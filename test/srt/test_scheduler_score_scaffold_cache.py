@@ -2,6 +2,9 @@ from types import SimpleNamespace
 
 from sgl_jax.srt.managers.io_struct import ScoreFromCacheReqInput
 from sgl_jax.srt.managers.scheduler_scoring_cache_mixin import SchedulerScoringCacheMixin
+from sgl_jax.srt.managers.scheduler_scoring_dispatch_mixin import (
+    SchedulerScoringDispatchMixin,
+)
 from sgl_jax.srt.managers.scheduler_scoring_execute_mixin import (
     SchedulerScoringExecuteMixin,
 )
@@ -10,6 +13,7 @@ from sgl_jax.srt.managers.scheduler_scoring_state_mixin import SchedulerScoringS
 
 class _DummyScheduler(
     SchedulerScoringCacheMixin,
+    SchedulerScoringDispatchMixin,
     SchedulerScoringExecuteMixin,
     SchedulerScoringStateMixin,
 ):
@@ -43,15 +47,17 @@ def test_scoring_cache_metrics_snapshot_tracks_hits_and_misses():
     assert metrics["lookup_by_path"]["extend"]["hits"] == 1
 
 
-def test_score_from_cache_v2_scaffold_returns_not_enabled():
+def test_score_from_cache_v2_scaffold_reports_validation_failure():
     scheduler = _DummyScheduler()
     scheduler.init_scoring_state(
         SimpleNamespace(multi_item_prefill_extend_cache_timeout=1.0)
     )
+    scheduler.enable_overlap = False
+    scheduler.server_args = type("ServerArgs", (), {})()
 
     result = scheduler.score_from_cache_v2(ScoreFromCacheReqInput(rid="rid-1"))
 
     assert result.success is False
-    assert result.fallback_reason == "not_enabled"
+    assert result.fallback_reason == "missing_cache_handle"
     assert scheduler.score_from_cache_v2_attempted == 1
     assert scheduler.score_from_cache_v2_fallback == 1
