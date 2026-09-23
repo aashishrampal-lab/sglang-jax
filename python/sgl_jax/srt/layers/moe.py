@@ -27,14 +27,14 @@ from sgl_jax.srt.utils.weight_utils import WeightMapping
 # Opt-in: replace the 3-op unpermute (gather -> reshape/fp32 -> weighted sum)
 # with the single fused SparseCore ragged_gather_reduce_v2 kernel ported from
 # tpu-inference. Off by default so the stock path stays bit-identical.
-_MOE_FUSED_UNPERMUTE_VERSION = "ragged-gather-reduce-v2-rec1"
+_MOE_FUSED_UNPERMUTE_VERSION = "ragged-gather-reduce-v2-rec2"
 _USE_FUSED_UNPERMUTE = os.environ.get("SGL_MOE_FUSED_UNPERMUTE", "0") == "1"
 _USE_RAGGED_GATHER = os.environ.get("SGL_MOE_RAGGED_GATHER", "1") == "1"
+_USE_EXPERT_SCATTER = os.environ.get("SGL_MOE_EXPERT_SCATTER", "1") == "1"
 _MOE_FUSED_MIN_TOKENS = int(os.environ.get("SGL_MOE_FUSED_MIN_TOKENS", "4096") or "4096")
 _MOE_FUSED_DEBUG = os.environ.get("SGL_MOE_FUSED_DEBUG", "0") == "1"
-# Analogue of VLLM_MOE_CHUNK_SIZE staging from b/525141213: the token range is
-# split into this many chunks, one fused-kernel call each. 0/1 disables it.
-_MOE_CHUNK_STAGE = int(os.environ.get("SGL_MOE_CHUNK_STAGE", "0") or "0")
+# Recommendation 2: number of chunks for pipelined ragged_gather_reduce_v2 + psum_scatter.
+_MOE_CHUNK_STAGE = int(os.environ.get("SGL_MOE_CHUNK_STAGE", "4") or "4")
 
 
 class EPMoE(nnx.Module):
@@ -429,19 +429,41 @@ class EPMoE(nnx.Module):
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
     ) -> jax.Array:
-        if out_sharding is None:
-            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
-        # Translate the caller's target sharding (on self.mesh: data,tensor)
-        # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
-        # 'tensor' is shared between the two meshes; everything else is
-        # irrelevant inside the per-expert shard_map context.
-        out_specs = P(
-            *[
-                "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
-                for s in out_sharding.spec
-            ]
+        total_tokens = (
+            hidden_states.shape[0]
+            if hidden_states.ndim == 2
+            else (hidden_states.shape[0] * hidden_states.shape[1])
         )
-        scatter_on_tensor = "tensor" in out_specs
+        can_scatter_on_expert = (
+            _USE_EXPERT_SCATTER
+            and self.ep_size > 1
+            and self.tp_size == 1
+            and self.mesh.shape.get("data", 0) == self.ep_size
+            and hidden_states.ndim == 2
+            and (total_tokens % self.ep_size == 0)
+        )
+        if out_sharding is None:
+            if can_scatter_on_expert:
+                out_sharding = jax.sharding.NamedSharding(self.mesh, P("data", None))
+            else:
+                out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
+
+        if can_scatter_on_expert and (
+            out_sharding.spec[0] == "data"
+            or (isinstance(out_sharding.spec[0], tuple) and "data" in out_sharding.spec[0])
+        ):
+            out_specs = P("expert", None)
+            scatter_on_expert = True
+            scatter_on_tensor = False
+        else:
+            out_specs = P(
+                *[
+                    "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
+                    for s in out_sharding.spec
+                ]
+            )
+            scatter_on_expert = False
+            scatter_on_tensor = "tensor" in out_specs
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -467,7 +489,7 @@ class EPMoE(nnx.Module):
             )
 
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(self._forward, scatter_on_tensor=scatter_on_tensor, scatter_on_expert=scatter_on_expert),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -524,6 +546,7 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        scatter_on_expert: bool = False,
     ):
         expert_shard_id = jax.lax.axis_index("expert")
         if hidden_states.ndim == 2:
@@ -567,6 +590,23 @@ class EPMoE(nnx.Module):
             use_fused=use_fused,
         )
 
+        use_chunked_expert_scatter = (
+            scatter_on_expert
+            and use_fused
+            and _MOE_CHUNK_STAGE > 1
+            and (total_tokens % (self.ep_size * _MOE_CHUNK_STAGE) == 0)
+        )
+        if use_chunked_expert_scatter:
+            return self._unpermute_chunked_psum_scatter(
+                intermediate_output,
+                sorted_selected_experts,
+                weights,
+                total_tokens=total_tokens,
+                token_start=token_start,
+                token_end=token_end,
+                num_chunks=_MOE_CHUNK_STAGE,
+            )
+
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
@@ -587,9 +627,81 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            output = self._combine(output)
+            if scatter_on_expert:
+                output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
+            else:
+                output = self._combine(output)
 
         return output
+
+    def _unpermute_chunked_psum_scatter(
+        self,
+        intermediate,
+        sorted_selected_experts,
+        weights,
+        *,
+        total_tokens: int,
+        token_start,
+        token_end,
+        num_chunks: int,
+    ):
+        from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
+            ragged_gather_reduce,
+        )
+
+        expected_tokens = sorted_selected_experts.shape[0]
+        actual_tokens = intermediate.shape[0]
+        if actual_tokens != expected_tokens:
+            if actual_tokens > expected_tokens:
+                intermediate = intermediate[:expected_tokens]
+            else:
+                padding_size = expected_tokens - actual_tokens
+                padding = jnp.zeros(
+                    (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
+                )
+                intermediate = jnp.concatenate([intermediate, padding], axis=0)
+
+        argsort_indices = jnp.argsort(sorted_selected_experts).astype(jnp.int32)
+        flat_weights = jnp.reshape(weights, (-1,))
+        if self.ep_size > 1 and token_start is not None and token_end is not None:
+            valid_rows = (argsort_indices >= token_start) & (
+                argsort_indices < token_end
+            )
+        else:
+            valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
+
+        top_k = self.num_experts_per_tok
+        idx_by_chunk = (
+            argsort_indices.reshape(self.ep_size, num_chunks, -1, top_k)
+            .transpose(1, 0, 2, 3)
+            .reshape(num_chunks, -1)
+        )
+        w_by_chunk = (
+            flat_weights.reshape(self.ep_size, num_chunks, -1, top_k)
+            .transpose(1, 0, 2, 3)
+            .reshape(num_chunks, -1)
+        )
+        val_by_chunk = (
+            valid_rows.reshape(self.ep_size, num_chunks, -1, top_k)
+            .transpose(1, 0, 2, 3)
+            .reshape(num_chunks, -1)
+        )
+
+        pieces = []
+        for c in range(num_chunks):
+            chunk_out = ragged_gather_reduce(
+                intermediate,
+                idx_by_chunk[c],
+                w_by_chunk[c],
+                val_by_chunk[c],
+                top_k,
+            ).astype(self.dtype)
+            piece = jax.lax.psum_scatter(
+                chunk_out, "expert", scatter_dimension=0, tiled=True
+            )
+            pieces.append(piece)
+
+        return jnp.concatenate(pieces, axis=0)
 
     def _gmm_compute(
         self,
