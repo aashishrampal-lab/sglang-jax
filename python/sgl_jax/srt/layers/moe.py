@@ -24,30 +24,17 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
-
-# --------------------------------------------------------------------------
-# Arm F1c: chunked MoE unpermute, single expert-reduce, single output cast.
-#
-# The MoE tail is  gather(unpermute) -> top-k combine -> cast -> psum("expert").
-# Chunking the gather+einsum pair lets chunk c's einsum (TensorCore) overlap
-# chunk c+1's gather (SparseCore).  Measured in F1a: the unpermute gather's
-# exposed TensorCore wait fell 3.700 -> 2.217 ms/core/layer (-40.1%).
-#
-# Unlike F1a, the psum stays OUTSIDE the loop -- see _forward for why.
-# Unlike F1b, the f32 -> self.dtype cast is also outside the loop, so XLA can
-# fuse the convert into the concatenate's output loop and skip materializing
-# the per-chunk bf16 pieces (measured in F1b: cast 462.7 ms + concat 337.3 ms,
-# both HBM-bound).  concat(cast(a), cast(b)) == cast(concat(a, b)) exactly,
-# so this is bit-identical.
-#
-# Numerics are unchanged: psum reduces across devices, chunking splits the
-# token axis, which is never reduced.  Output is bit-identical.
-#
-# Off unless SGL_MOE_CHUNKS > 1.  The min-token guard keeps it off in decode.
-# --------------------------------------------------------------------------
-_SGL_MOE_CHUNKS = int(os.environ.get("SGL_MOE_CHUNKS", "0"))
-_SGL_MOE_CHUNK_MIN_TOKENS = int(os.environ.get("SGL_MOE_CHUNK_MIN_TOKENS", "4096"))
-_SGL_MOE_CHUNK_LOGGED = set()
+# Opt-in: replace the 3-op unpermute (gather -> reshape/fp32 -> weighted sum)
+# with the single fused SparseCore ragged_gather_reduce_v2 kernel ported from
+# tpu-inference. Off by default so the stock path stays bit-identical.
+_MOE_FUSED_UNPERMUTE_VERSION = "ragged-gather-reduce-v2-rec1"
+_USE_FUSED_UNPERMUTE = os.environ.get("SGL_MOE_FUSED_UNPERMUTE", "0") == "1"
+_USE_RAGGED_GATHER = os.environ.get("SGL_MOE_RAGGED_GATHER", "1") == "1"
+_MOE_FUSED_MIN_TOKENS = int(os.environ.get("SGL_MOE_FUSED_MIN_TOKENS", "4096") or "4096")
+_MOE_FUSED_DEBUG = os.environ.get("SGL_MOE_FUSED_DEBUG", "0") == "1"
+# Analogue of VLLM_MOE_CHUNK_SIZE staging from b/525141213: the token range is
+# split into this many chunks, one fused-kernel call each. 0/1 disables it.
+_MOE_CHUNK_STAGE = int(os.environ.get("SGL_MOE_CHUNK_STAGE", "0") or "0")
 
 
 class EPMoE(nnx.Module):
@@ -554,6 +541,13 @@ class EPMoE(nnx.Module):
 
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
+        group_offsets = jnp.concatenate(
+            [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(group_sizes, dtype=jnp.int32)]
+        )
+        token_start = group_offsets[group_offset]
+        token_end = group_offsets[group_offset + self.experts_per_device]
+        use_fused = _USE_FUSED_UNPERMUTE and (total_tokens >= _MOE_FUSED_MIN_TOKENS)
+
         intermediate_output = self._gmm_compute(
             inputs_2d,
             token_indices,
@@ -568,44 +562,10 @@ class EPMoE(nnx.Module):
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
+            token_start=token_start,
+            token_end=token_end,
+            use_fused=use_fused,
         )
-
-        chunk_plan = self._moe_chunk_plan(weights)
-        if chunk_plan is not None:
-            # --- F1c pipelined tail ---------------------------------------
-            # Chunk c's einsum (TensorCore) overlaps chunk c+1's gather
-            # (SparseCore); that pair is what F1a measured as -854.6 ms on the
-            # unpermute gather, and it is preserved verbatim here.
-            #
-            # The psum is deliberately OUTSIDE the loop.  Per-chunk psums cost
-            # F1a +2877 ms: TpuAllReduceScatterFusion only rewrites
-            # all-reduce -> reduce-scatter when the all-reduce's sole user is a
-            # dynamic-slice (intervening reshape/bitcast only).  Chunked, XLA
-            # lowers dynamic-slice(concatenate(...)) to per-chunk pad + slice +
-            # maximum, and the `pad` blocks the match -> 4 full all-reduces at
-            # 2x the wire.  One psum on the concatenated result keeps the
-            # dynamic-slice adjacent and restores the reduce-scatter.
-            #
-            # The cast is also outside the loop.  It stays BEFORE the psum, so
-            # the collective still moves bf16 (wire volume unchanged) and the
-            # psum's sole user is still the dynamic-slice -- a convert placed
-            # AFTER the psum would break MatchWithDynamicSlice, which tolerates
-            # only reshape/bitcast between the all-reduce and the slice.
-            #
-            # _moe_chunk_plan has already established tp_size == 1, so the
-            # "tensor"-axis block below is dead here and is not replicated.
-            base, argsort_indices, reshaped_weights = self._unpermute_prep(
-                intermediate_output,
-                sorted_selected_experts,
-                weights,
-            )
-            pieces = []
-            for lo, hi in chunk_plan:
-                pieces.append(
-                    self._unpermute_slice(base, argsort_indices, reshaped_weights, lo, hi)
-                )
-            combined = jnp.concatenate(pieces, axis=0).astype(self.dtype)
-            return self._combine(combined)
 
         output = self._unpermute(
             intermediate_output,
@@ -613,6 +573,9 @@ class EPMoE(nnx.Module):
             weights,
             batch_size,
             seq_len,
+            token_start=token_start,
+            token_end=token_end,
+            use_fused=use_fused,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -643,6 +606,10 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        *,
+        token_start=None,
+        token_end=None,
+        use_fused: bool = False,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -656,6 +623,23 @@ class EPMoE(nnx.Module):
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
             x = (x.astype(jnp.float32) * x_scale).astype(self.dtype)
+        elif (
+            use_fused
+            and _USE_RAGGED_GATHER
+            and self.ep_size > 1
+            and token_start is not None
+            and token_end is not None
+        ):
+            from sgl_jax.srt.kernels.sparse_core.ragged_gather_v2 import (
+                ragged_gather_v2,
+            )
+
+            x = ragged_gather_v2(
+                inputs_2d.astype(self.dtype),
+                token_indices,
+                token_start,
+                token_end,
+            )
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
@@ -709,12 +693,15 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
+        # When use_fused is True and ep_size > 1, ragged_gather_reduce_v2 masks
+        # out all rows outside [token_start, token_end) via valid_rows, so
+        # zero_initialize=False avoids zero-filling 31/32 of intermediate_output.
         return gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=True,
+            zero_initialize=not (use_fused and self.ep_size > 1),
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
@@ -775,118 +762,117 @@ class EPMoE(nnx.Module):
             group_sizes,
         )
 
-    def _moe_chunk_plan(self, weights):
-        """Token-chunk bounds for the pipelined tail, or None for the stock path.
+    def _unpermute(
+        self,
+        intermediate,
+        sorted_selected_experts,
+        weights,
+        batch_size,
+        seq_len,
+        *,
+        token_start=None,
+        token_end=None,
+        use_fused: bool = False,
+    ):
+        expected_tokens = sorted_selected_experts.shape[0]
+        actual_tokens = intermediate.shape[0]
 
-        All conditions are static at trace time, so this never introduces a
-        data-dependent branch.
-        """
-        n = _SGL_MOE_CHUNKS
-        if n <= 1:
-            return None
-        if self.ep_size <= 1:
-            return None  # no collective to pipeline
-        if self.tp_size > 1:
-            return None  # extra tensor-axis collective; not handled by F1a
-        if len(weights.shape) != 2:
-            return None  # only the 2-D (flat token) layout is supported
+        if actual_tokens != expected_tokens:
+            if actual_tokens > expected_tokens:
+                intermediate = intermediate[:expected_tokens]
+            else:
+                padding_size = expected_tokens - actual_tokens
+                padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
+                intermediate = jnp.concatenate([intermediate, padding], axis=0)
+
+        argsort_indices = jnp.argsort(sorted_selected_experts).astype(jnp.int32)
+
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
-        if total_tokens < _SGL_MOE_CHUNK_MIN_TOKENS:
-            return None  # decode / small prefill: pipelining costs more than it saves
-        if total_tokens % n != 0:
-            return None
-        step = total_tokens // n
-        key = (total_tokens, n)
-        if key not in _SGL_MOE_CHUNK_LOGGED:
-            _SGL_MOE_CHUNK_LOGGED.add(key)
-            print(
-                "[F1c] MoE tail pipelined: total_tokens=%d chunks=%d step=%d "
-                "(ep=%d tp=%d k=%d)"
-                % (total_tokens, n, step, self.ep_size, self.tp_size, self.num_experts_per_tok),
-                flush=True,
+
+        if use_fused:
+            # Fused path: one SparseCore kernel does gather -> weight multiply ->
+            # mask -> sum over top_k, emitting [total_tokens, hidden] directly.
+            # The [expected_tokens, hidden] intermediate is never materialised,
+            # which is an ``num_experts_per_tok``-fold cut in bytes written.
+            from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
+                ragged_gather_reduce,
             )
-        return [(i * step, (i + 1) * step) for i in range(n)]
 
-    def _unpermute_prep(self, intermediate, sorted_selected_experts, weights):
-        """The part of _unpermute that must happen once, before chunking.
-
-        Mirrors the head of _unpermute exactly.
-        """
-        expected_tokens = sorted_selected_experts.shape[0]
-        actual_tokens = intermediate.shape[0]
-
-        if actual_tokens != expected_tokens:
-            if actual_tokens > expected_tokens:
-                intermediate = intermediate[:expected_tokens]
+            # Row i of the unsorted intermediate is assignment i = token * top_k
+            # + k, so the flattened weights line up elementwise with it.
+            flat_weights = jnp.reshape(weights, (-1,))
+            # In EPMoE, only rows in [token_start, token_end) were computed by
+            # this rank's experts; masking out the other 31/32 rows lets
+            # ragged_gather_reduce_v2 skip 31/32 of SparseCore HBM DMA gathers!
+            if self.ep_size > 1 and token_start is not None and token_end is not None:
+                valid_rows = (argsort_indices >= token_start) & (
+                    argsort_indices < token_end
+                )
             else:
-                padding_size = expected_tokens - actual_tokens
-                padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
-                intermediate = jnp.concatenate([intermediate, padding], axis=0)
+                valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
 
-        argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
-            .at[sorted_selected_experts]
-            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
-        )
+            if _MOE_FUSED_DEBUG:
+                print(
+                    f"[FUSED-UNPERMUTE] layer={getattr(self, 'layer_id', '?')} "
+                    f"x={tuple(intermediate.shape)}/{intermediate.dtype} "
+                    f"idx={tuple(argsort_indices.shape)} "
+                    f"w={tuple(flat_weights.shape)}/{flat_weights.dtype} "
+                    f"top_k={self.num_experts_per_tok} "
+                    f"stage={_MOE_CHUNK_STAGE} "
+                    f"-> out=({total_tokens}, {intermediate.shape[-1]})",
+                    flush=True,
+                )
 
-        total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
-        reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
-
-        return intermediate, argsort_indices, reshaped_weights
-
-    def _unpermute_slice(self, intermediate, argsort_indices, reshaped_weights, lo, hi):
-        """gather + top-k combine for tokens [lo, hi). Same math as _unpermute.
-
-        Returns f32; the caller casts once on the concatenated result.
-        """
-        k = self.num_experts_per_tok
-        chunk_indices = argsort_indices[lo * k : hi * k]
-        unsort_intermediate = jnp.take(intermediate, indices=chunk_indices, axis=0)
-
-        reshaped_intermediate = jnp.reshape(unsort_intermediate, (hi - lo, k, -1))
-
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            reshaped_intermediate.astype(jnp.float32),
-            reshaped_weights[lo:hi].astype(jnp.float32),
-        )
-        return output
-
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, seq_len):
-        expected_tokens = sorted_selected_experts.shape[0]
-        actual_tokens = intermediate.shape[0]
-
-        if actual_tokens != expected_tokens:
-            if actual_tokens > expected_tokens:
-                intermediate = intermediate[:expected_tokens]
+            top_k = self.num_experts_per_tok
+            if _MOE_CHUNK_STAGE > 1 and total_tokens > _MOE_CHUNK_STAGE:
+                chunk_tokens = -(-total_tokens // _MOE_CHUNK_STAGE)  # ceil
+                pieces = []
+                for start_tok in range(0, total_tokens, chunk_tokens):
+                    end_tok = min(total_tokens, start_tok + chunk_tokens)
+                    lo, hi = start_tok * top_k, end_tok * top_k
+                    if _MOE_FUSED_DEBUG:
+                        print(
+                            f"[FUSED-UNPERMUTE]   chunk tokens[{start_tok}:{end_tok}] "
+                            f"assignments[{lo}:{hi}] size={hi - lo}",
+                            flush=True,
+                        )
+                    pieces.append(
+                        ragged_gather_reduce(
+                            intermediate,
+                            argsort_indices[lo:hi],
+                            flat_weights[lo:hi],
+                            valid_rows[lo:hi],
+                            top_k,
+                        )
+                    )
+                output = (
+                    jnp.concatenate(pieces, axis=0) if len(pieces) > 1 else pieces[0]
+                )
             else:
-                padding_size = expected_tokens - actual_tokens
-                padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
-                intermediate = jnp.concatenate([intermediate, padding], axis=0)
+                output = ragged_gather_reduce(
+                    intermediate,
+                    argsort_indices,
+                    flat_weights,
+                    valid_rows,
+                    top_k,
+                )
+        else:
+            unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
 
-        argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
-            .at[sorted_selected_experts]
-            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
-        )
-        unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
+            reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
+            reshaped_intermediate = jnp.reshape(
+                unsort_intermediate,
+                (total_tokens, self.num_experts_per_tok, -1),
+            )
 
-        total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
+            intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
+            weights_fp32 = reshaped_weights.astype(jnp.float32)
 
-        reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
-        reshaped_intermediate = jnp.reshape(
-            unsort_intermediate,
-            (total_tokens, self.num_experts_per_tok, -1),
-        )
-
-        intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
-
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
-        )
+            output = jnp.einsum(
+                "BKE,BK -> BE",
+                intermediate_fp32,
+                weights_fp32,
+            )
 
         if len(weights.shape) == 2:
             final_output = output.astype(self.dtype)
