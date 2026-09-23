@@ -143,6 +143,8 @@ def _calculate_num_column_partitions(hidden_size: int, input_size: int,
     # Each column partition will do DMA pipelining on col_size.
     preferred_num_stages = 4
     num_column_partitions = 1
+    ep_sparsity_divisor = int(os.environ.get("SGL_SC_EP_SPARSITY_DIVISOR", "16"))
+    effective_input_size = max(input_size // max(ep_sparsity_divisor, 1), num_simd_lanes * num_cores)
     while (num_cores % (num_column_partitions * 2) == 0
            and hidden_size % (num_lanes * num_column_partitions * 2) == 0
            and hidden_size //
@@ -150,15 +152,19 @@ def _calculate_num_column_partitions(hidden_size: int, input_size: int,
         next_candidate = num_column_partitions * 2
         next_row_partitions = num_cores // next_candidate
 
-        # Calculate exactly how many pipeline invocations (outer loop)
+        # Calculate how many pipeline invocations (outer loop) run on valid rows
         num_row_subchunks, row_chunk_size = _calculate_row_tiling(
             input_size, num_simd_lanes, next_row_partitions)
-        num_iterations = input_size // (row_chunk_size * next_row_partitions)
+        num_iterations = effective_input_size // (row_chunk_size * next_row_partitions)
 
         # Ensure we satisfy the hardware constraint (num_row_partitions <= num_simd_lanes) first.
         if num_cores // num_column_partitions > num_simd_lanes:
             num_column_partitions = next_candidate
             continue
+
+        # Ensure sorted_by_validity_vmem per row partition fits comfortably in VMEM (<= 32768 int32 = 128KB).
+        if (input_size // next_row_partitions) > 32768:
+            break
 
         # Too many iterations cause high cumulative pipeline overhead. Set the
         # limit based on empirical data.
@@ -758,7 +764,9 @@ def ragged_gather_reduce(
     ), )
 
     # Step 5: Post-process the output (drop padding, zero empty groups, cast).
-    out = out[:input_size // reduce_group_size, :hidden_size]
-    out = jnp.where(mask[:input_size // reduce_group_size, None], out,
-                    jnp.zeros_like(out))
-    return out.astype(x.dtype)
+    out = out[:input_size // reduce_group_size, :hidden_size].astype(x.dtype)
+    return jnp.where(
+        mask[:input_size // reduce_group_size, None],
+        out,
+        jnp.zeros((), dtype=x.dtype),
+    )

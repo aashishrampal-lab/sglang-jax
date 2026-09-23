@@ -556,6 +556,11 @@ class EPMoE(nnx.Module):
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
             total_tokens = batch_size * seq_len
 
+        start_expert = expert_shard_id * self.experts_per_device
+        end_expert = start_expert + self.experts_per_device
+        flat_topk_ids = jnp.ravel(topk_ids)
+        valid_rows = (flat_topk_ids >= start_expert) & (flat_topk_ids < end_expert)
+
         inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
             hidden_states, topk_ids, topk_weights
         )
@@ -604,6 +609,7 @@ class EPMoE(nnx.Module):
                 total_tokens=total_tokens,
                 token_start=token_start,
                 token_end=token_end,
+                valid_rows=valid_rows,
                 num_chunks=_MOE_CHUNK_STAGE,
             )
 
@@ -615,6 +621,7 @@ class EPMoE(nnx.Module):
             seq_len,
             token_start=token_start,
             token_end=token_end,
+            valid_rows=valid_rows,
             use_fused=use_fused,
         )
 
@@ -643,6 +650,7 @@ class EPMoE(nnx.Module):
         total_tokens: int,
         token_start,
         token_end,
+        valid_rows=None,
         num_chunks: int,
     ):
         from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
@@ -663,12 +671,13 @@ class EPMoE(nnx.Module):
 
         argsort_indices = jnp.argsort(sorted_selected_experts).astype(jnp.int32)
         flat_weights = jnp.reshape(weights, (-1,))
-        if self.ep_size > 1 and token_start is not None and token_end is not None:
-            valid_rows = (argsort_indices >= token_start) & (
-                argsort_indices < token_end
-            )
-        else:
-            valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
+        if valid_rows is None:
+            if self.ep_size > 1 and token_start is not None and token_end is not None:
+                valid_rows = (argsort_indices >= token_start) & (
+                    argsort_indices < token_end
+                )
+            else:
+                valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
 
         top_k = self.num_experts_per_tok
         idx_by_chunk = (
@@ -884,6 +893,7 @@ class EPMoE(nnx.Module):
         *,
         token_start=None,
         token_end=None,
+        valid_rows=None,
         use_fused: bool = False,
     ):
         expected_tokens = sorted_selected_experts.shape[0]
@@ -913,15 +923,16 @@ class EPMoE(nnx.Module):
             # Row i of the unsorted intermediate is assignment i = token * top_k
             # + k, so the flattened weights line up elementwise with it.
             flat_weights = jnp.reshape(weights, (-1,))
-            # In EPMoE, only rows in [token_start, token_end) were computed by
-            # this rank's experts; masking out the other 31/32 rows lets
-            # ragged_gather_reduce_v2 skip 31/32 of SparseCore HBM DMA gathers!
-            if self.ep_size > 1 and token_start is not None and token_end is not None:
-                valid_rows = (argsort_indices >= token_start) & (
-                    argsort_indices < token_end
-                )
-            else:
-                valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
+            # In EPMoE, only rows in [start_expert, end_expert) were computed by
+            # this rank's experts; masking out the other 15/16 rows lets
+            # ragged_gather_reduce_v2 skip 15/16 of SparseCore HBM DMA gathers!
+            if valid_rows is None:
+                if self.ep_size > 1 and token_start is not None and token_end is not None:
+                    valid_rows = (argsort_indices >= token_start) & (
+                        argsort_indices < token_end
+                    )
+                else:
+                    valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
 
             if _MOE_FUSED_DEBUG:
                 print(
