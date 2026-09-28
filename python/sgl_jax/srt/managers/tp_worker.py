@@ -241,10 +241,7 @@ class ModelWorker:
             if self.dp_size > 1
             else self.max_total_num_tokens
         )
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            per_rank_tokens - 1,
-        )
+        self.max_req_len = self.model_config.context_len - 1
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
@@ -762,10 +759,7 @@ class MockModelWorker:
         per_rank_tokens = (
             self.max_total_num_tokens // dp_size if dp_size > 1 else self.max_total_num_tokens
         )
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            per_rank_tokens - 1,
-        )
+        self.max_req_len = self.model_config.context_len - 1
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 

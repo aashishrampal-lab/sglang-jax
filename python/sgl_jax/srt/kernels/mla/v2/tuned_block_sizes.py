@@ -297,3 +297,35 @@ TUNED_BLOCK_SIZES_MLA["TPU v7"].update({
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 1024): (16, 16),  # 4.3340 ms  [mla_tuned_blocks_heads64_dp32.txt]
 })
 # === END injected tuned MLA block sizes ===
+
+# Extend tuned MLA block sizes for page_size=128/256, mnt=2048/4096, and fp8 KV cache (float8_e4m3fn / float8_e5m2)
+for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
+    for _tk, _tv in list(_dst.items()):
+        if len(_tk) == 8 and _tk[7] == 1024:
+            for _mnt in (2048, 4096):
+                _dst.setdefault(_tk[:7] + (_mnt,), _tv)
+    for _tk, _tv in list(_dst.items()):
+        if len(_tk) == 8 and _tk[6] == 128:
+            _k256 = _tk[:6] + (256, _tk[7])
+            _dst.setdefault(_k256, (max(1, _tv[0] // 2),) + _tv[1:])
+    _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 2)] = (4, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 256)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1024)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2048)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4096)] = (8, 1, 2)
+    _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 256, 2)] = (2, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 256)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 1024)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 2048)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 4096)] = (4, 1, 2)
+    for _tk, _tv in list(_dst.items()):
+        if len(_tk) == 8 and _tk[2] == "bfloat16":
+            for _fp8_dt in ("float8_e4m3fn", "float8_e5m2"):
+                _k_fp8 = (_tk[0], _tk[1], _fp8_dt) + _tk[3:]
+                if _tk[6] == 256:
+                    _v_fp8 = (_tv[0] * 2,) + _tv[1:]
+                elif _tk[0] == "decode" and _tk[6] == 128 and _tk[7] == 2:
+                    _v_fp8 = (8, 1, 1)
+                else:
+                    _v_fp8 = _tv
+                _dst[_k_fp8] = _v_fp8

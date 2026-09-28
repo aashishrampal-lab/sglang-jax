@@ -163,8 +163,8 @@ class MLAAttentionBackend(AttentionBackend):
         per_dp_loc_len = total_loc_len // batch.dp_size
 
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        strided_2d = cache_loc_2d[:, :: self.page_size]
-        page_indices = (strided_2d // self.page_size).ravel()
+        strided_2d = cache_loc_2d[:, :: self.page_size].copy()
+        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size).copy()
 
         if batch.forward_mode == ForwardMode.EXTEND:
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
@@ -177,7 +177,6 @@ class MLAAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        seq_lens = batch.seq_lens
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
@@ -187,7 +186,6 @@ class MLAAttentionBackend(AttentionBackend):
         cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
         cu_kv_lens = cu_kv_2d.ravel()
 
-        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
         local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
             distribution = np.repeat(local_num_seqs, 3)
@@ -197,6 +195,33 @@ class MLAAttentionBackend(AttentionBackend):
             ).ravel()
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        # Cooperative Shared-Prefix Prefill detection:
+        # When all DP ranks r in 0..dp_size-1 prefill consecutive coop_chunk-token chunks
+        # of the same shared prefix (seq_lens_2d[r, 0] == pos_base + (r + 1) * coop_chunk),
+        # broadcast the full page table from the last DP rank and encode pos_base in
+        # the unused last padding slot of seq_lens_2d.
+        coop_chunk = int(ext_2d[0, 0]) if batch.forward_mode == ForwardMode.EXTEND else 0
+        if (
+            batch.forward_mode == ForwardMode.EXTEND
+            and batch.dp_size > 1
+            and batch.per_dp_bs_size >= 2
+            and coop_chunk >= 1024
+            and coop_chunk % self.page_size == 0
+            and seq_lens_2d[0, 0] >= coop_chunk
+            and np.all(ext_2d[:, 0] == coop_chunk)
+            and np.all(seq_lens_2d[:, 1:] == 0)
+            and np.all(
+                seq_lens_2d[:, 0]
+                == seq_lens_2d[0, 0] + np.arange(batch.dp_size, dtype=np.int32) * coop_chunk
+            )
+        ):
+            pos_base = int(seq_lens_2d[0, 0]) - coop_chunk
+            strided_2d[:] = strided_2d[-1:]
+            seq_lens_2d[:, -1] = -(pos_base + 1)
+
+        page_indices = (strided_2d // self.page_size).ravel()
+        seq_lens = seq_lens_2d.ravel()
 
         (
             metadata.cu_q_lens,
@@ -297,8 +322,14 @@ class MLAAttentionBackend(AttentionBackend):
         new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
         ql_nope = q
         q_pe = q_rope
+        has_tensor_axis = self.mesh is not None and "tensor" in self.mesh.axis_names
+        q_spec = P(dpa, "tensor", None) if has_tensor_axis else P(dpa, None, None)
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        if new_kv_c.dtype != cache.dtype:
+            new_kv_c = new_kv_c.astype(cache.dtype)
+        if new_k_pe.dtype != cache.dtype:
+            new_k_pe = new_k_pe.astype(cache.dtype)
         sm_scale = (
             (1.0 / jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
             if (layer is None or layer.scaling is None)
@@ -308,8 +339,8 @@ class MLAAttentionBackend(AttentionBackend):
         soft_cap = layer.logit_cap if layer is not None else None
 
         in_specs = (
-            P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
-            P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
+            q_spec,  # ql_nope    [T, n_h/tp, lkv]
+            q_spec,  # q_pe       [T, n_h/tp, r]
             P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
             P(dpa, None),  # new_k_pe   [T, r]    (single latent)
             P(dpa, None, None, None),  # cache (page axis sharded by data)
@@ -320,7 +351,7 @@ class MLAAttentionBackend(AttentionBackend):
             P(dpa),  # distribution
         )
         out_specs = (
-            P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
+            q_spec,  # o_latent       [T, n_h/tp, lkv]
             P(dpa, None, None, None),  # updated cache  4D
         )
 
@@ -336,6 +367,38 @@ class MLAAttentionBackend(AttentionBackend):
             cu_kv_lens_,
             distribution_,
         ):
+            coop_chunk = ql_nope_.shape[0]
+            if (
+                coop_chunk >= 1024
+                and self.mesh is not None
+                and self.mesh.shape.get(dpa, 1) > 1
+                and (self.mesh.shape[dpa] * coop_chunk) % self.page_size == 0
+            ):
+                coop_flag = seq_lens_[-1]
+                seq_lens_ = jnp.where(coop_flag < 0, seq_lens_.at[-1].set(0), seq_lens_)
+
+                def _coop_update(c_):
+                    pos_base = -coop_flag - 1
+                    start_page = pos_base // self.page_size
+                    dp_sz = self.mesh.shape[dpa]
+                    pages_per_step = (dp_sz * coop_chunk) // self.page_size
+                    all_kv_c = jax.lax.all_gather(new_kv_c_, dpa, axis=0, tiled=True)
+                    all_k_pe = jax.lax.all_gather(new_k_pe_, dpa, axis=0, tiled=True)
+                    nope_pad = ((all_kv_c.shape[-1] + 127) // 128) * 128 - all_kv_c.shape[-1]
+                    rope_pad = ((all_k_pe.shape[-1] + 127) // 128) * 128 - all_k_pe.shape[-1]
+                    kv_c_padded = jnp.pad(all_kv_c, ((0, 0), (0, nope_pad))).astype(c_.dtype)
+                    k_pe_padded = jnp.pad(all_k_pe, ((0, 0), (0, rope_pad))).astype(c_.dtype)
+                    merged = jnp.concatenate([kv_c_padded, k_pe_padded], axis=-1)
+                    merged_pages = merged.reshape(
+                        pages_per_step, c_.shape[1], c_.shape[2], c_.shape[3]
+                    )
+                    dest_pages = jax.lax.dynamic_slice_in_dim(
+                        page_indices_, start_page, pages_per_step, axis=0
+                    )
+                    return c_.at[dest_pages].set(merged_pages)
+
+                cache_ = jax.lax.cond(coop_flag < 0, _coop_update, lambda c_: c_, cache_)
+
             return mla_ragged_paged_attention(
                 ql_nope_,
                 q_pe_,
