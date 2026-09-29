@@ -469,19 +469,32 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        starts = jnp.cumsum(ext_rank, axis=0) - ext_rank
+        N = ext_rank.shape[0]
+        idx = jnp.arange(N)
+        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+        ext_rank_cumsum = jnp.dot(mask, ext_rank)
+
+        starts = ext_rank_cumsum - ext_rank
         ends = starts + ext_rank
         in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
-        req_starts = starts.at[slot].get()
-        req_lens = ext_rank.at[slot].get()
-        req_verified = verified_rank.at[slot].get()
+
+        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
+        req_starts = jnp.dot(one_hot_slot, starts)
+        req_lens = jnp.dot(one_hot_slot, ext_rank)
+        req_verified = jnp.dot(one_hot_slot, verified_rank)
+
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
-        shifted = ids_rank.at[shifted_index].get()
+        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
+        shifted = jnp.dot(one_hot_shifted, ids_rank)
+
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        rotated = jnp.where(is_last, req_verified, shifted)
-        return jnp.where(has_req, rotated, ids_rank)
+        is_last_int = is_last.astype(jnp.int32)
+        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
+
+        has_req_int = has_req.astype(jnp.int32)
+        return has_req_int * rotated + (1 - has_req_int) * ids_rank
 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
@@ -555,13 +568,17 @@ def _build_draft_extend(num_layers: int, topk: int):
             )
 
         for i in range(num_layers):
-            state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
+            leaf_idx = i if i < len(all_leaves) else -1
+            pool_idx = i if i < len(all_memory_pools) else -1
+            state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[leaf_idx])
             model = nnx.merge(model_def, state)
 
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
 
-            output, pool_updates, _, _ = model(forward_batch, all_memory_pools[i], logits_metadata)
+            output, pool_updates, _, _ = model(
+                forward_batch, all_memory_pools[pool_idx], logits_metadata
+            )
             all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
@@ -721,10 +738,6 @@ def _make_target_verify_metadata(
     page_size: int,
     dp_size: int,
 ):
-    from sgl_jax.srt.layers.attention.flashattention_backend import (
-        FlashAttentionMetadata,
-    )
-
     valid = verify_seq_lens > 0
     extend_seq_lens = jnp.where(
         valid,
@@ -743,7 +756,7 @@ def _make_target_verify_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if old_metadata.swa_page_indices is not None:
+    if getattr(old_metadata, "swa_page_indices", None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -754,10 +767,16 @@ def _make_target_verify_metadata(
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
-    distribution = jnp.stack(
-        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
-        axis=1,
-    ).reshape((dp_size * 3,))
+    if type(old_metadata).__name__ == "MLAAttentionMetadata":
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
+    else:
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
 
     data_sharding = jax.typeof(verify_seq_lens).sharding
     if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
@@ -769,15 +788,18 @@ def _make_target_verify_metadata(
         if swa_page_indices is not None:
             swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
 
-    return FlashAttentionMetadata(
-        cu_q_lens=cu_q_lens,
-        cu_kv_lens=cu_kv_lens,
-        page_indices=page_indices,
-        swa_page_indices=swa_page_indices,
-        seq_lens=metadata_seq_lens,
-        distribution=distribution,
-        custom_mask=old_metadata.custom_mask,
-    )
+    kwargs = {
+        "cu_q_lens": cu_q_lens,
+        "cu_kv_lens": cu_kv_lens,
+        "page_indices": page_indices,
+        "seq_lens": metadata_seq_lens,
+        "distribution": distribution,
+    }
+    if hasattr(old_metadata, "swa_page_indices"):
+        kwargs["swa_page_indices"] = swa_page_indices
+    if hasattr(old_metadata, "custom_mask"):
+        kwargs["custom_mask"] = old_metadata.custom_mask
+    return type(old_metadata)(**kwargs)
 
 
 def _make_draft_extend_metadata(
@@ -789,10 +811,6 @@ def _make_draft_extend_metadata(
     page_size: int,
     dp_size: int,
 ):
-    from sgl_jax.srt.layers.attention.flashattention_backend import (
-        FlashAttentionMetadata,
-    )
-
     valid = draft_seq_lens > 0
     # Fused EAGLE3 passes device query lengths so this cumsum remains in the
     # parent JIT. Other callers can retain the host-prepared value.
@@ -809,7 +827,7 @@ def _make_draft_extend_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if old_metadata.swa_page_indices is not None:
+    if getattr(old_metadata, "swa_page_indices", None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -820,10 +838,16 @@ def _make_draft_extend_metadata(
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
-    distribution = jnp.stack(
-        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
-        axis=1,
-    ).reshape((dp_size * 3,))
+    if type(old_metadata).__name__ == "MLAAttentionMetadata":
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
+    else:
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
 
     data_sharding = jax.typeof(draft_seq_lens).sharding
     if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
@@ -835,15 +859,18 @@ def _make_draft_extend_metadata(
         if swa_page_indices is not None:
             swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
 
-    return FlashAttentionMetadata(
-        cu_q_lens=cu_q_lens,
-        cu_kv_lens=cu_kv_lens,
-        page_indices=page_indices,
-        swa_page_indices=swa_page_indices,
-        seq_lens=draft_seq_lens,
-        distribution=distribution,
-        custom_mask=old_metadata.custom_mask,
-    )
+    kwargs = {
+        "cu_q_lens": cu_q_lens,
+        "cu_kv_lens": cu_kv_lens,
+        "page_indices": page_indices,
+        "seq_lens": draft_seq_lens,
+        "distribution": distribution,
+    }
+    if hasattr(old_metadata, "swa_page_indices"):
+        kwargs["swa_page_indices"] = swa_page_indices
+    if hasattr(old_metadata, "custom_mask"):
+        kwargs["custom_mask"] = old_metadata.custom_mask
+    return type(old_metadata)(**kwargs)
 
 
 def _make_eagle3_decode_metadata(
@@ -1147,10 +1174,13 @@ def _build_verify(topk: int):
                 dp_size=dp_size,
             )
             valid_seq_lens = target_forward_batch.seq_lens > 0
+            zeros = jnp.zeros_like(target_forward_batch.seq_lens)
+            b = relay_new_seq_lens - 1 + zeros
+
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
-                relay_new_seq_lens - 1,
-                jnp.zeros_like(target_forward_batch.seq_lens),
+                b,
+                zeros,
             )
             previous_verified_id = relay_verified_id
             previous_token_list = relay_topk_index
@@ -1442,13 +1472,15 @@ def _build_prefill(num_layers: int, topk: int):
 
         draft_forward_batch.spec_info.hidden_states = target_hidden
         for i in range(num_layers):
-            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[i])
+            leaf_idx = i if i < len(draft_all_leaves) else -1
+            pool_idx = i if i < len(all_memory_pools) else -1
+            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[leaf_idx])
             model = nnx.merge(draft_model_def, state)
 
             draft_forward_batch.input_ids = input_ids
             draft_forward_batch.spec_info.hidden_states = target_hidden
             output, pool_updates, _, _ = model(
-                draft_forward_batch, all_memory_pools[i], draft_logits_metadata
+                draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
             )
             all_pool_updates.append(pool_updates)
 
@@ -1831,14 +1863,15 @@ def launch_fused_draft_extend_for_decode(
     else:
         sel_pos = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(jnp.int32)
 
-    mr0 = draft_worker._workers[0].model_runner
+    _workers = getattr(draft_worker, "_workers", None) or [draft_worker._worker]
+    mr0 = _workers[0].model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
     shared_fb = _make_forward_batch(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
     all_memory_pools = []
     all_leaves = []
-    for w in draft_worker._workers:
+    for w in _workers:
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -1911,7 +1944,7 @@ def launch_fused_draft_extend_for_decode(
             dp_size=model_worker_batch.dp_size,
         )
 
-    for i, w in enumerate(draft_worker._workers):
+    for i, w in enumerate(_workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
     return FusedDraftExtendPendingResult(
@@ -2195,7 +2228,8 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-    draft_mr0 = draft_worker._workers[0].model_runner
+    _workers = getattr(draft_worker, "_workers", None) or [draft_worker._worker]
+    draft_mr0 = _workers[0].model_runner
     draft_mr0.attn_backend.forward_metadata = draft_mr0.attn_backend.get_eagle_forward_metadata(
         model_worker_batch
     )
@@ -2211,7 +2245,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     all_memory_pools = []
     all_leaves = []
-    for w in draft_worker._workers:
+    for w in _workers:
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -2284,7 +2318,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         launch_done.set()
 
     target_mr.memory_pools.replace_all(target_pool_updates)
-    for i, w in enumerate(draft_worker._workers):
+    for i, w in enumerate(_workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
     if update_relay:
         spec_worker.spec_relay_buffers = updated_relay_buffers
@@ -2397,7 +2431,10 @@ def spec_decode_verify(
         target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-    if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
+    if (
+        use_relay_state
+        and getattr(target_mr.attn_backend.forward_metadata, "custom_mask", None) is not None
+    ):
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     if rebuild_verify_metadata:
