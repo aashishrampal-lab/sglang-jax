@@ -1,6 +1,7 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
 import math
+import os
 from functools import partial
 
 import jax
@@ -12,22 +13,28 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
-from sgl_jax.srt.kernels.sparse_core.moe_permute import (
-    moe_sc_permute_enabled_by_env,
-    sc_combine,
-    sc_dispatch_gather,
-    should_use_sparse_core,
-)
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
-from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
+from sgl_jax.srt.model_loader.weights import WeightSpec
+
+# Opt-in: replace the 3-op unpermute (gather -> reshape/fp32 -> weighted sum)
+# with the single fused SparseCore ragged_gather_reduce_v2 kernel ported from
+# tpu-inference. Off by default so the stock path stays bit-identical.
+_MOE_FUSED_UNPERMUTE_VERSION = "ragged-gather-reduce-v2-rec2"
+_USE_FUSED_UNPERMUTE = os.environ.get("SGL_MOE_FUSED_UNPERMUTE", "0") == "1"
+_USE_RAGGED_GATHER = os.environ.get("SGL_MOE_RAGGED_GATHER", "1") == "1"
+_USE_EXPERT_SCATTER = os.environ.get("SGL_MOE_EXPERT_SCATTER", "1") == "1"
+_MOE_FUSED_MIN_TOKENS = int(os.environ.get("SGL_MOE_FUSED_MIN_TOKENS", "4096") or "4096")
+_MOE_FUSED_DEBUG = os.environ.get("SGL_MOE_FUSED_DEBUG", "0") == "1"
+# Recommendation 2: number of chunks for pipelined ragged_gather_reduce_v2 + psum_scatter.
+_MOE_CHUNK_STAGE = int(os.environ.get("SGL_MOE_CHUNK_STAGE", "4") or "4")
 
 
 class EPMoE(nnx.Module):
@@ -50,16 +57,13 @@ class EPMoE(nnx.Module):
         use_sc_permute: bool | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
-        # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
-        self.use_sc_permute = (
-            moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
-        )
+        self.use_sc_permute = bool(use_sc_permute) if use_sc_permute is not None else False
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
         self.moe_dp_size = moe_dp_size
         self.replicate_experts = self.moe_dp_size > 1
 
-        metadata = None if self.replicate_experts else get_global_expert_location_metadata()
+        metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
             self.num_experts = metadata.num_physical_experts
         else:
@@ -86,55 +90,25 @@ class EPMoE(nnx.Module):
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
 
-        if self.moe_dp_size < 1:
-            raise ValueError(f"moe_dp_size must be at least 1, got {self.moe_dp_size}")
-        if self.replicate_experts and self.ep_size != 1:
-            raise ValueError(f"replicated EPMoE requires ep_size=1, got ep_size={self.ep_size}")
-        if self.replicate_experts and (
-            self.quantized_dtype is not None or self.activation_quantized_dtype is not None
-        ):
-            raise NotImplementedError(
-                "replicated EPMoE currently supports unquantized experts only"
-            )
-        if not self.replicate_experts and self.num_experts % self.ep_size != 0:
+        if self.num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        if self.replicate_experts:
-            if "data" not in self.mesh.axis_names or "tensor" not in self.mesh.axis_names:
-                raise ValueError(
-                    "replicated EPMoE requires a model mesh with ('data', 'tensor') axes; "
-                    f"got {self.mesh.axis_names}"
-                )
-            if self.mesh.shape["data"] != self.moe_dp_size:
-                raise ValueError(
-                    "replicated EPMoE requires moe_dp_size to match the model mesh data axis; "
-                    f"got moe_dp_size={self.moe_dp_size}, data={self.mesh.shape['data']}"
-                )
-            self.tp_size = self.mesh.shape["tensor"]
-            self.experts_per_device = self.num_experts
-            self.moe_mesh = self.mesh
-            self.updated_mesh = self.mesh.abstract_mesh
-            wi_sharding = P(None, None, "tensor")
-            wo_sharding = P(None, "tensor", None)
-        else:
-            world_size = math.prod(self.mesh.shape.values())
-            self.tp_size = world_size // self.ep_size
-            self.experts_per_device = self.num_experts // self.ep_size
+        world_size = math.prod(self.mesh.shape.values())
+        self.tp_size = world_size // self.ep_size
+        self.experts_per_device = self.num_experts // self.ep_size
 
-            devices = self.mesh.devices.flatten()
-            self.moe_mesh = jax.sharding.Mesh(
-                devices.reshape(self.ep_size, self.tp_size),
-                axis_names=("expert", "tensor"),
-                axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-            )
+        devices = self.mesh.devices.flatten()
+        self.moe_mesh = jax.sharding.Mesh(
+            devices.reshape(self.ep_size, self.tp_size),
+            axis_names=("expert", "tensor"),
+            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+        )
 
-            abstract_mesh = self.mesh.abstract_mesh
-            self.updated_mesh = abstract_mesh.update(
-                axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-            )
-            wi_sharding = P("expert", None, "tensor")
-            wo_sharding = P("expert", "tensor", None)
+        abstract_mesh = self.mesh.abstract_mesh
+        self.updated_mesh = abstract_mesh.update(
+            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
+        )
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             # MOE weights' shape is (num_experts, k, n)
@@ -143,7 +117,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=wi_sharding,
+                    out_sharding=P("expert", None, "tensor"),
                 )
             )
 
@@ -152,7 +126,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=wi_sharding,
+                    out_sharding=P("expert", None, "tensor"),
                 )
             )
 
@@ -161,7 +135,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, intermediate_dim, hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=wo_sharding,
+                    out_sharding=P("expert", "tensor", None),
                 )
             )
 
@@ -337,8 +311,6 @@ class EPMoE(nnx.Module):
         )
         with mesh_context:
             if is_static:
-                # Both checkpoint and dummy loaders need placeholders with the
-                # quantized dtype before loading or generating the weights.
                 for name in ("wi_0", "wi_1", "wo"):
                     param = getattr(self, name)
                     if isinstance(param.value, jax.ShapeDtypeStruct):
@@ -473,33 +445,41 @@ class EPMoE(nnx.Module):
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
     ) -> jax.Array:
-        if self.replicate_experts:
-            if out_sharding is None:
-                out_sharding = jax.sharding.NamedSharding(
-                    self.mesh,
-                    P("data", *([None] * (hidden_states.ndim - 1))),
-                )
-            return self._call_replicated(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                out_sharding=out_sharding,
-            )
-
-        if out_sharding is None:
-            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
-
-        # Translate the caller's target sharding (on self.mesh: data,tensor)
-        # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
-        # 'tensor' is shared between the two meshes; everything else is
-        # irrelevant inside the per-expert shard_map context.
-        out_specs = P(
-            *[
-                ("tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None)
-                for s in out_sharding.spec
-            ]
+        total_tokens = (
+            hidden_states.shape[0]
+            if hidden_states.ndim == 2
+            else (hidden_states.shape[0] * hidden_states.shape[1])
         )
-        scatter_on_tensor = "tensor" in out_specs
+        can_scatter_on_expert = (
+            _USE_EXPERT_SCATTER
+            and self.ep_size > 1
+            and self.tp_size == 1
+            and self.mesh.shape.get("data", 0) == self.ep_size
+            and hidden_states.ndim == 2
+            and (total_tokens % self.ep_size == 0)
+        )
+        if out_sharding is None:
+            if can_scatter_on_expert:
+                out_sharding = jax.sharding.NamedSharding(self.mesh, P("data", None))
+            else:
+                out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
+
+        if can_scatter_on_expert and (
+            out_sharding.spec[0] == "data"
+            or (isinstance(out_sharding.spec[0], tuple) and "data" in out_sharding.spec[0])
+        ):
+            out_specs = P("expert", None)
+            scatter_on_expert = True
+            scatter_on_tensor = False
+        else:
+            out_specs = P(
+                *[
+                    "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
+                    for s in out_sharding.spec
+                ]
+            )
+            scatter_on_expert = False
+            scatter_on_tensor = "tensor" in out_specs
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -525,7 +505,7 @@ class EPMoE(nnx.Module):
             )
 
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(self._forward, scatter_on_tensor=scatter_on_tensor, scatter_on_expert=scatter_on_expert),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -566,53 +546,6 @@ class EPMoE(nnx.Module):
         # consistent context.
         return jax.sharding.reshard(result, out_sharding)
 
-    def _call_replicated(
-        self,
-        hidden_states,
-        topk_weights,
-        topk_ids,
-        *,
-        out_sharding: jax.sharding.NamedSharding,
-    ) -> jax.Array:
-        token_spec = P("data", *([None] * (hidden_states.ndim - 1)))
-        routing_spec = P("data", *([None] * (topk_ids.ndim - 1)))
-        out_spec = out_sharding.spec
-        token_axis = out_spec[0] if len(out_spec) > 0 else None
-        token_axes = token_axis if isinstance(token_axis, tuple) else (token_axis,)
-        if self.mesh.shape["data"] > 1 and "data" not in token_axes:
-            raise ValueError(
-                "replicated EPMoE output must shard the token dimension over the data axis"
-            )
-        scatter_on_tensor = "tensor" in token_axes
-
-        with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            hidden_states = jax.sharding.reshard(hidden_states, token_spec)
-            topk_weights = jax.sharding.reshard(topk_weights, routing_spec)
-            topk_ids = jax.sharding.reshard(topk_ids, routing_spec)
-            result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
-                mesh=self.moe_mesh,
-                in_specs=(
-                    token_spec,
-                    routing_spec,
-                    routing_spec,
-                    P(None, None, "tensor"),
-                    P(None, None, "tensor"),
-                    P(None, "tensor", None),
-                ),
-                out_specs=out_spec,
-                check_vma=False,
-            )(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                self.wi_0[...],
-                self.wi_1[...],
-                self.wo[...],
-            )
-
-        return jax.sharding.reshard(result, out_sharding)
-
     def _forward(
         self,
         hidden_states,
@@ -629,39 +562,30 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        scatter_on_expert: bool = False,
     ):
-        expert_shard_id = (
-            jnp.array(0, dtype=jnp.int32)
-            if self.replicate_experts
-            else jax.lax.axis_index("expert")
-        )
+        expert_shard_id = jax.lax.axis_index("expert")
+        if hidden_states.ndim == 2:
+            total_tokens = hidden_states.shape[0]
+            batch_size, seq_len = 1, total_tokens
+        else:
+            batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+            total_tokens = batch_size * seq_len
 
-        inputs_2d, token_indices, sorted_selected_experts, group_sizes = self._permute(
-            hidden_states, topk_ids
+        inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
+            hidden_states, topk_ids, topk_weights
         )
 
         group_sizes = group_sizes.astype(jnp.int32)
 
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
-        local_range = None
-        valid_mask = None
-        # Trace-time gate: small (decode-sized) batches keep the exact XLA path so
-        # their HLO is identical to the flag-off build.
-        if self.use_sc_permute and should_use_sparse_core(
-            token_indices.shape[0], inputs_2d.shape[-1], self.dtype
-        ):
-            # Sorted-row range owned by this expert shard, and which routed slots
-            # (token-major order) landed on a local expert.
-            csum = jnp.cumsum(group_sizes)
-            start = jnp.where(group_offset == 0, 0, csum[jnp.maximum(group_offset - 1, 0)])
-            end = csum[group_offset + self.experts_per_device - 1]
-            if self.ep_size > 1:
-                local_range = (start.astype(jnp.int32), end.astype(jnp.int32))
-            flat_experts = jnp.ravel(topk_ids)
-            valid_mask = (flat_experts >= group_offset) & (
-                flat_experts < group_offset + self.experts_per_device
-            )
+        group_offsets = jnp.concatenate(
+            [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(group_sizes, dtype=jnp.int32)]
+        )
+        token_start = group_offsets[group_offset]
+        token_end = group_offsets[group_offset + self.experts_per_device]
+        use_fused = _USE_FUSED_UNPERMUTE and (total_tokens >= _MOE_FUSED_MIN_TOKENS)
 
         intermediate_output = self._gmm_compute(
             inputs_2d,
@@ -677,14 +601,37 @@ class EPMoE(nnx.Module):
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
-            local_range=local_range,
+            token_start=token_start,
+            token_end=token_end,
+            use_fused=use_fused,
         )
+
+        use_chunked_expert_scatter = (
+            scatter_on_expert
+            and use_fused
+            and _MOE_CHUNK_STAGE > 1
+            and (total_tokens % (self.ep_size * _MOE_CHUNK_STAGE) == 0)
+        )
+        if use_chunked_expert_scatter:
+            return self._unpermute_chunked_psum_scatter(
+                intermediate_output,
+                sorted_selected_experts,
+                weights,
+                total_tokens=total_tokens,
+                token_start=token_start,
+                token_end=token_end,
+                num_chunks=_MOE_CHUNK_STAGE,
+            )
 
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
-            topk_weights,
-            valid_mask=valid_mask,
+            weights,
+            batch_size,
+            seq_len,
+            token_start=token_start,
+            token_end=token_end,
+            use_fused=use_fused,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -696,9 +643,81 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            output = self._combine(output)
+            if scatter_on_expert:
+                output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
+            else:
+                output = self._combine(output)
 
         return output
+
+    def _unpermute_chunked_psum_scatter(
+        self,
+        intermediate,
+        sorted_selected_experts,
+        weights,
+        *,
+        total_tokens: int,
+        token_start,
+        token_end,
+        num_chunks: int,
+    ):
+        from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
+            ragged_gather_reduce,
+        )
+
+        expected_tokens = sorted_selected_experts.shape[0]
+        actual_tokens = intermediate.shape[0]
+        if actual_tokens != expected_tokens:
+            if actual_tokens > expected_tokens:
+                intermediate = intermediate[:expected_tokens]
+            else:
+                padding_size = expected_tokens - actual_tokens
+                padding = jnp.zeros(
+                    (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
+                )
+                intermediate = jnp.concatenate([intermediate, padding], axis=0)
+
+        argsort_indices = jnp.argsort(sorted_selected_experts).astype(jnp.int32)
+        flat_weights = jnp.reshape(weights, (-1,))
+        if self.ep_size > 1 and token_start is not None and token_end is not None:
+            valid_rows = (argsort_indices >= token_start) & (
+                argsort_indices < token_end
+            )
+        else:
+            valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
+
+        top_k = self.num_experts_per_tok
+        idx_by_chunk = (
+            argsort_indices.reshape(self.ep_size, num_chunks, -1, top_k)
+            .transpose(1, 0, 2, 3)
+            .reshape(num_chunks, -1)
+        )
+        w_by_chunk = (
+            flat_weights.reshape(self.ep_size, num_chunks, -1, top_k)
+            .transpose(1, 0, 2, 3)
+            .reshape(num_chunks, -1)
+        )
+        val_by_chunk = (
+            valid_rows.reshape(self.ep_size, num_chunks, -1, top_k)
+            .transpose(1, 0, 2, 3)
+            .reshape(num_chunks, -1)
+        )
+
+        pieces = []
+        for c in range(num_chunks):
+            chunk_out = ragged_gather_reduce(
+                intermediate,
+                idx_by_chunk[c],
+                w_by_chunk[c],
+                val_by_chunk[c],
+                top_k,
+            ).astype(self.dtype)
+            piece = jax.lax.psum_scatter(
+                chunk_out, "expert", scatter_dimension=0, tiled=True
+            )
+            pieces.append(piece)
+
+        return jnp.concatenate(pieces, axis=0)
 
     def _gmm_compute(
         self,
@@ -715,7 +734,10 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
-        local_range=None,
+        *,
+        token_start=None,
+        token_end=None,
+        use_fused: bool = False,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -729,10 +751,23 @@ class EPMoE(nnx.Module):
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
             x = (x.astype(jnp.float32) * x_scale).astype(self.dtype)
-        elif local_range is not None:
-            # SparseCore ragged gather: only rows [start, end) (local experts) are
-            # materialized; gmm never reads the others thanks to group_offset.
-            x = sc_dispatch_gather(inputs_2d, token_indices, *local_range).astype(self.dtype)
+        elif (
+            use_fused
+            and _USE_RAGGED_GATHER
+            and self.ep_size > 1
+            and token_start is not None
+            and token_end is not None
+        ):
+            from sgl_jax.srt.kernels.sparse_core.ragged_gather_v2 import (
+                ragged_gather_v2,
+            )
+
+            x = ragged_gather_v2(
+                inputs_2d.astype(self.dtype),
+                token_indices,
+                token_start,
+                token_end,
+            )
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
@@ -786,12 +821,15 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
+        # When use_fused is True and ep_size > 1, ragged_gather_reduce_v2 masks
+        # out all rows outside [token_start, token_end) via valid_rows, so
+        # zero_initialize=False avoids zero-filling 31/32 of intermediate_output.
         return gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=True,
+            zero_initialize=not (use_fused and self.ep_size > 1),
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
@@ -823,19 +861,17 @@ class EPMoE(nnx.Module):
     def _combine(self, data):
         return jax.lax.psum(data, "expert")
 
-    def _permute(self, inputs, top_k_indices):
-        if inputs.ndim != 2:
-            raise ValueError(
-                "EPMoE._permute expects 2-D hidden states [tokens, hidden], "
-                f"got shape {inputs.shape}"
-            )
+    def _permute(self, inputs, top_k_indices, top_k_weights):
+        inputs_shape = inputs.shape
 
-        expected_indices_shape = (inputs.shape[0], self.num_experts_per_tok)
-        if top_k_indices.shape != expected_indices_shape:
-            raise ValueError(
-                "EPMoE._permute expects routing indices with shape "
-                f"{expected_indices_shape}, got shape {top_k_indices.shape}"
-            )
+        if len(inputs_shape) == 2:
+            inputs_2d = inputs
+            bsz_times_seq_len = inputs_shape[0]
+        else:
+            bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
+            inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[-1]))
+
+        del bsz_times_seq_len
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
         sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
@@ -847,27 +883,26 @@ class EPMoE(nnx.Module):
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
         return (
-            inputs,
+            inputs_2d,
             token_indices,
             sorted_selected_experts,
+            top_k_weights,
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, valid_mask=None):
-        top_k = self.num_experts_per_tok
-        if weights.ndim != 2 or weights.shape[1] != top_k:
-            raise ValueError(
-                "EPMoE._unpermute expects 2-D routing weights "
-                f"[tokens, {top_k}], got shape {weights.shape}"
-            )
-
-        expected_tokens = weights.shape[0] * top_k
-        if sorted_selected_experts.ndim != 1 or sorted_selected_experts.shape[0] != expected_tokens:
-            raise ValueError(
-                "EPMoE._unpermute expects 1-D sorted routing indices with "
-                f"{expected_tokens} entries, got shape {sorted_selected_experts.shape}"
-            )
-
+    def _unpermute(
+        self,
+        intermediate,
+        sorted_selected_experts,
+        weights,
+        batch_size,
+        seq_len,
+        *,
+        token_start=None,
+        token_end=None,
+        use_fused: bool = False,
+    ):
+        expected_tokens = sorted_selected_experts.shape[0]
         actual_tokens = intermediate.shape[0]
 
         if actual_tokens != expected_tokens:
@@ -878,51 +913,99 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
-            .at[sorted_selected_experts]
-            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
-        )
-        if self.use_sc_permute and valid_mask is not None:
-            # SparseCore fused gather + top-k weighted reduce (falls back to XLA when
-            # SparseCore is absent or the problem is too small to benefit).
-            return sc_combine(
-                intermediate,
-                argsort_indices,
-                jnp.reshape(weights, (-1,)),
-                valid_mask,
-                self.num_experts_per_tok,
-            ).astype(self.dtype)
+        argsort_indices = jnp.argsort(sorted_selected_experts).astype(jnp.int32)
 
-        weights_fp32 = weights.astype(jnp.float32)
+        total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
 
-        # Static token-count branch: small (decode) batches avoid the unrolled
-        # per-k gather overhead; large (prefill) batches avoid the fp32
-        # (tokens, top_k, hidden) intermediate. Benchmarks in the PR description.
-        if weights.shape[0] <= 256:
+        if use_fused:
+            # Fused path: one SparseCore kernel does gather -> weight multiply ->
+            # mask -> sum over top_k, emitting [total_tokens, hidden] directly.
+            # The [expected_tokens, hidden] intermediate is never materialised,
+            # which is an ``num_experts_per_tok``-fold cut in bytes written.
+            from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
+                ragged_gather_reduce,
+            )
+
+            # Row i of the unsorted intermediate is assignment i = token * top_k
+            # + k, so the flattened weights line up elementwise with it.
+            flat_weights = jnp.reshape(weights, (-1,))
+            # In EPMoE, only rows in [token_start, token_end) were computed by
+            # this rank's experts; masking out the other 31/32 rows lets
+            # ragged_gather_reduce_v2 skip 31/32 of SparseCore HBM DMA gathers!
+            if self.ep_size > 1 and token_start is not None and token_end is not None:
+                valid_rows = (argsort_indices >= token_start) & (
+                    argsort_indices < token_end
+                )
+            else:
+                valid_rows = jnp.ones((expected_tokens,), dtype=jnp.bool_)
+
+            if _MOE_FUSED_DEBUG:
+                print(
+                    f"[FUSED-UNPERMUTE] layer={getattr(self, 'layer_id', '?')} "
+                    f"x={tuple(intermediate.shape)}/{intermediate.dtype} "
+                    f"idx={tuple(argsort_indices.shape)} "
+                    f"w={tuple(flat_weights.shape)}/{flat_weights.dtype} "
+                    f"top_k={self.num_experts_per_tok} "
+                    f"stage={_MOE_CHUNK_STAGE} "
+                    f"-> out=({total_tokens}, {intermediate.shape[-1]})",
+                    flush=True,
+                )
+
+            top_k = self.num_experts_per_tok
+            if _MOE_CHUNK_STAGE > 1 and total_tokens > _MOE_CHUNK_STAGE:
+                chunk_tokens = -(-total_tokens // _MOE_CHUNK_STAGE)  # ceil
+                pieces = []
+                for start_tok in range(0, total_tokens, chunk_tokens):
+                    end_tok = min(total_tokens, start_tok + chunk_tokens)
+                    lo, hi = start_tok * top_k, end_tok * top_k
+                    if _MOE_FUSED_DEBUG:
+                        print(
+                            f"[FUSED-UNPERMUTE]   chunk tokens[{start_tok}:{end_tok}] "
+                            f"assignments[{lo}:{hi}] size={hi - lo}",
+                            flush=True,
+                        )
+                    pieces.append(
+                        ragged_gather_reduce(
+                            intermediate,
+                            argsort_indices[lo:hi],
+                            flat_weights[lo:hi],
+                            valid_rows[lo:hi],
+                            top_k,
+                        )
+                    )
+                output = (
+                    jnp.concatenate(pieces, axis=0) if len(pieces) > 1 else pieces[0]
+                )
+            else:
+                output = ragged_gather_reduce(
+                    intermediate,
+                    argsort_indices,
+                    flat_weights,
+                    valid_rows,
+                    top_k,
+                )
+        else:
             unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
+
+            reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
             reshaped_intermediate = jnp.reshape(
                 unsort_intermediate,
-                (weights.shape[0], top_k, -1),
+                (total_tokens, self.num_experts_per_tok, -1),
             )
+
+            intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
+            weights_fp32 = reshaped_weights.astype(jnp.float32)
+
             output = jnp.einsum(
                 "BKE,BK -> BE",
-                reshaped_intermediate.astype(jnp.float32),
+                intermediate_fp32,
                 weights_fp32,
             )
-        else:
-            grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
-            output = None
-            for k in range(top_k):
-                contribution = (
-                    jnp.take(intermediate, indices=grouped_indices[:, k], axis=0).astype(
-                        jnp.float32
-                    )
-                    * weights_fp32[:, k, None]
-                )
-                output = contribution if output is None else output + contribution
 
-        final_output = output.astype(self.dtype)
+        if len(weights.shape) == 2:
+            final_output = output.astype(self.dtype)
+        else:
+            final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
 

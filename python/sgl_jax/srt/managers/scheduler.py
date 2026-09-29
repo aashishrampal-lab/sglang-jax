@@ -2084,6 +2084,286 @@ class Scheduler(
 
         return ret
 
+    def _build_coop_step_batch(self, st: dict) -> ScheduleBatch:
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+        coop_chunk = int(st.get("coop_chunk", self.chunked_prefill_size or 1024))
+        pos_base = st["cur_pos"]
+        st["cur_pos"] += self.dp_size * coop_chunk
+        shared_token_ids = st["shared_token_ids"]
+        full_kv_indices = st["full_kv_indices"]
+        coop_req_pool_idx = st["coop_req_pool_idx"]
+        sampling_params = st["sampling_params"]
+
+        coop_reqs = []
+        for r in range(self.dp_size):
+            prefix_len_r = pos_base + r * coop_chunk
+            seq_len_r = pos_base + (r + 1) * coop_chunk
+            creq = Req(
+                rid=f"__coop_prefill_{pos_base}_{r}",
+                origin_input_text="",
+                origin_input_ids=shared_token_ids[:seq_len_r],
+                sampling_params=sampling_params,
+                dp_rank=r,
+                eos_token_ids=self.model_config.hf_eos_token_id,
+                vocab_size=self.model_config.vocab_size,
+            )
+            creq.fill_ids = shared_token_ids[:seq_len_r]
+            creq.prefix_indices = full_kv_indices[:prefix_len_r]
+            creq.extend_input_len = coop_chunk
+            creq.req_pool_idx = coop_req_pool_idx
+            creq.is_chunked = 1
+            creq.kv_allocated_len = seq_len_r
+            creq.kv_committed_len = seq_len_r
+            coop_reqs.append(creq)
+
+        batch = ScheduleBatch.init_new(
+            reqs=[[creq] for creq in coop_reqs],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            dp_size=self.dp_size,
+            spec_algorithm=self.spec_algorithm,
+            mesh=self.mesh,
+        )
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.is_prefill_only = True
+        batch.is_coop_prefill_batch = True
+        for r in range(self.dp_size):
+            info = batch.reqs_info[r]
+            prefix_len_r = pos_base + r * coop_chunk
+            seq_len_r = pos_base + (r + 1) * coop_chunk
+            info.input_ids = np.asarray(shared_token_ids[prefix_len_r:seq_len_r], dtype=np.int32)
+            info.req_pool_indices = np.asarray([coop_req_pool_idx], dtype=np.int32)
+            info.seq_lens = np.asarray([seq_len_r], dtype=np.int32)
+            info.out_cache_loc = full_kv_indices[prefix_len_r:seq_len_r]
+            info.seq_lens_sum = seq_len_r
+            info.extend_logprob_start_lens = [coop_chunk]
+            info.extend_num_tokens = coop_chunk
+            info.prefix_lens = [prefix_len_r]
+            info.extend_lens = [coop_chunk]
+            info.extend_input_logprob_token_ids = None
+            info.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                info,
+                self.model_config.vocab_size,
+                batch=batch,
+            )
+        return batch
+
+    def _maybe_get_coop_prefill_batch(self) -> ScheduleBatch | None:
+        st = getattr(self, "_coop_prefill_state", None)
+        if st is not None:
+            if st["cur_pos"] < st["coop_target_len"]:
+                return self._build_coop_step_batch(st)
+
+            # Cooperative prefill completed! Drain any remaining tokenized requests
+            # from tokenizer_manager in lockstep across all nodes.
+            empty_polls = 0
+            for _ in range(25):
+                if empty_polls >= 2:
+                    break
+                if self.node_rank == 0:
+                    time.sleep(0.01)
+                more_reqs = (
+                    self._comm_backend.recv_requests()
+                    if self._comm_backend is not None
+                    else self.recv_requests()
+                )
+                if more_reqs:
+                    empty_polls = 0
+                    more_reqs = self.select_dp_for_request(more_reqs)
+                    self.process_input_requests(more_reqs)
+                else:
+                    empty_polls += 1
+
+            if self.pending_dp_reqs:
+                ready_reqs = self.select_dp_for_request([])
+                self.process_input_requests(ready_reqs)
+
+            coop_target_len = st["coop_target_len"]
+            shared_tokens = st["shared_token_ids"][:coop_target_len]
+            extra_key = st["extra_key"]
+            full_kv_indices = st["full_kv_indices"]
+            try:
+                from sgl_jax.srt.mem_cache.base_prefix_cache import InsertParams
+                _use_insert_params = True
+            except ImportError:
+                _use_insert_params = False
+            for r in range(self.dp_size):
+                rkey = RadixKey(shared_tokens, extra_key, dp_rank=r)
+                rval = full_kv_indices[:coop_target_len].copy()
+                if _use_insert_params:
+                    self.tree_cache.insert(InsertParams(key=rkey, value=rval))
+                else:
+                    self.tree_cache.insert(rkey, rval)
+                if len(full_kv_indices) > coop_target_len:
+                    extra_indices = np.unique(full_kv_indices[coop_target_len:])
+                    self.token_to_kv_pool_allocator.free(
+                        extra_indices, dp_rank=r
+                    )
+            self._coop_prefill_state = None
+
+            if self.running_batch.is_empty() and len(self.waiting_queue) <= self.dp_size:
+                for idx, wreq in enumerate(self.waiting_queue):
+                    wreq.dp_rank = idx
+
+            logger.info(
+                "[CoopPrefill] Global RadixCache populated across all %d DP ranks: "
+                "cached_prefix_len=%d tokens, waiting_reqs=%d",
+                self.dp_size,
+                coop_target_len,
+                len(self.waiting_queue),
+            )
+            return None
+
+        if (
+            self.dp_size <= 1
+            or self.tree_cache is None
+            or self.tree_cache.disable
+            or not self.running_batch.is_empty()
+            or any(req is not None for req in self.chunked_reqs)
+            or len(self.waiting_queue) == 0
+        ):
+            return None
+
+        first_req = self.waiting_queue[0]
+        if len(first_req.origin_input_ids) < 4096:
+            return None
+
+        # If only 1 long request has arrived from tokenizer_manager so far,
+        # wait briefly in lockstep for the 2nd request of a batch to arrive
+        # so we can compute the exact shared system prompt LCP.
+        if len(self.waiting_queue) == 1:
+            for _ in range(40):
+                if len(self.waiting_queue) >= 2:
+                    break
+                if self.node_rank == 0:
+                    time.sleep(0.015)
+                more_reqs = (
+                    self._comm_backend.recv_requests()
+                    if self._comm_backend is not None
+                    else self.recv_requests()
+                )
+                if more_reqs:
+                    more_reqs = self.select_dp_for_request(more_reqs)
+                    self.process_input_requests(more_reqs)
+
+        if len(self.waiting_queue) >= 2:
+            ids0 = self.waiting_queue[0].origin_input_ids
+            ids1 = self.waiting_queue[1].origin_input_ids
+            min_len = min(len(ids0), len(ids1))
+            arr0 = np.asarray(ids0[:min_len], dtype=np.int32)
+            arr1 = np.asarray(ids1[:min_len], dtype=np.int32)
+            diff_idx = np.nonzero(arr0 != arr1)[0]
+            lcp_len = int(diff_idx[0]) if len(diff_idx) > 0 else min_len
+        else:
+            ids0 = first_req.origin_input_ids
+            coop_chunk_tmp = int(self.chunked_prefill_size or 1024)
+            lcp_len = max(0, len(ids0) - coop_chunk_tmp)
+
+        coop_chunk = int(self.chunked_prefill_size or 1024)
+        coop_target_len = (lcp_len // self.page_size) * self.page_size
+        if coop_target_len < 4096:
+            return None
+
+        extra_key = first_req.extra_key
+        cached_per_rank = [
+            getattr(self, "_lookup_prefix_length", getattr(self, "_cached_prefix_len", None))(ids0[:coop_target_len], extra_key, r)
+            for r in range(self.dp_size)
+        ]
+        min_cached = min(cached_per_rank)
+        max_cached = max(cached_per_rank)
+        if coop_target_len - min_cached < 4096:
+            return None
+        if max_cached > 0:
+            self.tree_cache.reset()
+
+        # Start from 0 for clean symmetric page allocation across all DP ranks
+        step_tokens = self.dp_size * coop_chunk
+        num_steps = (coop_target_len + step_tokens - 1) // step_tokens
+        total_coop_end = num_steps * step_tokens
+        if total_coop_end > self.req_to_token_pool.max_context_len:
+            old_buf = self.req_to_token_pool.req_to_token
+            new_max = total_coop_end + 64
+            new_buf = np.zeros((old_buf.shape[0], new_max), dtype=old_buf.dtype)
+            new_buf[:, : old_buf.shape[1]] = old_buf
+            self.req_to_token_pool.req_to_token = new_buf
+            self.req_to_token_pool.max_context_len = new_max
+
+        total_new_pages = total_coop_end // self.page_size
+        real_pages_needed = coop_target_len // self.page_size
+        alloc = self.token_to_kv_pool_allocator
+        for r in range(self.dp_size):
+            avail = alloc.available_size(dp_rank=r)
+            needed_tokens = max(total_coop_end, (real_pages_needed + 1) * self.page_size)
+            if avail < needed_tokens:
+                try:
+                    from sgl_jax.srt.mem_cache.base_prefix_cache import EvictParams
+                    self.tree_cache.evict(EvictParams(num_tokens=needed_tokens - avail, dp_rank=r))
+                except ImportError:
+                    self.tree_cache.evict(needed_tokens - avail, dp_rank=r)
+            alloc.merge_and_sort_free(r)
+
+        common_pages = alloc.free_pages[0]
+        for r in range(1, self.dp_size):
+            common_pages = np.intersect1d(common_pages, alloc.free_pages[r], assume_unique=True)
+        if len(common_pages) >= total_new_pages:
+            selected_pages = common_pages[:total_new_pages]
+            allocated_unique_pages = selected_pages
+        elif len(common_pages) >= real_pages_needed + 1:
+            real_pages = common_pages[:real_pages_needed]
+            scratch_page = common_pages[real_pages_needed]
+            pad_pages = np.full(
+                total_new_pages - real_pages_needed, scratch_page, dtype=common_pages.dtype
+            )
+            selected_pages = np.concatenate([real_pages, pad_pages])
+            allocated_unique_pages = common_pages[: real_pages_needed + 1]
+        else:
+            return None
+
+        for r in range(self.dp_size):
+            alloc.free_pages[r] = np.setdiff1d(
+                alloc.free_pages[r], allocated_unique_pages, assume_unique=True
+            )
+
+        full_kv_indices = (
+            selected_pages[:, None] * self.page_size
+            + np.arange(self.page_size, dtype=np.int32)[None, :]
+        ).reshape(-1)
+
+        coop_req_pool_idx = 0
+        self.req_to_token_pool.write(
+            (coop_req_pool_idx, slice(0, total_coop_end)),
+            full_kv_indices,
+        )
+
+        pad_len = max(0, total_coop_end - len(ids0))
+        shared_token_ids = list(ids0[:total_coop_end]) + ([0] * pad_len)
+
+        self._coop_prefill_state = {
+            "cur_pos": 0,
+            "coop_chunk": coop_chunk,
+            "coop_target_len": coop_target_len,
+            "total_coop_end": total_coop_end,
+            "shared_token_ids": shared_token_ids,
+            "extra_key": extra_key,
+            "full_kv_indices": full_kv_indices,
+            "coop_req_pool_idx": coop_req_pool_idx,
+            "sampling_params": first_req.sampling_params,
+        }
+        logger.info(
+            "[CoopPrefill] Starting cooperative shared-prefix prefill across %d DP ranks: "
+            "coop_chunk=%d, lcp_len=%d, coop_target_len=%d, num_steps=%d",
+            self.dp_size,
+            coop_chunk,
+            lcp_len,
+            coop_target_len,
+            num_steps,
+        )
+        return self._build_coop_step_batch(self._coop_prefill_state)
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
         # closed: existing chunked requests still advance, but nothing new is
@@ -2097,6 +2377,11 @@ class Scheduler(
         # Settle completed async D2H backups before scheduling.
         if getattr(self.tree_cache, "hicache_enabled", False):
             self.tree_cache.check_hicache_events()
+
+        if not admissions_paused:
+            coop_batch = self._maybe_get_coop_prefill_batch()
+            if coop_batch is not None:
+                return coop_batch
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
@@ -2614,6 +2899,18 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
+            if (
+                getattr(batch, "is_coop_prefill_batch", False)
+                or (
+                    batch.reqs_info
+                    and batch.reqs_info[0].reqs
+                    and str(batch.reqs_info[0].reqs[0].rid).startswith("__coop_prefill_")
+                )
+            ):
+                if self.enable_overlap:
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self.set_next_batch_sampling_info_done(batch)
+                return
             if self.pd:
                 with self._pd_swap_p_pool():
                     self.process_batch_result_prefill(batch, result, launch_done)
