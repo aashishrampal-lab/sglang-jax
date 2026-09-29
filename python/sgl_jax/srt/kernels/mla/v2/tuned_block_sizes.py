@@ -404,6 +404,11 @@ TUNED_BLOCK_SIZES_MLA["TPU v7"].update({
     ('decode', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 64): (8, 1, 2),  # 2.3794 ms  [mla_tuned_blocks_heads64_dp32.txt]
     ('mixed', 'bfloat16', 'bfloat16', 16, 512, 64, 128, 4096): (4, 128),  # 5.2662 ms  [mla_tuned_blocks_heads16_dp8.txt]
     ('mixed', 'bfloat16', 'bfloat16', 16, 512, 64, 128, 8192): (4, 128),  # 12.5046 ms  [mla_tuned_blocks_heads16_dp8.txt]
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 1): (16, 4),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 2): (16, 4),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 4): (16, 4),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 8): (16, 4),
+    ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 16): (16, 4),
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 32): (16, 4),  # 0.5876 ms  [mla_tuned_blocks_heads64_dp32.txt]
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 64): (4, 16),  # 0.7862 ms  [mla_tuned_blocks_heads64_dp32.txt]
     ('mixed', 'bfloat16', 'bfloat16', 64, 512, 64, 128, 128): (8, 16),  # 0.9721 ms  [mla_tuned_blocks_heads64_dp32.txt]
