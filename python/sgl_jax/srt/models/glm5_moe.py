@@ -776,7 +776,7 @@ class Glm5DecoderLayer(nnx.Module):
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
-        use_fused_mlp = getattr(config, "_sgl_use_fused_mlp", True)
+        use_fused_mlp = False
 
         if layer_id < first_k_dense_replace:
             self.mlp = Glm5MLP(
