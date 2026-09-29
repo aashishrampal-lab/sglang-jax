@@ -2206,7 +2206,7 @@ class Scheduler(
         if (
             self.dp_size <= 1
             or self.tree_cache is None
-            or self.tree_cache.disable
+            or getattr(self.tree_cache, "disable", True)
             or not self.running_batch.is_empty()
             or any(req is not None for req in self.chunked_reqs)
             or len(self.waiting_queue) == 0
