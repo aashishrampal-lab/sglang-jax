@@ -2908,7 +2908,11 @@ class Scheduler(
                 )
             ):
                 if self.enable_overlap:
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                        if launch_done is not None:
+                            launch_done.wait()
+                    else:
+                        self.tp_worker.resolve_last_batch_result(launch_done)
                     self.set_next_batch_sampling_info_done(batch)
                 return
             if self.pd:
