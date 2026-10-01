@@ -212,6 +212,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             else layer.scaling
         )
         dpa = self.attention_data_partition_axis
+        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+        if new_kv_c.dtype != kv_cache.dtype:
+            new_kv_c = new_kv_c.astype(kv_cache.dtype)
+        if new_k_pe.dtype != kv_cache.dtype:
+            new_k_pe = new_k_pe.astype(kv_cache.dtype)
         md = self.forward_metadata
 
         # ── dense short-circuit ────────────────────────────────────────────
@@ -339,6 +344,81 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
     # internals
     # ────────────────────────────────────────────────────────────────────────
 
+    def _scatter_or_coop_idx(self, cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa):
+        page_size = cache3d.shape[1]
+        idx_dim = cache3d.shape[2]
+        coop_chunk = k_.shape[0]
+        if (
+            coop_chunk >= 1024
+            and self.mesh is not None
+            and self.mesh.shape.get(dpa, 1) > 1
+            and (self.mesh.shape[dpa] * coop_chunk) % page_size == 0
+        ):
+            coop_flag = seq_lens_[-1]
+            seq_lens_ = jnp.where(coop_flag < 0, seq_lens_.at[-1].set(0), seq_lens_)
+
+            def _coop_update_idx(c3d_):
+                pos_base = -coop_flag - 1
+                start_page = pos_base // page_size
+                dp_sz = self.mesh.shape[dpa]
+                pages_per_step = (dp_sz * coop_chunk) // page_size
+                all_k = jax.lax.all_gather(k_, dpa, axis=0, tiled=True)
+                k_pad = idx_dim - all_k.shape[-1]
+                if k_pad > 0:
+                    all_k = jnp.pad(all_k, ((0, 0), (0, k_pad)))
+                merged_pages = all_k.astype(c3d_.dtype).reshape(
+                    pages_per_step, page_size, idx_dim
+                )
+                dest_pages = jax.lax.dynamic_slice_in_dim(
+                    pi_, start_page, pages_per_step, axis=0
+                )
+                return c3d_.at[dest_pages].set(merged_pages)
+
+            cache3d = jax.lax.cond(
+                coop_flag < 0,
+                _coop_update_idx,
+                lambda c3d_: _scatter_paged(
+                    c3d_, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq
+                ),
+                cache3d,
+            )
+            return cache3d, seq_lens_
+        return _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq), seq_lens_
+
+    def _coop_kv_update(self, kvc_, kpe_, cache_, seq_lens_, pi_, dpa):
+        coop_chunk = kvc_.shape[0]
+        if (
+            coop_chunk >= 1024
+            and self.mesh is not None
+            and self.mesh.shape.get(dpa, 1) > 1
+            and (self.mesh.shape[dpa] * coop_chunk) % self.page_size == 0
+        ):
+            coop_flag = seq_lens_[-1]
+            seq_lens_ = jnp.where(coop_flag < 0, seq_lens_.at[-1].set(0), seq_lens_)
+
+            def _coop_update(c_):
+                pos_base = -coop_flag - 1
+                start_page = pos_base // self.page_size
+                dp_sz = self.mesh.shape[dpa]
+                pages_per_step = (dp_sz * coop_chunk) // self.page_size
+                all_kv_c = jax.lax.all_gather(kvc_, dpa, axis=0, tiled=True)
+                all_k_pe = jax.lax.all_gather(kpe_, dpa, axis=0, tiled=True)
+                nope_pad = ((all_kv_c.shape[-1] + 127) // 128) * 128 - all_kv_c.shape[-1]
+                rope_pad = ((all_k_pe.shape[-1] + 127) // 128) * 128 - all_k_pe.shape[-1]
+                kv_c_padded = jnp.pad(all_kv_c, ((0, 0), (0, nope_pad))).astype(c_.dtype)
+                k_pe_padded = jnp.pad(all_k_pe, ((0, 0), (0, rope_pad))).astype(c_.dtype)
+                merged = jnp.concatenate([kv_c_padded, k_pe_padded], axis=-1)
+                merged_pages = merged.reshape(
+                    pages_per_step, c_.shape[1], c_.shape[2], c_.shape[3]
+                )
+                dest_pages = jax.lax.dynamic_slice_in_dim(
+                    pi_, start_page, pages_per_step, axis=0
+                )
+                return c_.at[dest_pages].set(merged_pages)
+
+            cache_ = jax.lax.cond(coop_flag < 0, _coop_update, lambda c_: c_, cache_)
+        return cache_, seq_lens_
+
     def _maybe_index(
         self,
         is_full,
@@ -379,7 +459,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             idx_dim = cache_.shape[3]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            cache3d, seq_lens_ = self._scatter_or_coop_idx(
+                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
+            )
             if compute_topk and _PAGE_TOPK_BUDGET > 0:
                 # Page-scoring path: budget pages picked directly by max-pooled
                 # page score; token-level topk is not materialized (sparse MLA
@@ -551,7 +633,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             idx_dim = cache_.shape[3]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            cache3d, seq_lens_ = self._scatter_or_coop_idx(
+                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
+            )
             if _INDEXER_KERNEL_PREFILL:
                 # dist_[2] == number of real (seq_len > 0) sequences in this
                 # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
@@ -639,6 +723,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+            cache_, sl_ = self._coop_kv_update(kvc_, kpe_, cache_, sl_, pi_, dpa)
             if _PREFILL_QBLOCK:
                 o, cache_new = prefill_write_and_attend_ragged_qblock(
                     ql_,
@@ -711,6 +796,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         sc = layer.logit_cap if layer is not None else None
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
+            cache_, seq_lens_ = self._coop_kv_update(
+                kvc_, kpe_, cache_, seq_lens_, pi_, dpa
+            )
             return mla_ragged_paged_attention(
                 ql_,
                 qpe_,
