@@ -58,6 +58,7 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # K=128, ep=16, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 8 TPU v7x chips / 16 JAX devices, 2026-08-04
         # (Falcon exp-fvmfgcw2y9).
+        ('bfloat16', 'float8_e4m3fn', 16, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True): (8, 1024, 8, 128, 8),
@@ -68,6 +69,7 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
         # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
         # K=128, ep=32, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 16 TPU v7x chips, 2026-08-03 (Falcon exp-bkbi8g86uy).
@@ -81,6 +83,22 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
+        # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed BF16, ep=32,
+        # in-kernel shared expert, act_quant OFF, no grouped top-k.
+        # Tuned on 16 TPU v7x chips (2x2x4, 32 TensorCores), 2026-10-05.
+        ('bfloat16', 'bfloat16', 32, 256, 8, 6144, 2048, 32, True, False, False): (8, 256, 8, 256, 8),  # 0.233 ms
+        ('bfloat16', 'bfloat16', 64, 256, 8, 6144, 2048, 32, True, False, False): (8, 256, 8, 256, 8),  # 0.234 ms
+        ('bfloat16', 'bfloat16', 128, 256, 8, 6144, 2048, 32, True, False, False): (8, 256, 16, 256, 16),  # 0.237 ms
+        ('bfloat16', 'bfloat16', 256, 256, 8, 6144, 2048, 32, True, False, False): (8, 256, 16, 256, 16),  # 0.238 ms
+        ('bfloat16', 'bfloat16', 512, 256, 8, 6144, 2048, 32, True, False, False): (16, 256, 32, 256, 32),  # 0.250 ms
+        ('bfloat16', 'bfloat16', 1024, 256, 8, 6144, 2048, 32, True, False, False): (32, 512, 64, 512, 64),  # 0.301 ms
+        ('bfloat16', 'bfloat16', 2048, 256, 8, 6144, 2048, 32, True, False, False): (64, 512, 80, 256, 80),  # 0.414 ms
+        ('bfloat16', 'bfloat16', 4096, 256, 8, 6144, 2048, 32, True, False, False): (128, 512, 160, 512, 160),  # 0.653 ms
+        ('bfloat16', 'bfloat16', 8192, 256, 8, 6144, 2048, 32, True, False, False): (128, 512, 160, 512, 160),  # 1.165 ms
+        ('bfloat16', 'bfloat16', 16384, 256, 8, 6144, 2048, 32, True, False, False): (128, 512, 160, 512, 160),  # 2.265 ms
+        ('bfloat16', 'bfloat16', 32768, 256, 8, 6144, 2048, 32, True, False, False): (128, 512, 160, 512, 160),  # 4.612 ms
+        ('bfloat16', 'bfloat16', 65536, 256, 8, 6144, 2048, 32, True, False, False): (128, 512, 160, 512, 160),  # 12.128 ms (with TopK)
+        ('bfloat16', 'bfloat16', 131072, 256, 8, 6144, 2048, 32, True, False, False): (128, 512, 160, 512, 160),  # 24.465 ms (with TopK)
         # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
         # Tuned 2026-05-27
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),

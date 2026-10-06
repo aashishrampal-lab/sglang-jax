@@ -195,11 +195,11 @@ class CompilationManager:
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
         is_fused_moe = self.moe_backend in ("fused", "fused_v2")
-        min_fused_bs = self.tp_size * 2
+        min_fused_bs = self.tp_size if self.moe_backend == "fused_v2" else self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
                 f"max_padded_batch_size={self.max_padded_batch_size} is below the fused-MoE "
-                f"minimum 2 * mesh_ep_size={min_fused_bs}. Increase --max-running-requests "
+                f"minimum {min_fused_bs}. Increase --max-running-requests "
                 "or reduce the EP group size."
             )
 

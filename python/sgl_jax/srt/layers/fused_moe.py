@@ -212,6 +212,12 @@ class FusedEPMoE(nnx.Module):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
+        if (
+            not is_static
+            and self.w1_scale is not None
+            and getattr(self.w1.value, "dtype", None) == self.quantized_dtype
+        ):
+            return
 
         # Determine quant_block_k. The v1 kernel requires a block size when
         # scales are provided, so per-channel fp8 must tile to block-256; the v2
@@ -324,7 +330,12 @@ class FusedEPMoE(nnx.Module):
 
                 return
 
-            # Replace original weights with quantized versions
+            # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
+            ep_sharding = P(("data", "tensor"), None, None)
+            ep_scale_sharding = P(("data", "tensor"), None, None, None)
+
+            # Replace original weights with quantized versions one by one so
+            # each BF16 expert tensor is freed before quantizing the next.
             if self.quant_block_n is not None:
                 # 2D block-wise quantization: scale shape (E, K//block_k, N//block_n)
                 w1_value, w1_scale = quantize_tensor(
@@ -333,18 +344,24 @@ class FusedEPMoE(nnx.Module):
                     axis=(1, 2),
                     block_size=[self.quant_block_k, self.quant_block_n],
                 )
+                self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
+                del w1_value
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=(1, 2),
                     block_size=[self.quant_block_k, self.quant_block_n],
                 )
+                self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
+                del w3_value
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=(1, 2),
                     block_size=[self.quant_block_k, self.quant_block_n],
                 )
+                self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+                del w2_value
             else:
                 # 1D sub-channel quantization: scale shape (E, K//wsz, N)
                 w1_value, w1_scale = quantize_tensor(
@@ -353,26 +370,24 @@ class FusedEPMoE(nnx.Module):
                     axis=1,
                     block_size=self.quant_block_k,
                 )
+                self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
+                del w1_value
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=1,
                     block_size=self.quant_block_k,
                 )
+                self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
+                del w3_value
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=1,
                     block_size=self.quant_block_k,
                 )
-
-            # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
-            ep_sharding = P(("data", "tensor"), None, None)
-            ep_scale_sharding = P(("data", "tensor"), None, None, None)
-
-            self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
-            self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
-            self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+                self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+                del w2_value
 
             # Update scales (reshape to 4D for GMM kernel)
             if self.quant_block_n is not None:

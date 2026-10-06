@@ -894,6 +894,7 @@ class Glm5DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        token_valid_mask: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
@@ -931,6 +932,8 @@ class Glm5DecoderLayer(nnx.Module):
                 correction_bias,
                 dispatch_info=dispatch_info,
             )
+            if self.use_fused and token_valid_mask is not None:
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
@@ -987,6 +990,7 @@ class Glm5Model(nnx.Module):
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
         residual = None
         layers_kv_fused = []
         layers_idx_fused = []
@@ -1000,6 +1004,7 @@ class Glm5Model(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                token_valid_mask=token_valid_mask,
                 dispatch_info=forward_batch.expert_location_metadata,
                 dsa_topk_in=dsa_topk,
                 dsa_topk_pages_in=dsa_topk_pages,
@@ -1088,7 +1093,42 @@ class Glm5ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
-        loader.load(weight_mappings)
+        quant_config = getattr(model_config, "quantization_config", None)
+        if (
+            quant_config is not None
+            and not quant_config.is_static_checkpoint
+            and not getattr(model_config, "_dummy_mode", False)
+            and quant_config.has_moe_quantization()
+        ):
+            import gc
+
+            chunk_size = 20
+            num_layers = self.config.num_hidden_layers
+            for start_layer in range(0, num_layers, chunk_size):
+                end_layer = min(start_layer + chunk_size, num_layers)
+                layer_prefixes = tuple(
+                    f"model.layers.{i}." for i in range(start_layer, end_layer)
+                )
+                chunk_mappings = {
+                    k: v
+                    for k, v in weight_mappings.items()
+                    if k.startswith(layer_prefixes)
+                    or (
+                        end_layer == num_layers
+                        and not k.startswith("model.layers.")
+                    )
+                }
+                loader.load(chunk_mappings)
+                for i in range(start_layer, end_layer):
+                    mlp = getattr(self.model.layers[i], "mlp", None)
+                    if isinstance(mlp, (EPMoE, FusedEPMoE)):
+                        mlp.quantize_weights(
+                            is_static=False,
+                            abstract=getattr(model_config, "_abstract_mode", False),
+                        )
+                gc.collect()
+        else:
+            loader.load(weight_mappings)
 
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
 
