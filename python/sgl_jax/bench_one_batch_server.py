@@ -453,18 +453,31 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
+    if bench_args.dataset_name == "generated-shared-prefix":
+        eff_input_len = bench_args.gsp_system_prompt_len + bench_args.gsp_question_len
+        eff_output_len = bench_args.gsp_output_len
+        summary = f"\nInput lens: ({eff_input_len},). Output lens: ({eff_output_len},).\n"
+    else:
+        eff_input_len = bench_args.input_len[0] if bench_args.input_len else 1024
+        eff_output_len = bench_args.output_len[0] if bench_args.output_len else 16
+        summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+
+    summary += "| batch size | latency (s) | ttft (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | req cost ($) | e2e req cost ($) |"
 
     if bench_args.profile:
         summary += " profile |"
 
     summary += "\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
+    summary += "| ---------- | ----------- | -------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | ------------ | ---------------- |"
 
     if bench_args.profile:
         summary += "-------------|"
     summary += "\n"
+
+    actual_tp_size = server_info.get("tp_size", server_args.tp_size) or 32
+    num_tpu7x_chips = (actual_tp_size // 2) if actual_tp_size > 1 else 16
+    tpu7x_chip_hourly_cost = 12.0  # $12.00/hour per TPU v7x chip (On-Demand)
+    hourly_cost = num_tpu7x_chips * tpu7x_chip_hourly_cost  # $192.00/hour for 16 TPU v7x chips
 
     for (
         batch_size,
@@ -477,18 +490,24 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         acc_length,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
         input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
+        input_cost_per_1m = 1e6 / (input_throughput * input_util) / 3600 * hourly_cost
+        output_cost_per_1m = 1e6 / output_throughput / 3600 * hourly_cost
+        req_cost = (eff_input_len / 1e6) * input_cost_per_1m + (eff_output_len / 1e6) * output_cost_per_1m
+        e2e_req_cost = (latency / batch_size) / 3600 * hourly_cost
         line = (
             f"| {batch_size} | "
             f"{latency:.2f} | "
+            f"{ttft:.2f} | "
             f"{input_throughput:.2f} | "
             f"{output_throughput:.2f} | "
             f"{accept_length} | "
             f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
+            f"{input_cost_per_1m:.2f} | "
+            f"{output_cost_per_1m:.2f} | "
+            f"{req_cost:.4f} | "
+            f"{e2e_req_cost:.4f} |"
         )
         if trace_link:
             line += f" [Profile]({trace_link}) |"

@@ -898,7 +898,7 @@ class Scheduler(
             getattr(self, "_pd_pending_migrate", None),
         ]
         for batch in batches:
-            if batch is None:
+            if batch is None or getattr(batch, "is_coop_prefill_batch", False):
                 continue
             for rank, info in enumerate(batch.reqs_info):
                 for req in info.reqs or ():
@@ -925,7 +925,7 @@ class Scheduler(
             self._iter_dp_requests(),
             self._estimate_req_input_output_tokens,
             request_limits=tuple(
-                0 if info.batch_is_full else self.per_dp_max_running_requests
+                0 if (info.batch_is_full and info.reqs) else self.per_dp_max_running_requests
                 for info in self.running_batch.reqs_info
             ),
         )
@@ -1963,7 +1963,11 @@ class Scheduler(
             self._eagle3_overlap_parked_batch = None
 
         # Merge the prefill batch into the running batch
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        if (
+            self.last_batch
+            and self.last_batch.forward_mode.is_extend()
+            and not getattr(self.last_batch, "is_coop_prefill_batch", False)
+        ):
             # Consistency check: each last_batch.reqs_info[dp_rank].chunked_req should match
             # what's in chunked_req_to_exclude (since self.chunked_reqs should contain the same requests)
             for dp_rank in range(self.dp_size):
@@ -2207,9 +2211,10 @@ class Scheduler(
                     )
             self._coop_prefill_state = None
 
-            if self.running_batch.is_empty() and len(self.waiting_queue) <= self.dp_size:
+            running_counts = [len(info.reqs) for info in self.running_batch.reqs_info]
+            if len(set(running_counts)) <= 1:
                 for idx, wreq in enumerate(self.waiting_queue):
-                    wreq.dp_rank = idx
+                    wreq.dp_rank = idx % self.dp_size
 
             logger.info(
                 "[CoopPrefill] Global RadixCache populated across all %d DP ranks: "
@@ -2223,8 +2228,15 @@ class Scheduler(
         if (
             self.dp_size <= 1
             or self.tree_cache is None
-            or getattr(self.tree_cache, "disable", True)
-            or not self.running_batch.is_empty()
+            or isinstance(self.tree_cache, ChunkCache)
+            or getattr(self.tree_cache, "disable", False)
+            or os.environ.get("SGL_MLA_COOP_PREFIX", "1") == "0"
+            or self.running_batch.batch_is_full
+            or len(self.req_to_token_pool.free_slots) == 0
+            or any(
+                len(info.reqs) >= getattr(self, "per_dp_max_running_requests", 1)
+                for info in self.running_batch.reqs_info
+            )
             or any(req is not None for req in self.chunked_reqs)
             or len(self.waiting_queue) == 0
         ):
@@ -2238,6 +2250,9 @@ class Scheduler(
         # wait briefly in lockstep for the 2nd request of a batch to arrive
         # so we can compute the exact shared system prompt LCP.
         if len(self.waiting_queue) == 1:
+            if self.pending_dp_reqs:
+                ready_reqs = self.select_dp_for_request([])
+                self.process_input_requests(ready_reqs)
             for _ in range(40):
                 if len(self.waiting_queue) >= 2:
                     break
@@ -2282,10 +2297,9 @@ class Scheduler(
         max_cached = max(cached_per_rank)
         if coop_target_len - min_cached < 4096:
             return None
-        if max_cached > 0:
-            self.tree_cache.reset()
+        if not self.running_batch.is_empty() and max_cached >= 4096:
+            return None
 
-        # Start from 0 for clean symmetric page allocation across all DP ranks
         step_tokens = self.dp_size * coop_chunk
         num_steps = (coop_target_len + step_tokens - 1) // step_tokens
         total_coop_end = num_steps * step_tokens
@@ -2299,16 +2313,34 @@ class Scheduler(
 
         total_new_pages = total_coop_end // self.page_size
         real_pages_needed = coop_target_len // self.page_size
+        needed_tokens = max(total_coop_end, (real_pages_needed + 1) * self.page_size)
+        max_new_tokens = getattr(first_req.sampling_params, "max_new_tokens", 0) or 0
+        min_req_tokens = len(first_req.origin_input_ids) + max_new_tokens + self.page_size
         alloc = self.token_to_kv_pool_allocator
+        required_per_rank = min(
+            alloc.size // self.dp_size, max(needed_tokens, min_req_tokens)
+        )
         for r in range(self.dp_size):
             avail = alloc.available_size(dp_rank=r)
-            needed_tokens = max(total_coop_end, (real_pages_needed + 1) * self.page_size)
-            if avail < needed_tokens:
+            evict = self.tree_cache.evictable_size(dp_rank=r)
+            if avail + evict < required_per_rank:
+                return None
+
+        if self.running_batch.is_empty() and (
+            max_cached > 0
+            or any(alloc.available_size(dp_rank=r) < required_per_rank for r in range(self.dp_size))
+        ):
+            self.tree_cache.reset()
+            self.token_to_kv_pool_allocator.clear()
+
+        for r in range(self.dp_size):
+            avail = alloc.available_size(dp_rank=r)
+            if avail < required_per_rank:
                 try:
                     from sgl_jax.srt.mem_cache.base_prefix_cache import EvictParams
-                    self.tree_cache.evict(EvictParams(num_tokens=needed_tokens - avail, dp_rank=r))
+                    self.tree_cache.evict(EvictParams(num_tokens=required_per_rank - avail, dp_rank=r))
                 except ImportError:
-                    self.tree_cache.evict(needed_tokens - avail, dp_rank=r)
+                    self.tree_cache.evict(required_per_rank - avail, dp_rank=r)
             alloc.merge_and_sort_free(r)
 
         common_pages = alloc.free_pages[0]
@@ -2338,7 +2370,7 @@ class Scheduler(
             + np.arange(self.page_size, dtype=np.int32)[None, :]
         ).reshape(-1)
 
-        coop_req_pool_idx = 0
+        coop_req_pool_idx = int(self.req_to_token_pool.free_slots[0])
         self.req_to_token_pool.write(
             (coop_req_pool_idx, slice(0, total_coop_end)),
             full_kv_indices,
@@ -2391,7 +2423,7 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
-        if self.is_hybrid:
+        if self.is_hybrid or self.running_batch.is_empty():
             for info in self.running_batch.reqs_info:
                 info.batch_is_full = False
 
@@ -2431,6 +2463,7 @@ class Scheduler(
         )
 
         # Process existing chunked requests for each DP rank
+        had_chunked_reqs = [req is not None for req in self.chunked_reqs]
         for dp_rank in range(self.dp_size):
             req = self.chunked_reqs[dp_rank]
             if req is not None and self._pending_chunked_abort_reqs[dp_rank] is None:
@@ -2481,7 +2514,8 @@ class Scheduler(
             # this round: a boundary-only split leaves chunk budget, so a second
             # req could otherwise truncate and overwrite new_chunked_reqs).
             if (
-                self.chunked_reqs[dp_rank] is not None
+                had_chunked_reqs[dp_rank]
+                or self.chunked_reqs[dp_rank] is not None
                 or adder.new_chunked_reqs[dp_rank] is not None
             ):
                 continue
@@ -3080,6 +3114,21 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         self._sync_chunked_req_owners()
         self._mark_pending_chunked_aborts(recv_req)
+
+        # Delete requests in pending_dp_reqs (unassigned DP queue)
+        to_del_pending = []
+        for i, req in enumerate(self.pending_dp_reqs):
+            rid = getattr(req, "rid", "")
+            if recv_req.abort_all or (isinstance(rid, str) and rid.startswith(recv_req.rid)):
+                to_del_pending.append(i)
+        for i in reversed(to_del_pending):
+            req = self.pending_dp_reqs.pop(i)
+            abort_out = AbortReq(rid=req.rid)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(abort_out)
+            else:
+                self.send_to_tokenizer.send_pyobj(abort_out)
+            logger.debug("Abort pending_dp request. rid=%s", req.rid)
 
         # Delete requests in the waiting queue
         to_del = []
