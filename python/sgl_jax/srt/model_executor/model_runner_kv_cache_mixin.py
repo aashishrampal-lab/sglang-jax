@@ -300,13 +300,16 @@ def _build_hybrid_pools(
 
 def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
     """Wrap a single KV pool in MemoryPools."""
-    from sgl_jax.srt.mem_cache.memory_pool import MSAIndexKProxy, MSATokenToKVPool
+    try:
+        from sgl_jax.srt.mem_cache.memory_pool import MSAIndexKProxy, MSATokenToKVPool
 
-    if isinstance(token_to_kv_pool, MSATokenToKVPool):
-        return MemoryPools(
-            token_to_kv_pool=token_to_kv_pool,
-            msa_index_k=MSAIndexKProxy(token_to_kv_pool),
-        )
+        if isinstance(token_to_kv_pool, MSATokenToKVPool):
+            return MemoryPools(
+                token_to_kv_pool=token_to_kv_pool,
+                msa_index_k=MSAIndexKProxy(token_to_kv_pool),
+            )
+    except (ImportError, AttributeError):
+        pass
     return MemoryPools(token_to_kv_pool=token_to_kv_pool)
 
 
