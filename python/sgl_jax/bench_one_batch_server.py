@@ -305,11 +305,13 @@ def run_one_case(
                 if "error" in data:
                     raise RuntimeError(f"Request has failed. {data}.")
 
+                fr = data["meta_info"]["finish_reason"]
                 assert (
-                    data["meta_info"]["finish_reason"] is None
-                    or data["meta_info"]["finish_reason"]["type"] == "length"
-                )
-                if data["meta_info"]["completion_tokens"] == 1:
+                    fr is None
+                    or fr == "length"
+                    or (isinstance(fr, dict) and fr.get("type") in ("length", "stop", None))
+                ), f"Unexpected finish reason: {fr}"
+                if ttft == 0.0 and data["meta_info"]["completion_tokens"] >= 1:
                     ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic

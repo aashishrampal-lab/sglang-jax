@@ -421,7 +421,11 @@ class MiniLoadBalancer:
                                 )
                             yield chunk
                     finally:
-                        await asyncio.gather(prefill_drain, return_exceptions=True)
+                        prefill_drain.cancel()
+                        try:
+                            await prefill_drain
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
         return StreamingResponse(
             stream_results(),
