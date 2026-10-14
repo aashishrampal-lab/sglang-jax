@@ -135,6 +135,7 @@ class CompilationManager:
         supports_recurrent_cow: bool = False,
         supports_recurrent_track: bool = False,
         moe_backend: str | None = None,
+        attn_backend=None,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -156,6 +157,10 @@ class CompilationManager:
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
+        self.disaggregation_mode = getattr(server_args, "disaggregation_mode", "null")
+        # Backends may request decode variants per pages-per-seq bucket (MSA);
+        # None keeps one decode shape per bs. Shared by warmup and AOT export.
+        self.decode_page_buckets = getattr(attn_backend, "decode_page_buckets", None)
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -165,6 +170,8 @@ class CompilationManager:
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
         if user_paddings is None:
+            if self.disaggregation_mode == "decode":
+                return [self.max_padded_batch_size]
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
             # The static defaults top out at 8192 * dp_size. When the token
             # budget is larger, keep doubling so the final max-size bucket is
@@ -195,11 +202,11 @@ class CompilationManager:
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
         is_fused_moe = self.moe_backend in ("fused", "fused_v2")
-        min_fused_bs = self.tp_size if self.moe_backend == "fused_v2" else self.tp_size * 2
+        min_fused_bs = self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
                 f"max_padded_batch_size={self.max_padded_batch_size} is below the fused-MoE "
-                f"minimum {min_fused_bs}. Increase --max-running-requests "
+                f"minimum 2 * mesh_ep_size={min_fused_bs}. Increase --max-running-requests "
                 "or reduce the EP group size."
             )
 
@@ -267,6 +274,11 @@ class CompilationManager:
             else server_args.max_running_requests
         )
         constraints = [server_limit, pool_limit, attn_backend_limit]
+        if (
+            getattr(server_args, "disaggregation_mode", "null") == "prefill"
+            and server_args.max_running_requests is None
+        ):
+            constraints.append(256)
         max_running_requests = min(constraints)
         # Log each constraint for debugging
         logger.info("Max running requests constraints:")
@@ -345,15 +357,40 @@ class CompilationManager:
         return batch_size, num_tokens
 
     def iter_model_shapes(self, mode):
-        """The model shapes used by both serving warmup and offline export."""
+        """The model shapes used by both serving warmup and offline export.
+
+        Yields ``(bs, tokens, cache_loc, decode_pages)``. ``decode_pages`` is the
+        per-request page-table bucket a backend traces decode at (None = the
+        plain shape; see ``decode_dummy_seq_len``).
+        """
         if mode.is_extend():
             for tokens in self.token_buckets:
-                yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1]
+                yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1], None
         elif mode.is_decode():
             for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
-                yield bs, bs, cache_loc
+                for pages in self.decode_page_buckets or [None]:
+                    yield bs, bs, cache_loc, pages
         else:
             raise ValueError(f"No serving precompile shapes for {mode}")
+
+    def decode_page_count(self, bs: int, cache_loc: int, decode_pages: int | None) -> int | None:
+        """Decode page-table length for a ``(bs, cache_loc, decode_pages)`` shape.
+
+        Mirrors serving: FlashAttention.get_forward_metadata bounds the per-DP page
+        table by the backend's bucket but never grows it past the cache_loc pages,
+        so both warmup and offline export see ``min(bs * pages, cache_loc / page)``.
+        None means the backend does not bound the page table (plain shape)."""
+        if decode_pages is None:
+            return None
+        return min(bs * decode_pages, cache_loc // self.page_size)
+
+    def decode_dummy_seq_len(self, decode_pages: int | None) -> int:
+        """Warmup seq_len for a decode page bucket: fills ``decode_pages`` pages so the
+        backend's page-table bound (FlashAttention._decode_page_limit) lands exactly
+        on that bucket; the plain shape keeps the historical seq_len=1."""
+        if decode_pages is None:
+            return 1
+        return decode_pages * self.page_size - 1
 
     @staticmethod
     def compiler_options(backend, batch=None, overrides=None):
@@ -399,6 +436,7 @@ class CompilationManager:
         prepare_lora_fn: Callable | None = None,
         future_token_ids_map=None,
     ):
+        disagg_mode = getattr(model_runner.server_args, "disaggregation_mode", "null")
         self._precompile_encode(model_runner)
         self._precompile_extend(
             forward_fn,
@@ -407,9 +445,10 @@ class CompilationManager:
             prepare_lora_fn,
             future_token_ids_map,
         )
-        self._precompile_decode(
-            forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
-        )
+        if disagg_mode != "prefill":
+            self._precompile_decode(
+                forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+            )
 
     def _precompile_encode(self, model_runner) -> None:
         if not self.precompile_in_model_multimodal:
@@ -442,7 +481,7 @@ class CompilationManager:
         )
 
         def batches():
-            for bs, tokens, cache_loc in dict.fromkeys(self.iter_model_shapes(mode)):
+            for bs, tokens, cache_loc, pages in dict.fromkeys(self.iter_model_shapes(mode)):
                 batch = self._make_dummy_batch(
                     bs,
                     tokens,
@@ -450,6 +489,7 @@ class CompilationManager:
                     cache_loc,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs // self.dp_size,
+                    dummy_seq_len=self.decode_dummy_seq_len(pages),
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 yield batch
@@ -528,7 +568,7 @@ class CompilationManager:
             leave=False,
             total=len(self.token_buckets),
         ) as pbar:
-            for bs_val, num_tokens, cache_loc_size in pbar:
+            for bs_val, num_tokens, cache_loc_size, _ in pbar:
                 pbar.set_postfix(bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
@@ -583,18 +623,15 @@ class CompilationManager:
         start_time = time.perf_counter()
         self._compile_model_buckets(model_runner, ForwardMode.DECODE)
         logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s",
+            "[DECODE] Begin to precompile bs_paddings=%s decode_page_buckets=%s",
             self.bs_buckets,
+            self.decode_page_buckets,
         )
 
-        with tqdm(
-            self.iter_model_shapes(ForwardMode.DECODE),
-            desc="[DECODE] PRECOMPILE",
-            leave=False,
-            total=len(self.bs_buckets),
-        ) as pbar:
-            for bs_val, num_tokens, aligned_cache_loc_size in pbar:
-                pbar.set_postfix(bs=bs_val)
+        shapes = list(self.iter_model_shapes(ForwardMode.DECODE))
+        with tqdm(shapes, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
+            for bs_val, num_tokens, aligned_cache_loc_size, pages in pbar:
+                pbar.set_postfix(bs=bs_val, pages=pages)
                 batch = self._make_dummy_batch(
                     bs_val,
                     num_tokens,
@@ -602,6 +639,7 @@ class CompilationManager:
                     aligned_cache_loc_size,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
+                    dummy_seq_len=self.decode_dummy_seq_len(pages),
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
@@ -655,6 +693,7 @@ class CompilationManager:
         speculative_algorithm=None,
         dp_size: int = 1,
         per_dp_bs_size: int = 0,
+        dummy_seq_len: int = 1,
     ):
         import jax.numpy as jnp
 
@@ -685,12 +724,12 @@ class CompilationManager:
         if invalid_cache_loc_size < 0:
             raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
 
-        valid_cache_loc = np.arange(bs)
+        valid_cache_loc = np.arange(bs, dtype=np.int32)
         invalid_cache_loc = np.array([0] * invalid_cache_loc_size, dtype=jnp.int32)
         lora_ids = ["0"] * bs
 
-        extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
-        logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
+        extend_seq_lens = np.array([1] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+        logits_indices = np.array([0] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
 
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
@@ -709,15 +748,20 @@ class CompilationManager:
             real_input_ids_len=len(valid_input_ids),
             real_bs=bs,
             req_pool_indices=np.arange(bs, dtype=np.int32),
-            seq_lens=np.array([1] * bs, dtype=np.int32),
+            seq_lens=np.full(bs, dummy_seq_len, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
             return_output_logprob_only=return_output_logprob_only,
             sampling_info=sampling_info,
             extend_input_logprob_token_ids=None,
+            extend_next_token_ids=(
+                np.full(bs, -1, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+            ),
             positions=np.concat([valid_positions, invalid_positions], axis=0),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
+            extend_prefix_lens=(
+                np.array([0] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+            ),
             extend_seq_lens=extend_seq_lens,
             top_logprobs_nums=None,
             token_ids_logprobs=None,

@@ -45,7 +45,11 @@ def synced_terminal_rooms(
             st = KVPoll.FAILED
         local[i, 0] = int(room)
         local[i, 1] = 1 if st == KVPoll.SUCCESS else (-2 if st == KVPoll.FAILED else 0)
-    gathered = multihost_utils.process_allgather(local)
+    # Preserve all 64 bits of 63-bit bootstrap_room across TPU process_allgather
+    # when jax_enable_x64=False (which otherwise silently truncates int64 -> int32).
+    local_i32 = np.ascontiguousarray(local).view(np.int32)
+    gathered_i32 = np.asarray(multihost_utils.process_allgather(local_i32), dtype=np.int32)
+    gathered = np.ascontiguousarray(gathered_i32).view(np.int64)
     nproc = int(gathered.shape[0])
     per_room: dict[int, list[int]] = {}
     for p in range(nproc):

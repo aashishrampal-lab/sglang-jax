@@ -102,6 +102,97 @@ global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS
 logger = logging.getLogger(__name__)
 
 
+# Speculative TARGET_VERIFY / DRAFT_EXTEND batches are extend-shaped, and extend
+# batches take the largest cache_loc padding (max_running_requests x context).
+# Their page table (cache_loc[::page_size]) is copied into kernel scalar memory
+# once per layer, so at cc64 / 135k context that is 67584 int32 per layer for a
+# batch that needs ~1k entries. cache_loc is packed (request i occupies
+# [cum_aligned_len[i], cum_aligned_len[i+1])), so any padding >= the packed
+# length is valid: pick the smallest one. Opt-in (SGLANG_JAX_SPEC_CACHE_LOC_FIT=1):
+# the fitted padding follows (padded bs x longest request in the batch), so a
+# long-running server compiles one verify + one draft executable per distinct
+# bucket it wanders through (a cc64 1k/1k run touched 8 of each, ~3 min per
+# verify compile) until the ladder is precompiled at startup. Default OFF keeps
+# the single largest padding.
+_SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "0") == "1"
+# Per-request token caps that define the short cache_loc ladder ("rungs") a
+# fitted speculative batch may land on, below the bs bucket's own padding
+# (bs x max context). Each rung is one more (bs, cache_loc) shape to
+# precompile per bs bucket, so keep the list short.
+_SPEC_CACHE_LOC_LADDER = tuple(
+    int(x) for x in os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_LADDER", "55296").split(",") if x
+)
+
+
+def spec_cache_loc_rungs(
+    bs_paddings, cache_loc_paddings, page_size: int, caps=None
+) -> list[list[int]]:
+    """Per bs bucket, the ascending cache_loc paddings a fitted speculative
+    batch may use: ``align(bs * cap)`` for every cap in the ladder that is
+    below the bucket's own padding, plus that padding itself (last)."""
+    caps = _SPEC_CACHE_LOC_LADDER if caps is None else tuple(caps)
+    out = []
+    for bs, big in zip(bs_paddings, cache_loc_paddings):
+        big = int(big)
+        rungs = {big}
+        for cap in caps:
+            rung = (int(bs) * int(cap) + page_size - 1) // page_size * page_size
+            if 0 < rung < big:
+                rungs.add(rung)
+        out.append(sorted(rungs))
+    return out
+
+
+def spec_cache_loc_precompile_sizes(
+    bs_index: int, bs_paddings, cache_loc_paddings, page_size: int, *, fit_enabled: bool, caps=None
+) -> list[int]:
+    """cache_loc sizes the speculative precompile must cover for bs bucket
+    ``bs_index``: the bucket's own padding, plus every rung when the fit is on."""
+    if not fit_enabled:
+        return [int(cache_loc_paddings[bs_index])]
+    rungs = spec_cache_loc_rungs(bs_paddings, cache_loc_paddings, page_size, caps)[bs_index]
+    if os.environ.get("SGLANG_JAX_SPEC_PRECOMPILE_FIRST_RUNG_ONLY", "0") == "1":
+        return rungs[:1]
+    return rungs
+
+
+def spec_cache_loc_needs(per_rank_lens, per_dp_bs: int, page_size: int) -> list[int]:
+    """Per-DP-rank token count a speculative batch's cache_loc segment must hold.
+
+    ``per_rank_lens`` is one array of per-request lengths (already including the
+    speculative allocation) per DP rank. Each segment must hold the packed
+    page-aligned layout AND, because several kernels take a fixed-stride view
+    (``pages_per_seq = len(page_indices) // bs_padded``), ``bs_padded`` times the
+    longest request.
+    """
+    needs = []
+    for lens in per_rank_lens:
+        if lens is None or len(lens) == 0:
+            needs.append(0)
+            continue
+        aligned = ((np.asarray(lens) + page_size - 1) // page_size) * page_size
+        needs.append(max(int(aligned.sum()), int(per_dp_bs) * int(aligned.max())))
+    return needs
+
+
+def fit_cache_loc_padding(cache_loc_paddings, per_rank_needs, dp_size: int) -> int:
+    """Smallest padding whose per-DP segment holds every rank's packed cache_loc.
+
+    ``per_rank_needs`` are the token counts each DP rank's segment must hold:
+    the packed length ``sum(aligned_seq_lens)`` and, because several kernels take
+    a fixed-stride view (``pages_per_seq = len(page_indices) // bs``), also
+    ``bs_padded * max(aligned_seq_lens)``. ``cache_loc_paddings`` is ascending.
+    Falls back to the largest padding when none fits (the caller asserts the
+    host buffer against it as before).
+    """
+    need = int(max(per_rank_needs)) if len(per_rank_needs) else 0
+    for padding in cache_loc_paddings:
+        padding = int(padding)
+        if padding % dp_size == 0 and padding // dp_size >= need:
+            return padding
+    return int(cache_loc_paddings[-1])
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -473,7 +564,16 @@ class Req:
         # ChunkCache (--disable-radix-cache). If RadixCache support is added,
         # continuation rounds must also preserve/update last_node and radix
         # lock state, not just prefix_indices.
-        if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
+        if (
+            getattr(self, "bootstrap_room", None) is not None
+            and not self.output_ids
+            and getattr(self, "last_node", None) is None
+            and (
+                tree_cache is None
+                or getattr(tree_cache, "disable", False)
+                or isinstance(tree_cache, ChunkCache)
+            )
+        ):
             # A completed middle chunk decrements is_chunked before
             # this continuation round is initialized. kv_committed_len, not the
             # in-flight counter, is the durable signal that prefix_indices owns
@@ -488,7 +588,7 @@ class Req:
             self.host_hit_length = 0
             return
         if tree_cache is not None:
-            if getattr(tree_cache, "disable", False):
+            if getattr(tree_cache, "disable", False) or isinstance(tree_cache, ChunkCache):
                 self.prefix_indices = np.empty((0,), dtype=np.int32)
                 self.last_node = tree_cache.root_node
                 self.last_host_node = tree_cache.root_node
@@ -776,6 +876,7 @@ class ScheduleReqsInfo:
     decoding_reqs: list[Req] = None
     extend_logprob_start_lens: list[int] = None
     extend_input_logprob_token_ids: np.ndarray | None = None
+    extend_next_token_ids: np.ndarray | None = None
 
     # Speculative decoding info (per DP)
     spec_info: EagleDraftInput | EagleVerifyInput | None = None
@@ -1231,6 +1332,7 @@ class ScheduleBatch:
                 info.out_cache_loc = None
                 info.seq_lens_sum = 0
                 info.extend_num_tokens = None
+                info.extend_next_token_ids = None
                 continue
 
             # Allocate req slots
@@ -1368,6 +1470,16 @@ class ScheduleBatch:
             info.prefix_lens = prefix_lens
             info.extend_lens = extend_lens
             info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+            info.extend_next_token_ids = np.asarray(
+                [
+                    r.origin_input_ids[seq_len + int(getattr(r, "_pd_seq_pos_offset", 0))]
+                    if (seq_len + int(getattr(r, "_pd_seq_pos_offset", 0)))
+                    < len(r.origin_input_ids)
+                    else -1
+                    for r, seq_len in zip(reqs, seq_lens)
+                ],
+                dtype=np.int32,
+            )
 
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
@@ -2138,9 +2250,19 @@ class ScheduleBatch:
             if self.forward_mode.is_extend():
                 # For extend: positions are [prefix_len, prefix_len+1, ..., seq_len-1] for each request
                 pt = offset
-                for seq_len, prefix_len in zip(info.seq_lens, info.prefix_lens):
+                reqs_list = info.reqs or []
+                for req_idx, (seq_len, prefix_len) in enumerate(
+                    zip(info.seq_lens, info.prefix_lens)
+                ):
+                    pos_off = (
+                        int(getattr(reqs_list[req_idx], "_pd_seq_pos_offset", 0))
+                        if req_idx < len(reqs_list)
+                        else 0
+                    )
                     next_pt = pt + (seq_len - prefix_len)
-                    positions_cpu[pt:next_pt] = np.arange(prefix_len, seq_len, dtype=np.int32)
+                    positions_cpu[pt:next_pt] = np.arange(
+                        prefix_len + pos_off, seq_len + pos_off, dtype=np.int32
+                    )
                     pt = next_pt
             else:
                 # For decode: positions are [seq_len-1] for each request
@@ -2368,11 +2490,23 @@ class ScheduleBatch:
 
             # Copy batch metadata
             req_pool_indices_cpu[offset_bs : offset_bs + dp_bs] = info.req_pool_indices
-            seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens
+            reqs_list = info.reqs or []
+            if reqs_list and any(getattr(r, "_pd_seq_pos_offset", 0) for r in reqs_list):
+                pos_offs = np.array(
+                    [int(getattr(r, "_pd_seq_pos_offset", 0)) for r in reqs_list], dtype=np.int32
+                )
+                seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens + pos_offs
+            else:
+                seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens
 
             if self.forward_mode.is_extend():
                 # Copy extend-specific metadata
-                extend_prefix_lens[offset_bs : offset_bs + dp_bs] = info.prefix_lens
+                if reqs_list and any(getattr(r, "_pd_seq_pos_offset", 0) for r in reqs_list):
+                    extend_prefix_lens[offset_bs : offset_bs + dp_bs] = (
+                        np.asarray(info.prefix_lens, dtype=np.int32) + pos_offs
+                    )
+                else:
+                    extend_prefix_lens[offset_bs : offset_bs + dp_bs] = info.prefix_lens
                 extend_seq_lens[offset_bs : offset_bs + dp_bs] = info.extend_lens
                 dp_extend_lens = np.array(info.extend_lens, dtype=np.int32)
                 local_last = np.cumsum(dp_extend_lens, dtype=np.int32) - 1
@@ -2423,11 +2557,56 @@ class ScheduleBatch:
         total_cache_loc_size = 0
         if self.forward_mode.is_extend():
             total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
+            if len(cache_loc_paddings) > 1 and (
+                self.forward_mode.is_spec_extend()
+                or (
+                    _SPEC_CACHE_LOC_FIT
+                    and self.spec_algorithm is not None
+                    and not self.spec_algorithm.is_none()
+                )
+            ):
+                # spec verify / draft-extend: smallest padding that holds the
+                # packed layout (see fit_cache_loc_padding).
+                needs = spec_cache_loc_needs(
+                    [self.reqs_info[r].seq_lens for r in range(self.dp_size)],
+                    per_dp_bs_size,
+                    page_size,
+                )
+                # extend-shaped spec batches pad bs to the largest bucket: only
+                # that bucket's rungs are precompiled.
+                total_cache_loc_size = fit_cache_loc_padding(
+                    spec_cache_loc_rungs(bs_paddings[-1:], cache_loc_paddings[-1:], page_size)[0],
+                    needs,
+                    self.dp_size,
+                )
         else:
             # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
             total_bs = per_dp_bs_size * self.dp_size
             _, bs_index = pad_to_bucket(total_bs, bs_paddings)
             total_cache_loc_size = cache_loc_paddings[bs_index]
+            if (
+                _SPEC_CACHE_LOC_FIT
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+                and len(cache_loc_paddings) > 1
+            ):
+                # Speculative decode batches become the TARGET_VERIFY batch
+                # (prepare_for_verify only flips the mode), so their page table
+                # feeds every verify layer: size it to the batch, not to the
+                # bs bucket x context.
+                needs = spec_cache_loc_needs(
+                    [self.reqs_info[r].seq_lens for r in range(self.dp_size)],
+                    per_dp_bs_size,
+                    page_size,
+                )
+                total_cache_loc_size = min(
+                    total_cache_loc_size,
+                    fit_cache_loc_padding(
+                        spec_cache_loc_rungs(bs_paddings, cache_loc_paddings, page_size)[bs_index],
+                        needs,
+                        self.dp_size,
+                    ),
+                )
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         # View into the persistent buffer; intentionally NOT re-zeroed per step.
@@ -2462,7 +2641,16 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
-            seq_lens = np.asarray(info.seq_lens)
+            reqs_list = info.reqs or []
+            if getattr(self, "is_coop_prefill_batch", False):
+                seq_lens = np.asarray(self.reqs_info[-1].seq_lens)
+            elif reqs_list and any(getattr(r, "_pd_seq_pos_offset", 0) for r in reqs_list):
+                pos_offs = np.array(
+                    [int(getattr(r, "_pd_seq_pos_offset", 0)) for r in reqs_list], dtype=np.int32
+                )
+                seq_lens = np.asarray(info.seq_lens) + pos_offs
+            else:
+                seq_lens = np.asarray(info.seq_lens)
             req_pool_indices = np.asarray(info.req_pool_indices)
 
             n_reqs = len(seq_lens)
@@ -3066,7 +3254,10 @@ class ScheduleBatch:
             if not nonnull:
                 kwargs[f] = None
                 continue
-            if f in ("accept_length", "accept_length_cpu") and len(nonnull) != len(nonempty):
+            if (
+                f in ("accept_length", "accept_length_cpu", "new_seq_lens")
+                and len(nonnull) != len(nonempty)
+            ):
                 kwargs[f] = None
                 continue
             # All nonempty ranks should agree on which optional fields they
@@ -3100,7 +3291,17 @@ class ScheduleBatch:
             token_paddings = bs_paddings
         else:
             bs_paddings = bs_paddings[-1:]
-            cache_loc_paddings = cache_loc_paddings[-1:]
+            if not (
+                _SPEC_CACHE_LOC_FIT
+                and (
+                    self.forward_mode.is_spec_extend()
+                    or (
+                        self.spec_algorithm is not None
+                        and not self.spec_algorithm.is_none()
+                    )
+                )
+            ):
+                cache_loc_paddings = cache_loc_paddings[-1:]
 
         bid = acc_global_bid()
 
@@ -3306,6 +3507,22 @@ class ScheduleBatch:
                 if chunks and self.forward_mode.is_extend():
                     merged_extend_input_logprob_token_ids = np.concatenate(chunks)
 
+        extend_next_token_ids_cpu = None
+        if self.forward_mode.is_extend() and any(
+            getattr(info, "extend_next_token_ids", None) is not None for info in self.reqs_info
+        ):
+            extend_next_token_ids_cpu = np.full(total_bs, -1, dtype=np.int32)
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if getattr(info, "extend_next_token_ids", None) is not None:
+                        extend_next_token_ids_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.extend_next_token_ids[:dp_bs]
+                        )
+                offset_bs += per_dp_bs_padding
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -3326,6 +3543,7 @@ class ScheduleBatch:
             extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=merged_extend_input_logprob_token_ids,
+            extend_next_token_ids=extend_next_token_ids_cpu,
             input_logprob_indices=input_logprob_indices,
             logits_indices=logits_indices,
             lora_ids=lora_ids,
@@ -3737,6 +3955,10 @@ class ModelWorkerBatch:
     real_bs: int
     real_bs_per_dp: list[int]
 
+    # Ground-truth next prompt token id per request for intermediate prefill chunks
+    # (-1 when the current extend reaches the end of the prompt).
+    extend_next_token_ids: np.ndarray | None = None
+
     # Maps "original request order" (DP-rank-then-req flat order) to the
     # DP-interleaved padded slot in the global batch. Host code applies
     # `arr[selector]` once after device_get to put per-req outputs back
@@ -3780,6 +4002,9 @@ class ModelWorkerBatch:
     # returning a fresh EagleDraftInput. Scheduler-persisted per-rank spec
     # state lives on ScheduleBatch.reqs_info[r].spec_info.
     spec_info_padded: EagleDraftInput | EagleVerifyInput | None = None
+    # Precompile only: pin the draft worker's fitted cache_loc padding to this
+    # rung instead of deriving it from the dummy batch's lengths.
+    spec_cache_loc_size: int | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0
     speculative_eagle_topk: int = 0

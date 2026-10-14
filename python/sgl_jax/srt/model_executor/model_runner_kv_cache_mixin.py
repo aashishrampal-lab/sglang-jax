@@ -34,6 +34,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Draft architectures whose draft worker holds exactly ONE decoder layer: the NextN /
+# MTP heads (``*ForCausalLMNextN``, ``MiMoMTPForCausalLM``, ``MiMoV2MTPForCausalLM``,
+# ``Qwen3NextForCausalLMMTP``). Multi-layer MTP models (MiMo-V2-Flash) instantiate one
+# worker per layer, so the per-worker count is still 1. Everything else (DFlash,
+# Eagle3) sizes its KV pool from its own ``num_hidden_layers``.
+_SINGLE_LAYER_DRAFT_SUFFIXES = ("NextN", "MTPForCausalLM", "ForCausalLMMTP")
+
+
+def is_single_layer_draft_arch(hf_config) -> bool:
+    archs = getattr(hf_config, "architectures", None) or []
+    arch = archs[0] if archs else ""
+    return arch.endswith(_SINGLE_LAYER_DRAFT_SUFFIXES)
+
+
 def _compute_recurrent_per_req_bytes(
     num_layers: int,
     num_heads: int,
@@ -286,6 +300,13 @@ def _build_hybrid_pools(
 
 def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
     """Wrap a single KV pool in MemoryPools."""
+    from sgl_jax.srt.mem_cache.memory_pool import MSAIndexKProxy, MSATokenToKVPool
+
+    if isinstance(token_to_kv_pool, MSATokenToKVPool):
+        return MemoryPools(
+            token_to_kv_pool=token_to_kv_pool,
+            msa_index_k=MSAIndexKProxy(token_to_kv_pool),
+        )
     return MemoryPools(token_to_kv_pool=token_to_kv_pool)
 
 
@@ -366,13 +387,18 @@ class ModelRunnerKVCacheMixin:
             )
             return int(full_cost + swa_cost)
 
-        return (
+        main_kv = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
             * 2
             * num_layers
             * dtype_size
         )
+        # Backends may keep extra per-token cache (e.g. MSA index_k, not tensor-sharded).
+        extra = getattr(self.attn_backend, "extra_kv_bytes_per_token", None)
+        if extra is not None:
+            main_kv += extra(dtype_size)
+        return main_kv
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
@@ -467,10 +493,11 @@ class ModelRunnerKVCacheMixin:
             and self.spec_algorithm is not None
             and not self.spec_algorithm.is_none()
         ):
-            # Reserve 1 GB for the Draft Worker's KV buffer and XLA fragmentation.
+            # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
             overhead_bytes = 1 * 1024 * 1024 * 1024
             logger.info(
-                f"Deducting {overhead_bytes} bytes from available KV cache for draft memory overhead"
+                "Deducting %d bytes from available KV cache for draft memory overhead",
+                overhead_bytes,
             )
             available_kv_cache_bytes -= overhead_bytes
 
@@ -523,7 +550,10 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, max_total_tokens)
 
         # Page alignment
-        token_capacity = (token_capacity // self.server_args.page_size + (2 if token_capacity < 101000 else 0)) * self.server_args.page_size
+        token_capacity = (
+            token_capacity // self.server_args.page_size
+            + (2 if token_capacity < 101000 else 0)
+        ) * self.server_args.page_size
 
         # DP scale
         token_capacity = token_capacity * dp_size
@@ -652,8 +682,10 @@ class ModelRunnerKVCacheMixin:
             # `_validate_kv_pool_compatibility` owns the user-facing check at
             # dispatch. Keep this assertion as a defensive invariant in case a
             # future caller constructs a hybrid pool through this lower seam.
-            assert not kvcache_kwargs.get(
-                "num_indexer_layers"
+            # QSA's indexer cache is fine: the wrapper forwards its accessors.
+            assert not (
+                kvcache_kwargs.get("num_indexer_layers")
+                and token_to_kv_pool_class is MLATokenToKVPool
             ), "hybrid-recurrent models do not support --attention-backend dsa_sparse"
 
             return HybridLinearKVPool(
@@ -686,7 +718,13 @@ class ModelRunnerKVCacheMixin:
                 "HybridLinearKVPool has no DSA indexer cache interface"
             )
 
-    def _create_token_to_kv_pool(self: ModelRunner, dp_size: int, *, abstract: bool = False):
+    def _create_token_to_kv_pool(
+        self: ModelRunner,
+        dp_size: int,
+        *,
+        abstract: bool = False,
+        max_num_reqs: int | None = None,
+    ):
         """Construct serving cache layouts, optionally as offline array descriptors."""
         from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, SWAKVPool
 
@@ -747,9 +785,7 @@ class ModelRunnerKVCacheMixin:
                 **dsa_kwargs,
             )
         else:
-            pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
-            return self._maybe_wrap_hybrid_kv_pool(
-                pool_class,
+            mha_kwargs = dict(
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
@@ -757,6 +793,13 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
                 abstract=abstract,
             )
+            pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
+            pool_kwargs = dict(getattr(self.attn_backend, "token_to_kv_pool_kwargs", None) or {})
+            # A backend asking for max_reqs sizes a per-request buffer by it; the
+            # request limit is only known here.
+            if "max_reqs" in pool_kwargs:
+                pool_kwargs["max_reqs"] = max_num_reqs
+            return self._maybe_wrap_hybrid_kv_pool(pool_class, **pool_kwargs, **mha_kwargs)
 
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
@@ -779,7 +822,7 @@ class ModelRunnerKVCacheMixin:
                 dtype=np.int32,
             )
 
-        self.token_to_kv_pool = self._create_token_to_kv_pool(dp_size)
+        self.token_to_kv_pool = self._create_token_to_kv_pool(dp_size, max_num_reqs=max_num_reqs)
 
         # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---
         if has_recurrent_state:
@@ -798,6 +841,17 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
+
+        # A per-request buffer in the KV pool is indexed by ReqToTokenPool slot.
+        # Its writes drop out-of-range rows, as a JAX scatter does by default, so a buffer
+        # smaller than the request pool would lose rows silently.
+        kv_pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+        request_rows = getattr(kv_pool, "max_reqs", None)
+        if request_rows and request_rows < self.req_to_token_pool.size:
+            raise ValueError(
+                f"{type(kv_pool).__name__} has {request_rows} per-request rows but "
+                f"ReqToTokenPool has {self.req_to_token_pool.size} slots"
+            )
 
         # --- Allocator ---
         if self.token_to_kv_pool_allocator is None:
@@ -940,7 +994,12 @@ class ModelRunnerKVCacheMixin:
 
         For hybrid recurrent models, only full-attention layers need KV cache.
         """
-        if getattr(self, "is_draft_worker", False):
+
+        if getattr(self, "is_draft_worker", False) and is_single_layer_draft_arch(
+            self.model_config.hf_config
+        ):
+            # NextN / MTP predictors: one decoder layer per draft worker. Other draft
+            # models (DFlash: 5 layers) keep their real layer count (#1639 review).
             return 1
 
         cfg = self.linear_recurrent_config

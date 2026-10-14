@@ -366,6 +366,16 @@ class ServerArgs:
                 setattr(self, field, local_path)
 
     def __post_init__(self):
+        if os.path.exists("/tmp/sgl_override.json"):
+            try:
+                with open("/tmp/sgl_override.json") as _ovf:
+                    _ov = json.load(_ovf)
+                for _k, _v in _ov.get("env", {}).items():
+                    os.environ[str(_k)] = str(_v)
+                for _k, _v in _ov.get("server_args", {}).items():
+                    setattr(self, str(_k), _v)
+            except Exception as _ove:
+                logger.warning("Failed to load /tmp/sgl_override.json: %s", _ove)
         if self.aot_model_dir:
             from sgl_jax.srt.model_executor.compilation_manager import (
                 CompilationManager,
@@ -416,9 +426,52 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+        if (
+            self.disaggregation_mode == "decode"
+            and self.mem_fraction_static is not None
+            and self.mem_fraction_static > 0.81
+        ):
+            logger.info(
+                "Clamping decode mem_fraction_static from %.3f to 0.810 for runtime XLA/pull headroom",
+                self.mem_fraction_static,
+            )
+            self.mem_fraction_static = 0.81
+        elif (
+            self.disaggregation_mode == "prefill"
+            and self.context_length is not None
+            and self.context_length >= 200000
+            and self.mem_fraction_static is not None
+            and self.mem_fraction_static > 0.785
+        ):
+            logger.info(
+                "Clamping 256k prefill mem_fraction_static from %.3f to 0.785 for runtime XLA headroom",
+                self.mem_fraction_static,
+            )
+            self.mem_fraction_static = 0.785
+
         # Set chunked prefill size
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 4096
+
+        if (
+            self.dp_size > 1
+            and self.max_prefill_tokens
+            and self.max_prefill_tokens > 0
+            and self.chunked_prefill_size
+            and self.chunked_prefill_size > 0
+        ):
+            max_per_dp_chunk = (
+                (self.max_prefill_tokens // self.dp_size) // self.page_size
+            ) * self.page_size
+            if max_per_dp_chunk > 0 and self.chunked_prefill_size > max_per_dp_chunk:
+                logger.warning(
+                    "chunked_prefill_size (%d) > max_prefill_tokens // dp_size (%d); clamping "
+                    "chunked_prefill_size to %d to fit per-DP prefill slot.",
+                    self.chunked_prefill_size,
+                    max_per_dp_chunk,
+                    max_per_dp_chunk,
+                )
+                self.chunked_prefill_size = max_per_dp_chunk
 
         if 0 < self.max_prefill_tokens < self.chunked_prefill_size:
             clamped_size = self.max_prefill_tokens // self.page_size * self.page_size
@@ -1615,6 +1668,7 @@ class ServerArgs:
                 "fa",
                 "fa_mha",
                 "dsa_sparse",
+                "qsa_sparse",
                 "tt",
             ],
             default=ServerArgs.attention_backend,
@@ -1626,6 +1680,8 @@ class ServerArgs:
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
                 "with IndexShare cross-layer reuse; MLA models with index_* config only. "
+                "'qsa_sparse' = Qwen Sparse Attention (compressed-key indexer top-k + sparse GQA); "
+                "GQA models with indexer_* config only. "
                 "'tt' = TTNN prefill and paged decode."
             ),
         )
