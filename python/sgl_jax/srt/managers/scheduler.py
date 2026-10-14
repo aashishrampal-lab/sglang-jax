@@ -761,6 +761,7 @@ class Scheduler(
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+            extra_device_pools=self._get_draft_kv_pools(),
         )
         if isinstance(self.tree_cache, UnifiedRadixCache):
             components = [component.name for component in self.tree_cache.tree_components]
@@ -780,9 +781,16 @@ class Scheduler(
         if getattr(self.tree_cache, "hicache_enabled", False):
             controller = getattr(self.tree_cache, "hicache_controller", None)
             submit = getattr(self.tp_worker, "submit_device_job", None)
-            if controller is not None and submit is not None:
+            if (
+                controller is not None
+                and submit is not None
+                and not self._is_spec_decode_enabled()
+            ):
                 # Multi-host safety: every HiCache device launch goes through the
-                # single launch-owning thread (forward thread in overlap mode),
+                # single launch-owning thread (forward thread in overlap mode when
+                # speculative decoding is not active; when speculative decoding is
+                # active, EAGLEWorker launches forwards on the scheduler thread so
+                # HiCache uses _inline_launcher on the scheduler thread),
                 # FIFO-ordered with forwards, so all hosts enqueue identical
                 # program sequences. See HiCacheController.
                 controller.set_launcher(submit)

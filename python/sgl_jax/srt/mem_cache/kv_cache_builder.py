@@ -60,6 +60,7 @@ def build_kv_cache(
     tp_size: int,
     spec_algorithm: SpeculativeAlgorithm | None,
     mesh: Mesh | None = None,
+    extra_device_pools: list | None = None,
 ) -> BasePrefixCache:
     params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
@@ -86,12 +87,25 @@ def build_kv_cache(
     cache = create_tree_cache(ctx)
 
     if server_args.hicache_storage != "disable":
-        init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator)
+        init_hicache(
+            cache,
+            server_args,
+            mesh,
+            token_to_kv_pool_allocator,
+            extra_device_pools=extra_device_pools,
+        )
 
     return cache
 
 
-def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
+def init_hicache(
+    cache,
+    server_args,
+    mesh,
+    token_to_kv_pool_allocator,
+    *,
+    extra_device_pools: list | None = None,
+) -> None:
     """Assemble the HiCache L2 stack and attach it to a UnifiedRadixCache.
 
     This is the single swap point for storage backends — the controller and
@@ -123,6 +137,7 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
             dtype=device_pool.dtype,
             mesh=mesh,
             partition_spec=device_pool.kv_sharding.spec,
+            extra_device_pools=extra_device_pools,
         )
 
     host_pool = _make_pool(num_pages)

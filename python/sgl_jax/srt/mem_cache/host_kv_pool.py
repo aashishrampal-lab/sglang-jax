@@ -475,6 +475,7 @@ class LRUHostKVPool(HostKVPool):
         partition_spec: PartitionSpec,
         *,
         pool_name: str = "hicache",
+        extra_device_pools: list | None = None,
     ) -> None:
         if pool_size <= 0:
             raise ValueError(f"pool_size must be positive, got {pool_size}")
@@ -544,6 +545,47 @@ class LRUHostKVPool(HostKVPool):
                 len(indexer_bufs),
                 tuple(int(d) for d in idx0.shape[1:]),
             )
+        for dp_idx, extra_dp in enumerate(extra_device_pools or ()):
+            if extra_dp is None or extra_dp is device_pool:
+                continue
+            extra_kv = getattr(extra_dp, "kv_buffer", None)
+            if extra_kv:
+                ekv0 = extra_kv[0]
+                ekv_spec = getattr(getattr(ekv0, "sharding", None), "spec", partition_spec)
+                groups.append(
+                    _BufferGroup.build(
+                        f"draft_kv_{dp_idx}",
+                        get_buffers=lambda dp=extra_dp: dp.kv_buffer,
+                        set_buffer=lambda layer, buf, dp=extra_dp: dp.kv_buffer.__setitem__(
+                            layer, buf
+                        ),
+                        layer_num=len(extra_kv),
+                        per_layer_shape=tuple(int(d) for d in ekv0.shape[1:]),
+                        dtype=ekv0.dtype,
+                        mesh=mesh,
+                        partition_spec=ekv_spec,
+                        shard_slot=shard_slot,
+                    )
+                )
+            extra_idx = getattr(extra_dp, "indexer_key_buffer", None)
+            if extra_idx:
+                eidx0 = extra_idx[0]
+                eidx_spec = getattr(getattr(eidx0, "sharding", None), "spec", partition_spec)
+                groups.append(
+                    _BufferGroup.build(
+                        f"draft_indexer_{dp_idx}",
+                        get_buffers=lambda dp=extra_dp: dp.indexer_key_buffer,
+                        set_buffer=lambda slot, buf, dp=extra_dp: dp.indexer_key_buffer.__setitem__(
+                            slot, buf
+                        ),
+                        layer_num=len(extra_idx),
+                        per_layer_shape=tuple(int(d) for d in eidx0.shape[1:]),
+                        dtype=eidx0.dtype,
+                        mesh=mesh,
+                        partition_spec=eidx_spec,
+                        shard_slot=shard_slot,
+                    )
+                )
         self._groups: tuple[_BufferGroup, ...] = tuple(groups)
 
         # Legacy single-group aliases (group 0), kept for readers of these names.
