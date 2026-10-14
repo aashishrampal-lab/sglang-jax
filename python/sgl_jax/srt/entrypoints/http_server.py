@@ -196,6 +196,19 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Get Prometheus metrics."""
+    try:
+        from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return Response(content=generate_latest(registry), media_type="text/plain")
+    except Exception:
+        return Response(content="", media_type="text/plain")
+
+
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
@@ -866,6 +879,7 @@ def launch(
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
+            backlog=8192,
         )
     finally:
         warmup_thread.join()

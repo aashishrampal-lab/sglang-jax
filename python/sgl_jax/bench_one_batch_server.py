@@ -291,6 +291,7 @@ def run_one_case(
             url + "/generate",
             json=json_data,
             stream=True,
+            timeout=3600,
         )
 
         # The TTFT of the last request in the batch
