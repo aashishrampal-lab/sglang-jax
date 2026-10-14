@@ -249,6 +249,7 @@ class ServerArgs:
     enable_deterministic_sampling: bool = False
     enable_single_process: bool = False
     enable_nan_detection: bool = False
+    enable_prefill_cooperative_attention: bool = False
 
     # LoRA
     enable_lora: bool | None = None
@@ -875,6 +876,12 @@ class ServerArgs:
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--enable-prefill-cooperative-attention",
+            action="store_true",
+            default=ServerArgs.enable_prefill_cooperative_attention,
+            help="Enable cooperative attention during prefill.",
         )
         parser.add_argument(
             "--context-length",
