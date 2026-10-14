@@ -139,8 +139,6 @@ class MiniLoadBalancer:
 
     @staticmethod
     def _get_item_prefix_sig(request: dict, idx: int = 0) -> tuple | None:
-        if request.get("dp_rank") is not None:
-            return None
         target_prefix_len = (
             int(
                 os.environ.get(
@@ -687,6 +685,8 @@ try:
         routing_key = (
             raw_request.headers.get("x-smg-routing-key")
             or raw_request.headers.get("x-session-id")
+            or raw_request.headers.get("x-dynamo-session-id")
+            or raw_request.headers.get("x-correlation-id")
             or request_data.get("routing_key")
             or request_data.get("session_id")
             or request_data.get("user")
