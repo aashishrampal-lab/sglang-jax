@@ -139,6 +139,11 @@ class MiniLoadBalancer:
 
     @staticmethod
     def _get_item_prefix_sig(request: dict, idx: int = 0) -> tuple | None:
+        if (
+            request.get("dp_rank") is not None
+            or int(os.environ.get("DSA_SHARDED_PREFIX_PAGES", "0")) == 0
+        ):
+            return None
         target_prefix_len = (
             int(
                 os.environ.get(
