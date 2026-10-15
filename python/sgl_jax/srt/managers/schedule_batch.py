@@ -127,20 +127,13 @@ _SPEC_CACHE_LOC_LADDER = tuple(
 def spec_cache_loc_rungs(
     bs_paddings, cache_loc_paddings, page_size: int, caps=None
 ) -> list[list[int]]:
-    """Per bs bucket, the ascending cache_loc paddings a fitted speculative
-    batch may use: ``align(bs * cap)`` for every cap in the ladder that is
-    below the bucket's own padding, plus that padding itself (last)."""
-    caps = _SPEC_CACHE_LOC_LADDER if caps is None else tuple(caps)
-    out = []
-    for bs, big in zip(bs_paddings, cache_loc_paddings):
-        big = int(big)
-        rungs = {big}
-        for cap in caps:
-            rung = (int(bs) * int(cap) + page_size - 1) // page_size * page_size
-            if 0 < rung < big:
-                rungs.add(rung)
-        out.append(sorted(rungs))
-    return out
+    """Per bs bucket, the cache_loc padding a fitted speculative batch uses.
+    Since cache_loc_paddings is already capped at <= 32,768 pages per DP rank
+    (128 KiB SMEM) and kernels index packed page_indices via cu_kv_lens, use a
+    single rung [big] per bs bucket so startup precompiles the exact 1M-context
+    shape and never recompiles mid-benchmark."""
+    del page_size, caps
+    return [[int(big)] for _, big in zip(bs_paddings, cache_loc_paddings)]
 
 
 def spec_cache_loc_precompile_sizes(
@@ -157,21 +150,15 @@ def spec_cache_loc_precompile_sizes(
 
 
 def spec_cache_loc_needs(per_rank_lens, per_dp_bs: int, page_size: int) -> list[int]:
-    """Per-DP-rank token count a speculative batch's cache_loc segment must hold.
-
-    ``per_rank_lens`` is one array of per-request lengths (already including the
-    speculative allocation) per DP rank. Each segment must hold the packed
-    page-aligned layout AND, because several kernels take a fixed-stride view
-    (``pages_per_seq = len(page_indices) // bs_padded``), ``bs_padded`` times the
-    longest request.
-    """
+    """Per-DP-rank token count a speculative batch's cache_loc segment must hold."""
+    del per_dp_bs
     needs = []
     for lens in per_rank_lens:
         if lens is None or len(lens) == 0:
             needs.append(0)
             continue
         aligned = ((np.asarray(lens) + page_size - 1) // page_size) * page_size
-        needs.append(max(int(aligned.sum()), int(per_dp_bs) * int(aligned.max())))
+        needs.append(int(aligned.sum()))
     return needs
 
 

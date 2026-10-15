@@ -144,11 +144,13 @@ class EAGLEWorker(BaseSpecWorker):
         # when the fitted spec cache_loc padding is on (the runtime fit may
         # only land on those rungs, so this precompile covers all of them).
         shapes = []
+        max_smem_tokens = dp_size * 32768 * self.page_size
         for i, bs in enumerate(self.precompile_bs_paddings):
-            legacy = (
+            legacy = min(
                 (bs * self.draft_worker.max_req_len + self.page_size - 1)
                 // self.page_size
-                * self.page_size
+                * self.page_size,
+                max_smem_tokens,
             )
             sizes = (
                 spec_cache_loc_precompile_sizes(
