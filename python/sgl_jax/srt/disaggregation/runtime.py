@@ -58,7 +58,11 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     role = "prefill" if mode == "prefill" else "decode"
     shared_secret = resolve_secret(server_args.disaggregation_shared_secret)
 
-    if os.environ.get("DISAGG_LAUNCH_BOOTSTRAP", "") == "1" and server_args.node_rank == 0:
+    launch_bootstrap = (
+        os.environ.get("DISAGG_LAUNCH_BOOTSTRAP", "") == "1"
+        or (mode == "prefill" and bool(server_args.disaggregation_bootstrap_port))
+    )
+    if launch_bootstrap and server_args.node_rank == 0:
         scheduler.disagg_bootstrap_server = BootstrapServer(
             host="0.0.0.0",
             port=server_args.disaggregation_bootstrap_port,

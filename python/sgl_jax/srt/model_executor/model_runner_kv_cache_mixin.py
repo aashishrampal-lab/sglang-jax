@@ -543,14 +543,16 @@ class ModelRunnerKVCacheMixin:
 
         # User cap
         if max_total_tokens is not None:
-            if max_total_tokens > token_capacity:
+            per_dp_cap = max_total_tokens // dp_size if dp_size > 1 else max_total_tokens
+            if per_dp_cap > token_capacity:
                 logger.warning(
-                    "max_total_tokens=%s is larger than the profiled value %s. "
+                    "max_total_tokens=%s (%s per DP) is larger than the profiled value %s. "
                     "Use the profiled value instead.",
                     max_total_tokens,
+                    per_dp_cap,
                     token_capacity,
                 )
-            token_capacity = min(token_capacity, max_total_tokens)
+            token_capacity = min(token_capacity, per_dp_cap)
 
         # Page alignment
         token_capacity = (

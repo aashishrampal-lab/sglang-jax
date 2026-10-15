@@ -503,9 +503,9 @@ class JaxShardReader(WeightReader):
             return math.prod(sharding.mesh.shape[name] for name in names)
 
         unsharded = all(axis_size(axis) == 1 for axis in sharding.spec[1:])
-        deferred = do_transpose and len(shape) == 2 and unsharded
+        deferred = False
         final_shape = (
-            (*shape[:-2], shape[-1], shape[-2]) if do_transpose and not deferred else shape
+            (*shape[:-2], shape[-1], shape[-2]) if do_transpose else shape
         )
         stacked_shape = (len(placement), *final_shape)
         # Mapping specs may include singleton axes introduced by scale reshape.
@@ -521,7 +521,6 @@ class JaxShardReader(WeightReader):
             raise ValueError("SGLANG_MOE_LOAD_WORKERS must be positive")
         use_bulk = (
             unsharded
-            and (not do_transpose or deferred)
             and (
                 file_manager.prefers_bulk
                 or (
@@ -604,7 +603,15 @@ class JaxShardReader(WeightReader):
                     raw = file_manager.read_ranges(
                         [(infos[i]["file"], infos[i]["byte_offset"], expert_bytes) for i in logical]
                     )
-                    values = {i: value.view(dtype).reshape(shape) for i, value in zip(logical, raw)}
+                    if do_transpose:
+                        values = {
+                            i: np.ascontiguousarray(
+                                np.swapaxes(value.view(dtype).reshape(shape), -1, -2)
+                            )
+                            for i, value in zip(logical, raw)
+                        }
+                    else:
+                        values = {i: value.view(dtype).reshape(shape) for i, value in zip(logical, raw)}
                     # Keep owners until every local device_put has completed. These
                     # waits cannot depend on another process's collective submission.
                     owners = [
