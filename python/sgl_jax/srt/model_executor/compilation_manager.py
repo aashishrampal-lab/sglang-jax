@@ -169,9 +169,9 @@ class CompilationManager:
 
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
+        if self.disaggregation_mode == "decode":
+            return [self.max_padded_batch_size]
         if user_paddings is None:
-            if self.disaggregation_mode == "decode":
-                return [self.max_padded_batch_size]
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
             # The static defaults top out at 8192 * dp_size. When the token
             # budget is larger, keep doubling so the final max-size bucket is

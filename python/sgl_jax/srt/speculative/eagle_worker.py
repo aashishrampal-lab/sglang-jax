@@ -61,15 +61,8 @@ class EAGLEWorker(BaseSpecWorker):
         dp_size = self.server_args.dp_size
         bs, _ = self.draft_worker.get_max_padded_size()
         token_paddings = list(self.precompile_token_paddings)
-        user_tok_paddings = getattr(self.server_args, "precompile_token_paddings", None)
-        if (
-            getattr(self.server_args, "disaggregation_mode", "null") == "decode"
-            and user_tok_paddings
-        ):
-            max_user_tok = max(user_tok_paddings)
-            capped = [t for t in token_paddings if t <= max_user_tok]
-            if capped:
-                token_paddings = capped
+        if getattr(self.server_args, "disaggregation_mode", "null") == "decode":
+            token_paddings = [bs]
         logger.info(
             "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s dp_size=%d",
             self.precompile_bs_paddings[-1:],

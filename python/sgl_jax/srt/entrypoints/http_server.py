@@ -196,6 +196,19 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
+@app.api_route("/restart_engine", methods=["GET", "POST"])
+async def restart_engine() -> Response:
+    """Terminate the server process so the container supervisor loop pulls latest code and restarts."""
+    import signal
+
+    def _kill():
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGQUIT)
+
+    threading.Thread(target=_kill, daemon=True).start()
+    return Response(content="Restarting engine...\n", status_code=200)
+
+
 @app.get("/metrics")
 async def metrics_endpoint():
     """Get Prometheus metrics."""
