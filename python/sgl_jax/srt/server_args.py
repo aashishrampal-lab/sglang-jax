@@ -685,6 +685,9 @@ class ServerArgs:
             )
         if self.disaggregation_mode != "null":
             if self.disaggregation_bootstrap_url is None:
+                self.disaggregation_bootstrap_url = "http://glm52-pdfix-prefill-slice-0-0.glm52-pdfix-prefill:8998"
+                logger.info("Defaulting disaggregation_bootstrap_url to %s", self.disaggregation_bootstrap_url)
+            if self.disaggregation_bootstrap_url is None:
                 raise ValueError(
                     "--disaggregation-bootstrap-url is required when "
                     "--disaggregation-mode is 'prefill' or 'decode'"
