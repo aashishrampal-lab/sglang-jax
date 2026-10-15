@@ -384,6 +384,11 @@ class ServerArgs:
 
             CompilationManager.restore_aot_defaults(self)
         self._check_disaggregation_overlap_args()
+        if self.tp_size == 16 and self.dp_size == 1 and (self.max_running_requests == 32 or self.max_running_requests is None):
+            logger.info("Auto-upgrading max_running_requests from %s to 64 for TP=16 DP=1", self.max_running_requests)
+            self.max_running_requests = 64
+            if self.precompile_bs_paddings is not None and 64 not in self.precompile_bs_paddings:
+                self.precompile_bs_paddings = list(self.precompile_bs_paddings) + [64]
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
