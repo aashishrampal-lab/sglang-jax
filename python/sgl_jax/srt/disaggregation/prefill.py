@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll, KVSender
 from sgl_jax.srt.disaggregation.base.transfer import (
@@ -59,17 +60,18 @@ def _batch_reqs(batch) -> tuple[Req, ...]:
 
 # Bucket page counts to bound XLA's per-shape compile pool.
 # Largest bucket (512 pages × 128 tokens/page) covers 64k-token prompts.
-_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512)
 
 
-def _pad_to_page_bucket(num_pages: int) -> int:
+def _pad_to_page_bucket(num_pages: int, min_multiple: int = 1) -> int:
+    target = max(num_pages, min_multiple)
     for b in _KV_GATHER_PAGE_BUCKETS:
-        if b >= num_pages:
+        if b >= target and b % min_multiple == 0:
             return b
     # Beyond the largest predefined bucket: round up to a multiple of it so we
     # never truncate KV, while keeping the set of compiled shapes bounded.
-    largest = _KV_GATHER_PAGE_BUCKETS[-1]
-    return ((num_pages + largest - 1) // largest) * largest
+    largest = max(_KV_GATHER_PAGE_BUCKETS[-1], min_multiple)
+    return ((target + largest - 1) // largest) * largest
 
 
 def _globalize_rank_local_page_ids(
@@ -124,7 +126,7 @@ def _jit_gather_all_layers(buffers, page_indices, out_sharding):
 def _global_to_local_shard(arr: jax.Array) -> jax.Array:
     """View this host's addressable shards of a globally-sharded ``arr`` as a
     fully-addressable array on a 1-D local mesh. Assumes ``arr`` is sharded
-    along exactly one dimension (the KV head axis). Zero-copy.
+    along exactly one dimension (the KV head axis or page axis). Zero-copy.
     """
     import numpy as _np
     from jax.sharding import Mesh as _Mesh
@@ -146,7 +148,33 @@ def _global_to_local_shard(arr: jax.Array) -> jax.Array:
     return jax.make_array_from_single_device_arrays(lshape, _NamedSharding(lmesh, lspec), shards)
 
 
-def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.ShapeDtypeStruct:
+def _page_transfer_axis_and_multiple(kv_pool):
+    """Return ``(is_page_axis_sharded, page_axis, min_multiple)`` for KV transfer.
+
+    For MLATokenToKVPool, ``kv_sharding`` has ``spec = P("data", None, None, None)``.
+    When ``dp_size == 1`` and ``tp_size > 1`` across multiple hosts (e.g. ``tp=16, dp=1``
+    on ``2x2x2``), ``mesh.shape["data"] == 1`` (replicated across all devices), so
+    ``int(kv_pool.mesh.shape[pool_pspec[0]])`` would be 1 instead of total devices (16),
+    breaking ``_global_to_local_shard`` and ``local_kv_spec_for_pool`` which require the
+    page dimension to be sharded across all global devices when ``process_count() > 1``.
+    Sharding gathered pages across ``tuple(kv_pool.mesh.axis_names)`` (e.g. ``("data", "tensor")``)
+    shards the page dimension evenly across all devices regardless of ``dp_size`` vs ``tp_size``.
+    """
+    import numpy as _np
+
+    pool_pspec = kv_pool.kv_sharding.spec
+    is_page_axis_sharded = all(s is None for s in pool_pspec[1:]) and pool_pspec[0] is not None
+    if not is_page_axis_sharded:
+        return False, None, 1
+    axis_names = tuple(kv_pool.mesh.axis_names)
+    page_axis = axis_names[0] if len(axis_names) == 1 else axis_names
+    total_devices = int(_np.prod(list(kv_pool.mesh.shape.values())))
+    return True, page_axis, max(1, total_devices)
+
+
+def local_kv_spec_for_pool(
+    kv_pool, layer_num: int, padded_pages: int, per_layer_tail=None
+) -> jax.ShapeDtypeStruct:
     """Build the ShapeDtypeStruct that D should pull on a multi-host process:
     this host's 1/nproc slice of the stacked KV, on a 1-D local mesh.
     """
@@ -156,9 +184,14 @@ def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.Sh
     from jax.sharding import PartitionSpec as _P
 
     pool_pspec = kv_pool.kv_sharding.spec
-    per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
-    gshape = (layer_num, padded_pages) + per_layer_tail
-    gspec = (None, None) + tuple(pool_pspec[1:])
+    if per_layer_tail is None:
+        per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+    gshape = (layer_num, padded_pages) + tuple(per_layer_tail)
+    is_page_axis_sharded, page_axis, _ = _page_transfer_axis_and_multiple(kv_pool)
+    if is_page_axis_sharded:
+        gspec = (None, page_axis) + tuple(pool_pspec[1:])
+    else:
+        gspec = (None, None) + tuple(pool_pspec[1:])
     sharded_dims = [i for i, s in enumerate(gspec) if s is not None]
     if len(sharded_dims) != 1:
         raise ValueError(f"expected one sharded dim in KV spec, got {gspec}")
@@ -290,9 +323,14 @@ class SchedulerDisaggregationPrefillMixin:
         # The forward worker publishes only after this batch's KV writes are
         # device-ready. No old donated Array escapes to this thread.
         result = pending.result
-        result.logits_output, result.next_token_ids, result.cache_miss_count = (
-            self.tp_worker.resolve_last_batch_result()
-        )
+        if self._is_spec_decode_enabled():
+            from sgl_jax.srt.speculative.overlap_utils import resolve_spec_prefill_token_ids
+
+            result.next_token_ids = resolve_spec_prefill_token_ids(result)
+        else:
+            result.logits_output, result.next_token_ids, result.cache_miss_count = (
+                self.tp_worker.resolve_last_batch_result()
+            )
         try:
             self.process_prefill_chunk(pending.batch, result, handoffs=pending.handoffs)
         finally:
@@ -364,7 +402,9 @@ class SchedulerDisaggregationPrefillMixin:
                 copied = batch.copy()
                 # P does not generate client tokens, so its sampler has no
                 # dependency on the previous P result's output processing.
-                copied.next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                copied.next_batch_sampling_info = (
+                    self._current_sampling_info_owner().cur_sampling_info
+                )
                 self.set_next_batch_sampling_info_done(copied)
                 copied.next_batch_sampling_info = None
                 self.result_queue.append(PendingPrefillResult(copied, result, handoffs))
@@ -376,10 +416,98 @@ class SchedulerDisaggregationPrefillMixin:
                     self._comm_backend.wait_for_new_requests(0.001)
             self.last_batch = batch
 
+    def _req_staging_bytes_per_device(self: Scheduler, req: Req | None) -> int:
+        if req is None:
+            return 0
+        seqlen = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+        skip_tokens = int(getattr(req, "_pd_transfer_skip_tokens", 0) or 0)
+        transfer_tokens = max(0, seqlen - skip_tokens)
+        if transfer_tokens <= 0:
+            return 0
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = max(1, int(kv_pool.page_size))
+        num_pages = (transfer_tokens + page_size - 1) // page_size
+        _, _, min_multiple = _page_transfer_axis_and_multiple(kv_pool)
+        padded_pages = _pad_to_page_bucket(num_pages, min_multiple=min_multiple)
+        all_pools = [kv_pool] + list(self._get_draft_kv_pools())
+        bytes_per_page_global = sum(
+            int(pool.layer_num)
+            * int(np.prod(pool.kv_buffer[0].shape[1:]))
+            * int(np.dtype(pool.dtype).itemsize)
+            for pool in all_pools
+            if getattr(pool, "kv_buffer", None)
+        )
+        for pool in all_pools:
+            indexer_buffers = getattr(pool, "indexer_key_buffer", None)
+            if indexer_buffers:
+                bytes_per_page_global += (
+                    int(len(indexer_buffers))
+                    * int(np.prod(indexer_buffers[0].shape[1:]))
+                    * int(np.dtype(indexer_buffers[0].dtype).itemsize)
+                )
+        return (padded_pages * bytes_per_page_global) // max(1, int(self.tp_size))
+
+    def _inflight_staging_bytes_per_device(self: Scheduler) -> int:
+        with self.disagg_prefill_queue._lock:
+            reqs = [
+                e.req
+                for e in self.disagg_prefill_queue._entries.values()
+                if e.sender.poll() not in (KVPoll.SUCCESS, KVPoll.FAILED)
+            ]
+        return sum(self._req_staging_bytes_per_device(r) for r in reqs)
+
+    def _pre_forward_staging_budget_bytes_per_device(self: Scheduler) -> int:
+        # On 95.73 GiB TPU v7x at mem_fraction_static=0.72, free HBM outside
+        # forward passes is 26.11 GiB/device, and jit_jitted_run_model
+        # (EXTEND num_tokens=32768) reserves 21.29 GiB/device at the bottom of
+        # memory during run_batch(). That leaves 26.11 - 21.29 = 4.82 GiB/device
+        # during run_batch(). Cap pre-forward in-flight staging to 3.60 GiB/device
+        # (<= 10 requests of 100k tokens = 3.51 GiB/device) so run_batch() always
+        # has >= 22.51 GiB/device free HBM (> 21.29 GiB required).
+        max_prefill_toks = int(getattr(self.server_args, "max_prefill_tokens", 32768) or 32768)
+        peak_xla_scratch_bytes = int(21.29 * (max_prefill_toks / 32768.0) * (1024**3))
+        safety_margin_bytes = int(1.80 * (1024**3))
+        spec_algo = getattr(self, "spec_algorithm", None)
+        has_spec = spec_algo is not None and not spec_algo.is_none()
+        spec_overhead_bytes = int(1.1 * (1024**3)) if has_spec else 0
+        mem_frac = float(getattr(self.server_args, "mem_fraction_static", 0.72) or 0.72)
+        total_hbm_bytes = int(95.73 * (1024**3))
+        free_hbm_bytes = (
+            int(max(0.05, 1.0 - mem_frac) * total_hbm_bytes)
+            - int(0.69 * (1024**3))
+            - spec_overhead_bytes
+        )
+        min_pre_budget = int(2.80 * (1024**3)) if has_spec else int(1.5 * (1024**3))
+        return max(
+            min_pre_budget,
+            free_hbm_bytes - peak_xla_scratch_bytes - safety_margin_bytes,
+        )
+
+    def _staging_budget_bytes_per_device(
+        self: Scheduler, inflight_bytes: int | None = None
+    ) -> int:
+        # Called in process_prefill_chunk() AFTER run_batch() has returned and
+        # released its 21.29 GiB XLA reservation, so 26.11 GiB/device is free.
+        # Allow up to 16.0 GiB/device post-forward staging (1 full wave of 16
+        # requests = 5.62 GiB/device).
+        del inflight_bytes
+        spec_algo = getattr(self, "spec_algorithm", None)
+        has_spec = spec_algo is not None and not spec_algo.is_none()
+        spec_overhead_bytes = int(1.1 * (1024**3)) if has_spec else 0
+        mem_frac = float(getattr(self.server_args, "mem_fraction_static", 0.72) or 0.72)
+        total_hbm_bytes = int(95.73 * (1024**3))
+        free_hbm_bytes = (
+            int(max(0.05, 1.0 - mem_frac) * total_hbm_bytes)
+            - int(0.69 * (1024**3))
+            - spec_overhead_bytes
+        )
+        return max(int(4.5 * (1024**3)), free_hbm_bytes - int(10.0 * (1024**3)))
+
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """Prefill-only event loop."""
 
         while True:
+            self.cur_batch = None
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
@@ -395,6 +523,37 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk()
                 continue
 
+            self._pd_admission_paused = False
+            if len(self.disagg_prefill_queue) > 0:
+                import time as _time
+
+                self.send_kv_chunk()
+                has_active_chunks = any(
+                    r is not None for r in getattr(self, "chunked_reqs", ())
+                )
+                has_pending_prefill = len(self.waiting_queue) > 0 or has_active_chunks
+                pre_budget = self._pre_forward_staging_budget_bytes_per_device()
+                hard_chunk_budget = pre_budget + int(1.10 * (1024**3))
+                # If mid-chunk requests are active in self.chunked_reqs, pause new
+                # waiting_queue admissions when staging exceeds pre_budget so the
+                # remaining chunks of the current wave can finish without deadlocking
+                # against 1D's wave drain. Only block mid-chunk progress if staging
+                # exceeds hard_chunk_budget.
+                eff_budget = hard_chunk_budget if has_active_chunks else pre_budget
+                while (
+                    has_pending_prefill
+                    and len(self.disagg_prefill_queue) > 0
+                    and self._inflight_staging_bytes_per_device() > eff_budget
+                ):
+                    _time.sleep(0.002)
+                    self.send_kv_chunk()
+                if (
+                    has_active_chunks
+                    and len(self.disagg_prefill_queue) > 0
+                    and self._inflight_staging_bytes_per_device() > pre_budget
+                ):
+                    self._pd_admission_paused = True
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -404,6 +563,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
                 result = self.run_batch(batch)
+                self.cur_batch = None
                 self.process_prefill_chunk(batch, result)
             else:
                 self.send_kv_chunk()
@@ -412,11 +572,17 @@ class SchedulerDisaggregationPrefillMixin:
                     self._comm_backend.wait_for_new_requests(0.001)
 
             self.send_kv_chunk()
-            # PD reqs are finished and released inside process_prefill_chunk;
-            # do not merge them into running_batch.
+            # PD reqs and CoopPrefill batches are finished/handled inside
+            # process_prefill_chunk; do not merge them into running_batch.
             batch_reqs = _batch_reqs(batch)
             self.last_batch = (
-                None if batch and any(r.bootstrap_room is not None for r in batch_reqs) else batch
+                None
+                if batch
+                and (
+                    getattr(batch, "is_coop_prefill_batch", False)
+                    or any(r.bootstrap_room is not None for r in batch_reqs)
+                )
+                else batch
             )
 
     def process_prefill_chunk(
@@ -424,6 +590,10 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
+        self.cur_batch = None
+        if getattr(batch, "is_coop_prefill_batch", False):
+            self.process_batch_result(batch, result)
+            return
         batch_reqs = _batch_reqs(batch)
         pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
@@ -461,8 +631,29 @@ class SchedulerDisaggregationPrefillMixin:
             and req.rid not in self.disagg_prefill_queue._entries
         ]
         if ready_to_transfer and handoffs is None:
+            import time as _time
+
+            # Gate at _extract_req_kv (final chunk) instead of before Chunk 1:
+            # Chunks 1..N-1 (~5.2s of compute) ran while the previous wave's DCN
+            # pull progressed in the background. Right before allocating the new
+            # wave's await_pull HBM buffers, reap finished transfers and wait if
+            # adding ready_to_transfer would exceed the HBM staging budget.
+            new_wave_bytes = sum(self._req_staging_bytes_per_device(r) for r in ready_to_transfer)
+            budget_bytes = self._staging_budget_bytes_per_device()
+            self.send_kv_chunk()
+            while (
+                len(self.disagg_prefill_queue) > 0
+                and self._inflight_staging_bytes_per_device() + new_wave_bytes > budget_bytes
+            ):
+                _time.sleep(0.002)
+                self.send_kv_chunk()
+
             kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-            self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
+            all_kv_buffers = list(kv_pool.kv_buffer)
+            for dpool in self._get_draft_kv_pools():
+                if getattr(dpool, "kv_buffer", None):
+                    all_kv_buffers.extend(dpool.kv_buffer)
+            self.disagg_kv_manager.prepare_prefill_batch(all_kv_buffers)
         for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
@@ -533,7 +724,7 @@ class SchedulerDisaggregationPrefillMixin:
                         bootstrap_room=req.bootstrap_room,
                         dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
-                        payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
+                        payload_factory=lambda req_obj=req: self._extract_req_payload(req_obj),
                         block_ids_factory=lambda req_obj=req, snap=snapshot: (
                             list(snap.block_ids) if snap else self._extract_req_block_ids(req_obj)
                         ),
@@ -702,6 +893,10 @@ class SchedulerDisaggregationPrefillMixin:
                         chunk_transfer=True,
                     )
                     sender.attach_debug_metadata(_debug_metadata(payload, expected_total_pages))
+            all_kv_buffers = list(kv_pool.kv_buffer)
+            for dpool in self._get_draft_kv_pools():
+                if getattr(dpool, "kv_buffer", None):
+                    all_kv_buffers.extend(dpool.kv_buffer)
             sender.send_chunk(
                 req.disagg_chunk_index,
                 block_ids,
@@ -713,7 +908,7 @@ class SchedulerDisaggregationPrefillMixin:
                 on_ready=(
                     None
                     if snapshot
-                    else lambda buffers=kv_pool.kv_buffer: (
+                    else lambda buffers=all_kv_buffers: (
                         self.disagg_kv_manager.prepare_prefill_batch(buffers)
                     )
                 ),
@@ -778,10 +973,21 @@ class SchedulerDisaggregationPrefillMixin:
         if pending is not None and pending[dp_rank] is req:
             pending[dp_rank] = None
 
-    def _extract_req_kv(self: Scheduler, req: Req):
+    def _extract_req_payload(self: Scheduler, req: Req) -> dict[str, Any]:
+        """Extract KV (and optional indexer_kv for DSA sparse attention) for ``req``."""
+        kv_out = self._extract_req_kv(req, include_indexer=True)
+        if isinstance(kv_out, tuple):
+            kv, indexer_kv = kv_out
+            return {"kv": kv, "indexer_kv": indexer_kv}
+        return {"kv": kv_out}
+
+    def _extract_req_kv(self: Scheduler, req: Req, *, include_indexer: bool = False):
         """Gather prefilled KV from the paged pool for ``req``.
 
-        Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
+        Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays
+        (or stacked local-mesh array on multi-host). When ``include_indexer=True``
+        and the KV pool carries an ``indexer_key_buffer`` (DSA sparse attention),
+        returns ``(kv, indexer_kv)``.
         """
 
         # Raiden normally uses raw page IDs. Optional debug extraction uses
@@ -795,32 +1001,36 @@ class SchedulerDisaggregationPrefillMixin:
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
-        num_pages = (seqlen + page_size - 1) // page_size
-        padded_pages = _pad_to_page_bucket(num_pages)
+        skip_tokens = int(getattr(req, "_pd_transfer_skip_tokens", 0) or 0)
+        transfer_tokens = max(1, seqlen - skip_tokens)
+        num_pages = (transfer_tokens + page_size - 1) // page_size
+        import numpy as _np
+        from jax.sharding import NamedSharding as _NamedSharding
+        from jax.sharding import PartitionSpec as _P
+
+        pool_pspec = kv_pool.kv_sharding.spec
+        is_page_axis_sharded, page_axis, min_multiple = _page_transfer_axis_and_multiple(kv_pool)
+        padded_pages = _pad_to_page_bucket(num_pages, min_multiple=min_multiple)
         # Only the first num_pages slots of req_to_token are written for this
         # req; the bucket-padding region holds whatever the previous occupant
         # left. Slice the real pages and zero-pad so device_put's cross-process
         # assert_equal sees identical indices on every NP.
         page_id_source = req_to_token[
             req.req_pool_idx,
-            : num_pages * page_size : page_size,
+            skip_tokens : skip_tokens + num_pages * page_size : page_size,
         ]
-        import numpy as _np
-        from jax.sharding import NamedSharding as _NamedSharding
-        from jax.sharding import PartitionSpec as _P
 
         page_ids = _np.asarray(page_id_source) // page_size
         if padded_pages > num_pages:
             page_ids = _np.concatenate(
                 [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
             )
-        layer_buffers = [
-            kv_pool.get_kv_buffer(layer_id)
-            for layer_id in range(
-                kv_pool.start_layer,
-                kv_pool.start_layer + kv_pool.layer_num,
-            )
-        ]
+        all_pools = [kv_pool] + list(self._get_draft_kv_pools())
+        layer_buffers = []
+        for pool in all_pools:
+            get_buf = getattr(pool, "get_fused_kv_buffer", pool.get_kv_buffer)
+            for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
+                layer_buffers.append(get_buf(layer_id))
         if not layer_buffers:
             raise ValueError("cannot gather debug KV from an empty layer range")
         page_ids = _globalize_rank_local_page_ids(
@@ -831,20 +1041,53 @@ class SchedulerDisaggregationPrefillMixin:
         )
         idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
         page_indices = jax.device_put(page_ids, idx_sharding)
-        # Page indices are replicated; preserve pool sharding on the remaining axes.
-        pool_pspec = kv_pool.kv_sharding.spec
-        gather_pspec = _P(None, *pool_pspec[1:])
+        # Page indices are replicated; preserve pool sharding on the remaining axes
+        # (or shard the gathered pages across the page axis when the pool is
+        # page-axis-sharded as in MLATokenToKVPool).
+        if is_page_axis_sharded:
+            gather_pspec = _P(page_axis, *pool_pspec[1:])
+        else:
+            gather_pspec = _P(None, *pool_pspec[1:])
         gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
+
+        indexer_buffers = []
+        for pool in all_pools:
+            pool_idx_bufs = getattr(pool, "indexer_key_buffer", None)
+            if pool_idx_bufs:
+                indexer_buffers.extend(pool_idx_bufs)
+        has_indexer = bool(include_indexer and indexer_buffers)
+        indexer_kvs = (
+            _jit_gather_all_layers(indexer_buffers, page_indices, gather_out_sharding)
+            if has_indexer
+            else None
+        )
+
         if jax.process_count() > 1:
-            # Multi-host: expose only this host's TP shard as a fully-addressable
+            # Multi-host: expose only this host's shard as a fully-addressable
             # local-mesh array; each P host registers its 1/nproc slice and the
             # matching D host (same jax_process_index) pulls exactly that slice.
             stacked = jnp.stack(layer_kvs, axis=0)
             stacked.block_until_ready()
-            return _global_to_local_shard(stacked)
+            for _arr in layer_kvs:
+                with suppress(Exception):
+                    _arr.delete()
+            del layer_kvs
+            local_kv = _global_to_local_shard(stacked)
+            if indexer_kvs is not None:
+                stacked_idx = jnp.stack(indexer_kvs, axis=0)
+                stacked_idx.block_until_ready()
+                for _arr in indexer_kvs:
+                    with suppress(Exception):
+                        _arr.delete()
+                del indexer_kvs
+                local_idx = _global_to_local_shard(stacked_idx)
+                return local_kv, local_idx
+            return local_kv
         # Single-host: return the per-layer list. The D2H staging path
         # (copy_from_device) consumes a ``list[jax.Array]``.
+        if indexer_kvs is not None:
+            return layer_kvs, indexer_kvs
         return layer_kvs
 
     def _release_prefill_kv_pool(self: Scheduler, req: Req) -> None:
@@ -857,7 +1100,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         from sgl_jax.srt.mem_cache.common import release_kv_cache
 
-        release_kv_cache(req, self.tree_cache)
+        release_kv_cache(
+            req,
+            self.tree_cache,
+            allow_overallocated=self._is_spec_decode_enabled(),
+        )
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""

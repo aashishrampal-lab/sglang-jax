@@ -21,7 +21,11 @@ import time
 
 import requests
 
-from sgl_jax.bench_serving import get_tokenizer, sample_random_requests
+from sgl_jax.bench_serving import (
+    get_tokenizer,
+    sample_random_requests,
+    sample_generated_shared_prefix_requests,
+)
 from sgl_jax.profiler import run_profile
 from sgl_jax.srt.entrypoints import http_server
 from sgl_jax.srt.server_args import ServerArgs
@@ -46,6 +50,18 @@ class BenchArgs:
     profile: bool = False
     profile_by_stage: bool = False
     api_type: str = "native"  # "native" or "openai"
+    dataset_name: str = "random"
+    gsp_num_groups: int = 1
+    gsp_prompts_per_group: int = 1
+    gsp_system_prompt_len: int = 1024
+    gsp_question_len: int = 100
+    gsp_output_len: int = 16
+    gsp_range_ratio: float = 1.0
+    seed: int = 1
+    gsp_send_routing_key: bool = False
+    gsp_num_turns: int = 1
+    gsp_fast_prepare: bool = False
+    gsp_ordered: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -78,12 +94,25 @@ class BenchArgs:
             choices=["native", "openai"],
             help="API type to use: 'native' for /generate or 'openai' for /v1/completions",
         )
+        parser.add_argument("--dataset-name", type=str, default=BenchArgs.dataset_name)
+        parser.add_argument("--gsp-num-groups", type=int, default=BenchArgs.gsp_num_groups)
+        parser.add_argument("--gsp-prompts-per-group", type=int, default=BenchArgs.gsp_prompts_per_group)
+        parser.add_argument("--gsp-system-prompt-len", type=int, default=BenchArgs.gsp_system_prompt_len)
+        parser.add_argument("--gsp-question-len", type=int, default=BenchArgs.gsp_question_len)
+        parser.add_argument("--gsp-output-len", type=int, default=BenchArgs.gsp_output_len)
+        parser.add_argument("--gsp-range-ratio", type=float, default=BenchArgs.gsp_range_ratio)
+        parser.add_argument("--seed", type=int, default=BenchArgs.seed)
+        parser.add_argument("--gsp-send-routing-key", action="store_true", default=BenchArgs.gsp_send_routing_key)
+        parser.add_argument("--gsp-num-turns", type=int, default=BenchArgs.gsp_num_turns)
+        parser.add_argument("--gsp-fast-prepare", action="store_true", default=BenchArgs.gsp_fast_prepare)
+        parser.add_argument("--gsp-ordered", action="store_true", default=BenchArgs.gsp_ordered)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
+        # Use default from dataclass if argument isn't present in args
+        return cls(**{attr: attr_type(getattr(args, attr, getattr(cls, attr))) for attr, attr_type in attrs})
 
 
 def launch_server_internal(server_args):
@@ -131,21 +160,42 @@ def run_one_case(
     profile: bool = False,
     profile_by_stage: bool = False,
     api_type: str = "native",
+    bench_args: BenchArgs = None,
 ):
     requests.post(url + "/flush_cache")
 
     # Determine whether to use text or input_ids based on API type
     return_text = api_type == "openai"
-    input_requests = sample_random_requests(
-        input_len=input_len,
-        output_len=output_len,
-        num_prompts=batch_size,
-        range_ratio=1.0,
-        tokenizer=tokenizer,
-        dataset_path="",
-        random_sample=True,
-        return_text=return_text,
-    )
+    
+    if bench_args is not None and getattr(bench_args, "dataset_name", "") == "generated-shared-prefix":
+        # Override prompts_per_group so we can test different batch sizes in one run
+        dynamic_prompts_per_group = max(1, batch_size // bench_args.gsp_num_groups)
+        bench_args.gsp_prompts_per_group = dynamic_prompts_per_group
+        
+        input_requests = sample_generated_shared_prefix_requests(
+            num_groups=bench_args.gsp_num_groups,
+            prompts_per_group=dynamic_prompts_per_group,
+            system_prompt_len=bench_args.gsp_system_prompt_len,
+            question_len=bench_args.gsp_question_len,
+            output_len=bench_args.gsp_output_len,
+            range_ratio=getattr(bench_args, "gsp_range_ratio", 1.0),
+            tokenizer=tokenizer,
+            args=bench_args,
+        )
+        batch_size = len(input_requests)
+        input_len = bench_args.gsp_system_prompt_len + bench_args.gsp_question_len
+        output_len = bench_args.gsp_output_len
+    else:
+        input_requests = sample_random_requests(
+            input_len=input_len,
+            output_len=output_len,
+            num_prompts=batch_size,
+            range_ratio=1.0,
+            tokenizer=tokenizer,
+            dataset_path="",
+            random_sample=True,
+            return_text=return_text,
+        )
 
     use_structured_outputs = False
     if use_structured_outputs:
@@ -221,21 +271,27 @@ def run_one_case(
                     total_chunks += 1
     else:
         # Use native API
+        json_data = {
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": output_len,
+                "ignore_eos": True,
+                "json_schema": json_schema,
+                "stream_interval": stream_interval,
+            },
+            "return_logprob": return_logprob,
+            "stream": True,
+        }
+        if getattr(bench_args, "dataset_name", "") == "generated-shared-prefix":
+            json_data["text"] = [req.prompt for req in input_requests]
+        else:
+            json_data["input_ids"] = [req.prompt for req in input_requests]
+
         response = requests.post(
             url + "/generate",
-            json={
-                "input_ids": [req.prompt for req in input_requests],
-                "sampling_params": {
-                    "temperature": temperature,
-                    "max_new_tokens": output_len,
-                    "ignore_eos": True,
-                    "json_schema": json_schema,
-                    "stream_interval": stream_interval,
-                },
-                "return_logprob": return_logprob,
-                "stream": True,
-            },
+            json=json_data,
             stream=True,
+            timeout=3600,
         )
 
         # The TTFT of the last request in the batch
@@ -249,11 +305,13 @@ def run_one_case(
                 if "error" in data:
                     raise RuntimeError(f"Request has failed. {data}.")
 
+                fr = data["meta_info"]["finish_reason"]
                 assert (
-                    data["meta_info"]["finish_reason"] is None
-                    or data["meta_info"]["finish_reason"]["type"] == "length"
-                )
-                if data["meta_info"]["completion_tokens"] == 1:
+                    fr is None
+                    or fr == "length"
+                    or (isinstance(fr, dict) and fr.get("type") in ("length", "stop", None))
+                ), f"Unexpected finish reason: {fr}"
+                if ttft == 0.0 and data["meta_info"]["completion_tokens"] >= 1:
                     ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic
@@ -331,6 +389,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             result_filename="",
             tokenizer=tokenizer,
             api_type=bench_args.api_type,
+            bench_args=bench_args,
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -355,6 +414,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
                     api_type=bench_args.api_type,
+                    bench_args=bench_args,
                 )
             )
 
@@ -380,6 +440,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 profile=bench_args.profile,
                                 profile_by_stage=bench_args.profile_by_stage,
                                 api_type=bench_args.api_type,
+                                bench_args=bench_args,
                             )[-1],
                         )
                     )
@@ -395,18 +456,31 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
+    if bench_args.dataset_name == "generated-shared-prefix":
+        eff_input_len = bench_args.gsp_system_prompt_len + bench_args.gsp_question_len
+        eff_output_len = bench_args.gsp_output_len
+        summary = f"\nInput lens: ({eff_input_len},). Output lens: ({eff_output_len},).\n"
+    else:
+        eff_input_len = bench_args.input_len[0] if bench_args.input_len else 1024
+        eff_output_len = bench_args.output_len[0] if bench_args.output_len else 16
+        summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+
+    summary += "| batch size | latency (s) | ttft (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | req cost ($) | e2e req cost ($) |"
 
     if bench_args.profile:
         summary += " profile |"
 
     summary += "\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
+    summary += "| ---------- | ----------- | -------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | ------------ | ---------------- |"
 
     if bench_args.profile:
         summary += "-------------|"
     summary += "\n"
+
+    actual_tp_size = server_info.get("tp_size", server_args.tp_size) or 32
+    num_tpu7x_chips = (actual_tp_size // 2) if actual_tp_size > 1 else 16
+    tpu7x_chip_hourly_cost = 12.0  # $12.00/hour per TPU v7x chip (On-Demand)
+    hourly_cost = num_tpu7x_chips * tpu7x_chip_hourly_cost  # $192.00/hour for 16 TPU v7x chips
 
     for (
         batch_size,
@@ -419,18 +493,24 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         acc_length,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
         input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
+        input_cost_per_1m = 1e6 / (input_throughput * input_util) / 3600 * hourly_cost
+        output_cost_per_1m = 1e6 / output_throughput / 3600 * hourly_cost
+        req_cost = (eff_input_len / 1e6) * input_cost_per_1m + (eff_output_len / 1e6) * output_cost_per_1m
+        e2e_req_cost = (latency / batch_size) / 3600 * hourly_cost
         line = (
             f"| {batch_size} | "
             f"{latency:.2f} | "
+            f"{ttft:.2f} | "
             f"{input_throughput:.2f} | "
             f"{output_throughput:.2f} | "
             f"{accept_length} | "
             f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
+            f"{input_cost_per_1m:.2f} | "
+            f"{output_cost_per_1m:.2f} | "
+            f"{req_cost:.4f} | "
+            f"{e2e_req_cost:.4f} |"
         )
         if trace_link:
             line += f" [Profile]({trace_link}) |"

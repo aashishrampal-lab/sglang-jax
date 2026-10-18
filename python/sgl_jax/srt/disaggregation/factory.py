@@ -78,12 +78,48 @@ def _create_jax_backend(
 ):
     from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
     from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
-    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
+    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
+        JaxTransferWrapper,
+        get_or_create_wrapper,
+    )
+
+    effective_channels = max(8, int(server_args.disaggregation_channel_number or 8))
+    if not getattr(JaxTransferWrapper, "_pd_multisocket_patched", False):
+        def _multisocket_start(self):
+            if self._server is not None:
+                return self._server
+            with self._init_lock:
+                if self._server is not None:
+                    return self._server
+                import jax
+                from jax.experimental.transfer import start_transfer_server
+
+                num_addrs = max(8, int(getattr(self, "_channel_number", 8) or 8))
+                server_addr = f"{self._host_ip}:{self._port}"
+                self._server = start_transfer_server(
+                    jax.local_devices()[0].client,
+                    server_addr,
+                    [f"{self._host_ip}:0"] * num_addrs,
+                    max_num_parallel_copies=num_addrs,
+                    transfer_size=64 * 1024 * 1024,
+                    use_raw_buffers=False,
+                )
+                logger.info(
+                    "JaxTransferWrapper started at %s (channel_number=%d, sockets=%d, jax_version=%s)",
+                    server_addr,
+                    num_addrs,
+                    num_addrs,
+                    jax.__version__,
+                )
+            return self._server
+
+        JaxTransferWrapper.start = _multisocket_start
+        JaxTransferWrapper._pd_multisocket_patched = True
 
     wrapper = get_or_create_wrapper(
         local_host,
         server_args.disaggregation_transfer_port,
-        channel_number=server_args.disaggregation_channel_number,
+        channel_number=effective_channels,
     )
     wrapper.start()
     notifier = ZmqPullNotifier(
@@ -127,10 +163,11 @@ def _create_jax_backend(
         notifier,
         host_pool=host_pool,
         use_d2h_staging=server_args.disaggregation_enable_d2h and role == "prefill",
-        ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
-        pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
+        ack_timeout_seconds=max(3600.0, server_args.disaggregation_ack_timeout_seconds),
+        pull_timeout_seconds=max(3600.0, server_args.disaggregation_pull_timeout_seconds),
         reaper_interval_seconds=server_args.disaggregation_orphan_reaper_interval_seconds,
-        pull_worker_count=server_args.disaggregation_channel_number,
+        pull_worker_count=effective_channels,
+        dp_size=server_args.dp_size,
     )
 
 

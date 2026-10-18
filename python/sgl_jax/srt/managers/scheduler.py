@@ -791,7 +791,40 @@ class Scheduler(
                 # now launched FIFO after the in-flight forward, but keep the barrier
                 # so the device pages are not freed/re-allocated before it is issued.
                 self.tree_cache._donation_barrier = self._wait_donation_safe
+        if isinstance(self.tree_cache, ChunkCache):
+            def _pd_chunk_cache_finished_req(req: Req, is_insert: bool = True):
+                committed_kv_len = req.pop_committed_kv_cache()
+                shared_len = int(getattr(req, "_pd_shared_prefix_len", 0) or 0)
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx,
+                    shared_len:committed_kv_len,
+                ]
+                dp_rank = req.dp_rank if req.dp_rank is not None else 0
+                if len(kv_indices) > 0:
+                    self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+                prefix_entry = getattr(req, "_pd_shared_prefix_entry", None)
+                if prefix_entry is not None:
+                    req._pd_shared_prefix_entry = None
+                    prefix_entry["ref_count"] = max(0, int(prefix_entry.get("ref_count", 1)) - 1)
+                    if prefix_entry["ref_count"] == 0 and prefix_entry.get("evict_on_zero", False):
+                        shared_kv = prefix_entry.get("kv_indices")
+                        if shared_kv is not None and len(shared_kv) > 0:
+                            self.token_to_kv_pool_allocator.free(shared_kv, dp_rank)
+                        prefix_entry["kv_indices"] = None
 
+            self.tree_cache.cache_finished_req = _pd_chunk_cache_finished_req
+
+    @staticmethod
+    def _extract_pd_dpseq(req: Req | None) -> int | None:
+        if req is None:
+            return None
+        tid = str(getattr(req, "disagg_transfer_id", "") or "")
+        if "__dpseq_" in tid:
+            try:
+                return int(tid.rsplit("__dpseq_", 1)[1].split("__", 1)[0])
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
     def _get_input_token_len(req: Req | TokenizedGenerateReqInput) -> int:
@@ -1251,6 +1284,20 @@ class Scheduler(
         req.bootstrap_room = recv_req.bootstrap_room
         req.disagg_prefill_dp_rank = getattr(recv_req, "disagg_prefill_dp_rank", None)
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
+        _tid_str = str(req.disagg_transfer_id or "")
+        _target_prefix_len = (
+            int(
+                os.environ.get(
+                    "SGL_PD_SHARED_PREFIX_LEN",
+                    "262144" if _SHARDED_PREFIX_PAGES == 0 else "92160",
+                )
+            )
+            // self.page_size
+        ) * self.page_size
+        if "__pskip_" in _tid_str and len(req.origin_input_ids) >= _target_prefix_len + self.page_size:
+            req._pd_transfer_skip_tokens = _target_prefix_len
+        elif "__pfull_" in _tid_str:
+            req._pd_transfer_skip_tokens = 0
         if (
             getattr(self.server_args, "disaggregation_enable_overlap_schedule", False)
             and self.server_args.disaggregation_mode == "prefill"
@@ -1696,7 +1743,16 @@ class Scheduler(
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
         self.new_token_ratio = self.init_new_token_ratio
-
+        for attr_name in (
+            "_pd_last_prefix_ids_per_dp",
+            "_pd_decode_prefix_cache",
+            "_pd_next_expected_dpseq",
+            "_pd_dpseq_wait_ticks",
+        ):
+            state_dict = getattr(self, attr_name, None)
+            if isinstance(state_dict, dict):
+                state_dict.clear()
+        self._pd_latest_leader_prefix = None
 
         flushed_items = (
             self.token_to_kv_pool_allocator.available_size()
@@ -2179,6 +2235,37 @@ class Scheduler(
                 self._consec_decode = 0
 
         return ret
+
+    def _get_draft_kv_pools(self) -> list:
+        """Return draft model KV pools when speculative decoding is active."""
+        if not self._is_spec_decode_enabled():
+            return []
+        spec_worker = getattr(self, "draft_worker", None)
+        if spec_worker is None:
+            tp_w = getattr(self, "tp_worker", None)
+            spec_worker = getattr(tp_w, "draft_worker", None)
+        if spec_worker is None:
+            return []
+        draft_worker = getattr(spec_worker, "draft_worker", None) or spec_worker
+        workers = getattr(draft_worker, "_workers", None) or getattr(
+            draft_worker, "draft_worker_list", None
+        )
+        if workers is None:
+            w = getattr(draft_worker, "_worker", draft_worker)
+            workers = [w] if w is not None else []
+        pools = []
+        for w in workers:
+            mr = getattr(w, "model_runner", None)
+            pool = getattr(mr, "token_to_kv_pool", None)
+            if pool is None:
+                alloc = getattr(w, "token_to_kv_pool_allocator", None) or getattr(
+                    mr, "token_to_kv_pool_allocator", None
+                )
+                if alloc is not None and hasattr(alloc, "get_kvcache"):
+                    pool = alloc.get_kvcache()
+            if pool is not None:
+                pools.append(pool)
+        return pools
 
     def _reload_override_env(self) -> None:
         override_path = "/tmp/sgl_override.json"

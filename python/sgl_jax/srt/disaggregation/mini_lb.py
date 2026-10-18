@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import zlib
 from http import HTTPStatus
 from itertools import chain
 
@@ -51,15 +52,22 @@ class MiniLoadBalancer:
 
         self.host = router_args.host
         self.port = router_args.port
-        self.timeout = router_args.request_timeout_secs
+        self.timeout = max(3600.0, float(router_args.request_timeout_secs or 3600.0))
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
+        self.prefill_servers = self.prefill_urls
+        self.decode_servers = self.decode_urls
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_bootstrap_host = router_args.prefill_bootstrap_host
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
+        self._dp_seq_counter: dict[int, int] = {}
+        self._next_dp_rank: int = 0
+        self._active_prefix_sig: tuple | None = None
+        self._active_prefix_leader_dp: int | None = None
+        self._post_sem = asyncio.Semaphore(64)
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -78,25 +86,45 @@ class MiniLoadBalancer:
         lb = self
         if self.max_concurrent_requests:
             _admission_sem = asyncio.Semaphore(self.max_concurrent_requests)
-        uvicorn.run(app, host=self.host, port=self.port)
+        uvicorn.run(app, host=self.host, port=self.port, backlog=8192)
+
+    async def _get_session(self):
+        import aiohttp
+
+        sess = getattr(self, "_http_session", None)
+        if sess is None or sess.closed:
+            connector = aiohttp.TCPConnector(
+                limit=0,
+                ttl_dns_cache=300,
+                keepalive_timeout=300,
+                force_close=False,
+            )
+            sess = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(
+                    total=self.timeout,
+                    sock_connect=600.0,
+                    sock_read=self.timeout,
+                ),
+            )
+            self._http_session = sess
+        return sess
 
     async def _ensure_dp_sizes(self) -> None:
         if self.prefill_dp_size is not None:
             return
 
-        import aiohttp
-
-        async with aiohttp.ClientSession() as session:
-            prefill_info = await fetch_backend_json(
-                session,
-                self.prefill_urls[0],
-                ("get_server_info", "server_info"),
-            )
-            decode_info = await fetch_backend_json(
-                session,
-                self.decode_urls[0],
-                ("get_server_info", "server_info"),
-            )
+        session = await self._get_session()
+        prefill_info = await fetch_backend_json(
+            session,
+            self.prefill_urls[0],
+            ("get_server_info", "server_info"),
+        )
+        decode_info = await fetch_backend_json(
+            session,
+            self.decode_urls[0],
+            ("get_server_info", "server_info"),
+        )
         self.prefill_dp_size = _get_dp_size(prefill_info)
         self.decode_dp_size = _get_dp_size(decode_info)
         logger.info(
@@ -129,6 +157,71 @@ class MiniLoadBalancer:
             return [int(room) % dp_size for room in bootstrap_room]
         return int(bootstrap_room) % dp_size
 
+    @staticmethod
+    def _get_item_prefix_sig(request: dict, idx: int = 0) -> tuple | None:
+        if request.get("dp_rank") is not None:
+            return None
+        target_prefix_len = (
+            int(
+                os.environ.get(
+                    "SGL_PD_SHARED_PREFIX_LEN",
+                    "262144"
+                    if int(os.environ.get("DSA_SHARDED_PREFIX_PAGES", "0")) == 0
+                    else "92160",
+                )
+            )
+            // 128
+        ) * 128
+        if (input_ids := request.get("input_ids")) is not None:
+            item = (
+                input_ids
+                if (input_ids and isinstance(input_ids[0], int))
+                else (input_ids[idx] if idx < len(input_ids) else None)
+            )
+            if (
+                isinstance(item, list)
+                and len(item) >= target_prefix_len + 128
+                and isinstance(item[0], int)
+            ):
+                step = target_prefix_len // 16
+                return (
+                    "ids",
+                    tuple(item[i * step] for i in range(16)),
+                    item[target_prefix_len - 1],
+                )
+            if isinstance(item, str) and len(item) >= 100000:
+                return ("str", item[:32768], item[65536:98304])
+        for field_name in ("text", "prompt"):
+            if (val := request.get(field_name)) is not None:
+                item = (
+                    val
+                    if isinstance(val, str)
+                    else (val[idx] if isinstance(val, list) and idx < len(val) else None)
+                )
+                if isinstance(item, str) and len(item) >= 100000:
+                    return ("str", item[:32768], item[65536:98304])
+                if (
+                    isinstance(item, list)
+                    and len(item) >= target_prefix_len + 128
+                    and isinstance(item[0], int)
+                ):
+                    step = target_prefix_len // 16
+                    return (
+                        "ids",
+                        tuple(item[i * step] for i in range(16)),
+                        item[target_prefix_len - 1],
+                    )
+        return None
+
+    def _tag_transfer_id(self, base_tid: str, r_int: int, seq: int, sig: tuple | None) -> str:
+        if sig is None:
+            return f"{base_tid}__dpseq_{seq}"
+        if sig == self._active_prefix_sig and self._active_prefix_leader_dp is not None:
+            return f"{base_tid}__dpseq_{seq}__pskip_{self._active_prefix_leader_dp}"
+        self._active_prefix_sig = sig
+        self._active_prefix_leader_dp = r_int
+        return f"{base_tid}__dpseq_{seq}__pfull_{r_int}"
+
     async def _align_dp_requests(self, request: dict):
         await self._ensure_dp_sizes()
         p_size = int(self.prefill_dp_size or 1)
@@ -145,17 +238,60 @@ class MiniLoadBalancer:
             if not 0 <= forced < p_size:
                 raise ValueError(f"SGLANG_JAX_PD_FORCE_DP_RANK={forced} is outside [0, {p_size})")
             dp_rank = forced
+        elif request.get("dp_rank") is not None:
+            raw_dp = request["dp_rank"]
+            if isinstance(raw_dp, list):
+                dp_rank = [int(r) % p_size for r in raw_dp]
+            else:
+                dp_rank = int(raw_dp) % p_size
+        elif isinstance(request["bootstrap_room"], list):
+            n_items = len(request["bootstrap_room"])
+            dp_rank = [(self._next_dp_rank + i) % p_size for i in range(n_items)]
+            self._next_dp_rank = (self._next_dp_rank + n_items) % p_size
         else:
-            dp_rank = self._room_rank(request["bootstrap_room"], p_size)
+            dp_rank = self._next_dp_rank % p_size
+            self._next_dp_rank = (self._next_dp_rank + 1) % p_size
 
         prefill_req = request.copy()
         decode_req = request.copy()
         prefill_req["dp_rank"] = dp_rank
         decode_req["dp_rank"] = dp_rank
         decode_req["disagg_prefill_dp_rank"] = dp_rank
+        orig_tid = request.get("disagg_transfer_id")
+        if orig_tid is not None:
+            if isinstance(dp_rank, list):
+                new_tids = []
+                for idx, r in enumerate(dp_rank):
+                    r_int = int(r)
+                    seq = self._dp_seq_counter.get(r_int, 0)
+                    self._dp_seq_counter[r_int] = seq + 1
+                    base_tid = orig_tid[idx] if isinstance(orig_tid, list) else f"{orig_tid}_{idx}"
+                    sig = self._get_item_prefix_sig(request, idx)
+                    new_tids.append(self._tag_transfer_id(base_tid, r_int, seq, sig))
+                prefill_req["disagg_transfer_id"] = new_tids
+                decode_req["disagg_transfer_id"] = new_tids
+            else:
+                r_int = int(dp_rank)
+                seq = self._dp_seq_counter.get(r_int, 0)
+                self._dp_seq_counter[r_int] = seq + 1
+                sig = self._get_item_prefix_sig(request, 0)
+                new_tid = self._tag_transfer_id(str(orig_tid), r_int, seq, sig)
+                prefill_req["disagg_transfer_id"] = new_tid
+                decode_req["disagg_transfer_id"] = new_tid
         return prefill_req, decode_req
 
-    def select_pair(self) -> tuple[str, int | None, str]:
+    def select_pair(self, routing_key: str | None = None) -> tuple[str, int | None, str]:
+        servers = getattr(self, "prefill_servers", self.prefill_urls)
+        d_servers = getattr(self, "decode_servers", self.decode_urls)
+        if routing_key is not None and len(servers) > 0 and len(d_servers) > 0:
+            h = zlib.crc32(str(routing_key).encode("utf-8"))
+            pidx = h % len(servers)
+            didx = h % len(d_servers)
+            return (
+                self.prefill_urls[pidx],
+                self.prefill_bootstrap_ports[pidx],
+                self.decode_urls[didx],
+            )
         pidx = random.randint(0, len(self.prefill_urls) - 1)
         didx = random.randint(0, len(self.decode_urls) - 1)
         return (
@@ -187,20 +323,19 @@ class MiniLoadBalancer:
         else:
             prefill_req, decode_req = await self._align_dp_requests(modified_request)
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.timeout)
-        ) as session:
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
-            prefill_response, decode_response = await asyncio.gather(*tasks)
-
+        session = await self._get_session()
+        tasks = [
+            session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+            session.post(f"{decode_server}/{endpoint}", json=decode_req),
+        ]
+        prefill_response, decode_response = await asyncio.gather(*tasks)
+        try:
             if "return_logprob" in modified_request:
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
                 _prepend_input_logprobs(prefill_json.get("meta_info", {}), ret_json)
             else:
+                await prefill_response.read()
                 ret_json = await decode_response.json()
 
             if expected_decode_dp_rank is not None:
@@ -220,6 +355,9 @@ class MiniLoadBalancer:
                 content=ret_json,
                 status_code=decode_response.status,
             )
+        finally:
+            prefill_response.release()
+            decode_response.release()
 
     async def generate_stream(
         self,
@@ -243,18 +381,19 @@ class MiniLoadBalancer:
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        prefill_req, decode_req = await self._align_dp_requests(modified_request)
-
         async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as session:
+            import re
+
+            session = await self._get_session()
+            async with self._post_sem:
+                prefill_req, decode_req = await self._align_dp_requests(modified_request)
                 tasks = [
                     session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
                     session.post(f"{decode_server}/{endpoint}", json=decode_req),
                 ]
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
+            try:
                 if modified_request.get("return_logprob", False):
                     prefill_meta = {}
                     async for chunk in _iter_stream_lines(prefill_response.content):
@@ -277,10 +416,42 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
-                    ):
-                        yield chunk
+                    p_cache_holder = {}
+
+                    async def _drain_prefill():
+                        raw = await prefill_response.read()
+                        try:
+                            for line in raw.splitlines():
+                                if line.startswith(b"data:") and b"[DONE]" not in line:
+                                    obj = orjson.loads(line[5:])
+                                    if (u := obj.get("usage")) and (ptd := u.get("prompt_tokens_details")):
+                                        if ptd.get("cached_tokens") is not None:
+                                            p_cache_holder["cached_tokens"] = int(ptd["cached_tokens"])
+                                    elif (m := obj.get("meta_info")) and m.get("cached_tokens") is not None:
+                                        p_cache_holder["cached_tokens"] = int(m["cached_tokens"])
+                        except Exception:
+                            pass
+
+                    prefill_drain = asyncio.create_task(_drain_prefill())
+                    try:
+                        async for chunk in decode_response.content.iter_any():
+                            ct = p_cache_holder.get("cached_tokens")
+                            if ct is not None and b"cached_tokens" in chunk:
+                                chunk = re.sub(
+                                    rb'"cached_tokens"\s*:\s*\d+',
+                                    f'"cached_tokens":{ct}'.encode(),
+                                    chunk,
+                                )
+                            yield chunk
+                    finally:
+                        prefill_drain.cancel()
+                        try:
+                            await prefill_drain
+                        except (asyncio.CancelledError, Exception):
+                            pass
+            finally:
+                prefill_response.release()
+                decode_response.release()
 
         return StreamingResponse(
             stream_results(),
@@ -289,8 +460,8 @@ class MiniLoadBalancer:
 
 
 try:
-    from fastapi import FastAPI, HTTPException
-    from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import ORJSONResponse, PlainTextResponse, Response, StreamingResponse
 
     from sgl_jax.srt.disaggregation.mini_lb_helpers import (
         get_parallel_sample_num,
@@ -326,6 +497,29 @@ try:
     async def health_check():
         return Response(status_code=200)
 
+    @app.post("/admin_config")
+    async def admin_config(request_data: dict):
+        if lb is not None:
+            if "decode_urls" in request_data:
+                lb.decode_urls = list(request_data["decode_urls"])
+                lb.decode_servers = list(request_data["decode_urls"])
+            if "prefill_urls" in request_data:
+                lb.prefill_urls = list(request_data["prefill_urls"])
+                lb.prefill_servers = list(request_data["prefill_urls"])
+            for k, v in request_data.get("env", {}).items():
+                os.environ[str(k)] = str(v)
+            lb._dp_seq_counter.clear()
+            lb._next_dp_rank = 0
+            lb._active_prefix_sig = None
+            lb._active_prefix_leader_dp = None
+        return ORJSONResponse(
+            content={
+                "status": "ok",
+                "prefill_urls": getattr(lb, "prefill_urls", []),
+                "decode_urls": getattr(lb, "decode_urls", []),
+            }
+        )
+
     @app.get("/health_generate")
     async def health_generate():
         import aiohttp
@@ -342,6 +536,11 @@ try:
     async def flush_cache():
         import aiohttp
 
+        if lb is not None:
+            lb._dp_seq_counter.clear()
+            lb._next_dp_rank = 0
+            lb._active_prefix_sig = None
+            lb._active_prefix_leader_dp = None
         async with aiohttp.ClientSession() as session:
             tasks = []
             for server in chain(lb.prefill_urls, lb.decode_urls):
@@ -349,6 +548,48 @@ try:
             for response in asyncio.as_completed(tasks):
                 await response
         return Response(status_code=200)
+
+    @app.post("/pause_generation")
+    async def pause_generation(request_data: dict | None = None):
+        import aiohttp
+
+        payload = request_data or {}
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                session.post(f"{server}/pause_generation", json=payload)
+                for server in chain(lb.prefill_urls, lb.decode_urls)
+            ]
+            for response in asyncio.as_completed(tasks):
+                await response
+        return ORJSONResponse(content={"status": "ok"})
+
+    @app.post("/continue_generation")
+    async def continue_generation(request_data: dict | None = None):
+        import aiohttp
+
+        payload = request_data or {}
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                session.post(f"{server}/continue_generation", json=payload)
+                for server in chain(lb.prefill_urls, lb.decode_urls)
+            ]
+            for response in asyncio.as_completed(tasks):
+                await response
+        return ORJSONResponse(content={"status": "ok"})
+
+    @app.post("/abort_request")
+    async def abort_request(request_data: dict | None = None):
+        import aiohttp
+
+        payload = request_data or {"rid": "", "abort_all": True}
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                session.post(f"{server}/abort_request", json=payload)
+                for server in chain(lb.prefill_urls, lb.decode_urls)
+            ]
+            for response in asyncio.as_completed(tasks):
+                await response
+        return ORJSONResponse(content={"status": "ok"})
 
     @app.get("/server_info")
     @app.get("/get_server_info")
@@ -415,13 +656,39 @@ try:
     async def get_model_info():
         return await _get_model_info_impl()
 
-    async def _do_forward(request_data: dict, endpoint_name: str):
+    @app.get("/metrics")
+    async def get_metrics():
+        import aiohttp
+
+        if not lb:
+            return PlainTextResponse("", status_code=200)
+
+        metrics_parts = []
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for server in chain(lb.prefill_urls, lb.decode_urls):
+                tasks.append(session.get(f"{server}/metrics"))
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for resp in responses:
+                if isinstance(resp, aiohttp.ClientResponse):
+                    try:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            if text:
+                                metrics_parts.append(text)
+                    except Exception:
+                        pass
+
+        combined = "\n".join(metrics_parts)
+        return PlainTextResponse(combined, status_code=200)
+
+    async def _do_forward(request_data: dict, endpoint_name: str, routing_key: str | None = None):
         if get_parallel_sample_num(request_data) > 1:
             raise HTTPException(
                 status_code=400,
                 detail="PD mini_lb does not support parallel sampling (n > 1)",
             )
-        prefill_server, bootstrap_port, decode_server = lb.select_pair()
+        prefill_server, bootstrap_port, decode_server = lb.select_pair(routing_key=routing_key)
         modified_request = inject_bootstrap_fields(
             request_data,
             prefill_server=prefill_server,
@@ -442,9 +709,29 @@ try:
             endpoint=endpoint_name,
         )
 
-    async def _forward_to_backend(request_data: dict, endpoint_name: str):
+    async def _forward_to_backend(raw_request: Request, request_data: dict, endpoint_name: str):
+        routing_key = (
+            raw_request.headers.get("x-smg-routing-key")
+            or raw_request.headers.get("x-session-id")
+            or request_data.get("routing_key")
+            or request_data.get("session_id")
+            or request_data.get("user")
+        )
+        if routing_key is not None and request_data.get("dp_rank") is None:
+            if lb is not None and getattr(lb, "prefill_dp_size", None) is None:
+                try:
+                    await lb._ensure_dp_sizes()
+                except Exception:
+                    pass
+            default_dp = str(
+                lb.prefill_dp_size if (lb is not None and getattr(lb, "prefill_dp_size", None)) else 16
+            )
+            num_dp = max(1, int(os.environ.get("SGL_NUM_PREFILL_DP_RANKS", default_dp)))
+            h = zlib.crc32(str(routing_key).encode("utf-8"))
+            request_data["dp_rank"] = h % num_dp
+
         if _admission_sem is None:
-            return await _do_forward(request_data, endpoint_name)
+            return await _do_forward(request_data, endpoint_name, routing_key=routing_key)
 
         # Pending admission: hold the permit while the request runs. Excess
         # requests await the semaphore (held pending at the proxy) and are
@@ -452,7 +739,7 @@ try:
         await _admission_sem.acquire()
         released = False
         try:
-            resp = await _do_forward(request_data, endpoint_name)
+            resp = await _do_forward(request_data, endpoint_name, routing_key=routing_key)
             if isinstance(resp, StreamingResponse):
                 # Streaming returns immediately; the real work happens while the
                 # body is drained. Transfer permit ownership to the iterator so
@@ -474,16 +761,16 @@ try:
                 _admission_sem.release()
 
     @app.post("/generate")
-    async def handle_generate_request(request_data: dict):
-        return await _forward_to_backend(request_data, "generate")
+    async def handle_generate_request(raw_request: Request, request_data: dict):
+        return await _forward_to_backend(raw_request, request_data, "generate")
 
     @app.post("/v1/chat/completions")
-    async def handle_chat_completion_request(request_data: dict):
-        return await _forward_to_backend(request_data, "v1/chat/completions")
+    async def handle_chat_completion_request(raw_request: Request, request_data: dict):
+        return await _forward_to_backend(raw_request, request_data, "v1/chat/completions")
 
     @app.post("/v1/completions")
-    async def handle_completion_request(request_data: dict):
-        return await _forward_to_backend(request_data, "v1/completions")
+    async def handle_completion_request(raw_request: Request, request_data: dict):
+        return await _forward_to_backend(raw_request, request_data, "v1/completions")
 
     @app.get("/v1/models")
     async def get_models():

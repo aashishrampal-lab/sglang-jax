@@ -119,7 +119,53 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
-        self.queue_time = create_queue_time_histogram() if self.server_args.enable_metrics else None
+        self.queue_time = create_queue_time_histogram() if getattr(self.server_args, "enable_metrics", False) else None
+        self.prom_cached_tokens = None
+        self.prom_prompt_tokens = None
+        self.prom_full_token_usage = None
+        self.prom_num_running_reqs = None
+        self.prom_num_queue_reqs = None
+        if getattr(self.server_args, "enable_metrics", False):
+            try:
+                from prometheus_client import REGISTRY, Counter, Gauge
+
+                def _get_or_create_counter(name, documentation):
+                    collector = REGISTRY._names_to_collectors.get(name)
+                    if collector is not None:
+                        return collector
+                    return Counter(name=name, documentation=documentation)
+
+                def _get_or_create_gauge(name, documentation, multiprocess_mode="mostrecent"):
+                    collector = REGISTRY._names_to_collectors.get(name)
+                    if collector is not None:
+                        return collector
+                    return Gauge(
+                        name=name, documentation=documentation, multiprocess_mode=multiprocess_mode
+                    )
+
+                self.prom_cached_tokens = _get_or_create_counter(
+                    "sglang:cached_tokens", "Number of cached prompt tokens."
+                )
+                self.prom_prompt_tokens = _get_or_create_counter(
+                    "sglang:prompt_tokens", "Number of prompt tokens processed."
+                )
+                self.prom_full_token_usage = _get_or_create_gauge(
+                    "sglang:full_token_usage",
+                    "The token usage for full attention layers.",
+                    multiprocess_mode="mostrecent",
+                )
+                self.prom_num_running_reqs = _get_or_create_gauge(
+                    "sglang:num_running_reqs",
+                    "The number of running requests.",
+                    multiprocess_mode="livesum",
+                )
+                self.prom_num_queue_reqs = _get_or_create_gauge(
+                    "sglang:num_queue_reqs",
+                    "The number of requests in the waiting queue.",
+                    multiprocess_mode="mostrecent",
+                )
+            except Exception as e:
+                logger.warning("Failed to initialize prometheus metrics: %s", e)
 
     def log_prefill_stats(
         self: Scheduler,
@@ -153,6 +199,7 @@ class SchedulerMetricsMixin:
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
+            full_token_usage = token_usage
             token_msg = f"token usage: {token_usage:.2f}, "
 
         num_new_seq = sum(len(v) for v in adder.can_run_list.values())
@@ -180,6 +227,19 @@ class SchedulerMetricsMixin:
         f += f"#queue-req: {len(self.waiting_queue)}, "
 
         logger.info(f)
+
+        if getattr(self, "prom_cached_tokens", None) is not None and adder.log_hit_tokens > 0:
+            self.prom_cached_tokens.inc(adder.log_hit_tokens)
+        if getattr(self, "prom_prompt_tokens", None) is not None:
+            total_prompt = adder.log_input_tokens + adder.log_hit_tokens
+            if total_prompt > 0:
+                self.prom_prompt_tokens.inc(total_prompt)
+        if getattr(self, "prom_full_token_usage", None) is not None:
+            self.prom_full_token_usage.set(full_token_usage)
+        if getattr(self, "prom_num_running_reqs", None) is not None:
+            self.prom_num_running_reqs.set(running_bs)
+        if getattr(self, "prom_num_queue_reqs", None) is not None:
+            self.prom_num_queue_reqs.set(len(self.waiting_queue))
 
     def log_decode_stats(self: Scheduler, running_batch: ScheduleBatch = None):
         batch = running_batch or self.running_batch
@@ -210,6 +270,7 @@ class SchedulerMetricsMixin:
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
+            full_token_usage = token_usage
             token_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
@@ -245,3 +306,10 @@ class SchedulerMetricsMixin:
             msg += f"#cache_miss: {batch.cache_miss_count}"
 
         logger.info(msg)
+
+        if getattr(self, "prom_full_token_usage", None) is not None:
+            self.prom_full_token_usage.set(full_token_usage)
+        if getattr(self, "prom_num_running_reqs", None) is not None:
+            self.prom_num_running_reqs.set(num_running_reqs)
+        if getattr(self, "prom_num_queue_reqs", None) is not None:
+            self.prom_num_queue_reqs.set(len(self.waiting_queue))

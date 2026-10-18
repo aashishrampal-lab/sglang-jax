@@ -128,20 +128,36 @@ class TestGlm52SplitCommitsSmoke(unittest.TestCase):
         """Stage 4: Verify PD Disagg KV-only prefill, shared-prefix skip/extend, and MiniLB sticky routing."""
         if STAGE < 4:
             return
+        import asyncio
         from sgl_jax.srt.disaggregation.mini_lb import MiniLoadBalancer
 
         lb = MiniLoadBalancer.__new__(MiniLoadBalancer)
         lb.prefill_servers = ["http://127.0.0.1:8001"]
         lb.decode_servers = ["http://127.0.0.1:8002"]
+        lb.prefill_dp_size = 1
+        lb.decode_dp_size = 1
+        lb._dp_seq_counter = {}
+        lb._active_prefix_sig = None
+        lb._active_prefix_leader_dp = None
+
+        async def _noop_ensure():
+            return
+
+        lb._ensure_dp_sizes = _noop_ensure
 
         os.environ["SGL_PD_SHARED_PREFIX_LEN"] = "4096"
-        req_a = {"input_ids": [1, 2, 3] * 2000}
+        req_a = {"input_ids": [1, 2, 3] * 2000, "bootstrap_room": 1, "disagg_transfer_id": "t1"}
         req_b = {"input_ids": [1, 2, 3] * 2000}
         h_expected = zlib.crc32(b"session-xyz") % 16
         # Verify deterministic CRC32 sticky routing and suppression of cross-DP leader tag when dp_rank is set
         req_a["dp_rank"] = h_expected
         self.assertIsNone(lb._get_item_prefix_sig(req_a))
         self.assertIsNotNone(lb._get_item_prefix_sig(req_b))
+
+        # Verify _align_dp_requests safely wraps dp_rank modulo prefill_dp_size (e.g., dp_size=1)
+        p_req, d_req = asyncio.run(lb._align_dp_requests(req_a))
+        self.assertEqual(p_req["dp_rank"], 0)
+        self.assertEqual(d_req["dp_rank"], 0)
 
         with open(os.path.join(PYTHON_ROOT, "sgl_jax/srt/models/glm5_moe.py")) as f:
             glm5_src = f.read()

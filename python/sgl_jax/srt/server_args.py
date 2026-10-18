@@ -426,6 +426,29 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+        if (
+            self.disaggregation_mode == "decode"
+            and self.mem_fraction_static is not None
+            and self.mem_fraction_static > 0.81
+        ):
+            logger.info(
+                "Clamping decode mem_fraction_static from %.3f to 0.810 for runtime XLA/pull headroom",
+                self.mem_fraction_static,
+            )
+            self.mem_fraction_static = 0.81
+        elif (
+            self.disaggregation_mode == "prefill"
+            and self.context_length is not None
+            and self.context_length >= 200000
+            and self.mem_fraction_static is not None
+            and self.mem_fraction_static > 0.785
+        ):
+            logger.info(
+                "Clamping 256k prefill mem_fraction_static from %.3f to 0.785 for runtime XLA headroom",
+                self.mem_fraction_static,
+            )
+            self.mem_fraction_static = 0.785
+
         # Set chunked prefill size
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 4096
