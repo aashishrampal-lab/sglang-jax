@@ -43,23 +43,40 @@ class EAGLEWorker(BaseSpecWorker):
     # -- Precompilation --
 
     def run_spec_decode_precompile(self):
-        if not self.server_args.disable_overlap_schedule:
+        disagg_mode = getattr(self.server_args, "disaggregation_mode", "null")
+        use_overlap = not self.server_args.disable_overlap_schedule
+        if disagg_mode in ("prefill", "decode"):
+            use_overlap = use_overlap and bool(
+                getattr(self.server_args, "disaggregation_enable_overlap_schedule", False)
+            )
+        if use_overlap:
             self.init_spec_relay_buffers()
         self.precompile_spec_extend()
-        self.precompile_spec_decode()
+        if disagg_mode != "prefill":
+            self.precompile_spec_decode()
         # FIXME precompile some kernel
 
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
         dp_size = self.server_args.dp_size
+        bs, _ = self.draft_worker.get_max_padded_size()
+        token_paddings = list(self.precompile_token_paddings)
+        user_tok_paddings = getattr(self.server_args, "precompile_token_paddings", None)
+        if (
+            getattr(self.server_args, "disaggregation_mode", "null") == "decode"
+            and user_tok_paddings
+        ):
+            max_user_tok = max(user_tok_paddings)
+            capped = [t for t in token_paddings if t <= max_user_tok]
+            if capped:
+                token_paddings = capped
         logger.info(
             "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s dp_size=%d",
             self.precompile_bs_paddings[-1:],
-            self.precompile_token_paddings,
+            token_paddings,
             dp_size,
         )
 
-        bs, _ = self.draft_worker.get_max_padded_size()
         # extend-shaped spec batches pad bs to the largest bucket; with the
         # fitted cache_loc padding on, their page table may land on any rung
         # of that bucket, so compile each rung.
@@ -74,7 +91,7 @@ class EAGLEWorker(BaseSpecWorker):
             if _SPEC_CACHE_LOC_FIT
             else [self.precompile_cache_loc_paddings[-1]]
         )
-        pairs = list(itertools.product([bs], self.precompile_token_paddings, cache_loc_sizes))
+        pairs = list(itertools.product([bs], token_paddings, cache_loc_sizes))
 
         with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
@@ -208,23 +225,51 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
-                spec_info = EagleDraftInput(
-                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
-                    topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
-                    hidden_states=np.ones(
-                        (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=(
-                            jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                def _make_non_relay_spec_info(batch):
+                    return EagleDraftInput(
+                        topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
+                        topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
+                        hidden_states=np.ones(
+                            (bs, self.draft_worker.model_config.hidden_size),
+                            dtype=(
+                                jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                            ),
                         ),
-                    ),
-                    verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    num_tokens_per_batch=np.asarray(1, dtype=np.int32),
-                    num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                    allocate_lens=model_worker_batch.seq_lens
-                    + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                )
-                if self.spec_relay_buffers is not None:
+                        verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                        allocate_lens=batch.seq_lens + max(3 * EagleDraftInput.ALLOC_LEN_PER_DECODE, 2 * num_steps),
+                    )
+
+                def _make_relay_spec_info(batch):
+                    return EagleDraftInput(
+                        future_indices=np.asarray(batch.req_pool_indices, dtype=np.int32),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                        allocate_lens=batch.seq_lens + max(3 * EagleDraftInput.ALLOC_LEN_PER_DECODE, 2 * num_steps),
+                    )
+
+                greedy_modes = (True, False) if bs == shapes[0][0] else (False,)
+                for is_greedy in greedy_modes:
+                    model_worker_batch = _make_decode_batch()
+                    model_worker_batch.sampling_info.is_all_greedy = is_greedy
+                    spec_info = _make_non_relay_spec_info(model_worker_batch)
+                    if self.spec_relay_buffers is not None:
+                        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                        model_worker_batch.spec_info_padded = spec_info
+                        model_worker_batch.speculative_eagle_topk = self.topk
+                        model_worker_batch.speculative_num_draft_tokens = (
+                            self.speculative_num_draft_tokens
+                        )
+                        model_worker_batch.speculative_num_steps = self.speculative_num_steps
+                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                        jax.block_until_ready(self.spec_relay_buffers)
+
+                        model_worker_batch = _make_decode_batch()
+                        model_worker_batch.sampling_info.is_all_greedy = is_greedy
+                        spec_info = _make_relay_spec_info(model_worker_batch)
                     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                     model_worker_batch.spec_info_padded = spec_info
                     model_worker_batch.speculative_eagle_topk = self.topk
@@ -232,30 +277,11 @@ class EAGLEWorker(BaseSpecWorker):
                         self.speculative_num_draft_tokens
                     )
                     model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                    self.forward_batch_speculative_decode_overlap(model_worker_batch)
-                    jax.block_until_ready(self.spec_relay_buffers)
-
-                    model_worker_batch = _make_decode_batch()
-                    spec_info = EagleDraftInput(
-                        future_indices=np.asarray(
-                            model_worker_batch.req_pool_indices, dtype=np.int32
-                        ),
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
-                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
-                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                        allocate_lens=model_worker_batch.seq_lens
-                        + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                    )
-                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-                model_worker_batch.spec_info_padded = spec_info
-                model_worker_batch.speculative_eagle_topk = self.topk
-                model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
-                model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                if self.spec_relay_buffers is not None:
-                    self.forward_batch_speculative_decode_overlap(model_worker_batch)
-                    jax.block_until_ready(self.spec_relay_buffers)
-                else:
-                    self.forward_batch_speculative_generation(model_worker_batch)
+                    if self.spec_relay_buffers is not None:
+                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                        jax.block_until_ready(self.spec_relay_buffers)
+                    else:
+                        self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

@@ -157,6 +157,7 @@ class CompilationManager:
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
+        self.disaggregation_mode = getattr(server_args, "disaggregation_mode", "null")
         # Backends may request decode variants per pages-per-seq bucket (MSA);
         # None keeps one decode shape per bs. Shared by warmup and AOT export.
         self.decode_page_buckets = getattr(attn_backend, "decode_page_buckets", None)
@@ -169,6 +170,8 @@ class CompilationManager:
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
         if user_paddings is None:
+            if self.disaggregation_mode == "decode":
+                return [self.max_padded_batch_size]
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
             # The static defaults top out at 8192 * dp_size. When the token
             # budget is larger, keep doubling so the final max-size bucket is
@@ -271,6 +274,11 @@ class CompilationManager:
             else server_args.max_running_requests
         )
         constraints = [server_limit, pool_limit, attn_backend_limit]
+        if (
+            getattr(server_args, "disaggregation_mode", "null") == "prefill"
+            and server_args.max_running_requests is None
+        ):
+            constraints.append(256)
         max_running_requests = min(constraints)
         # Log each constraint for debugging
         logger.info("Max running requests constraints:")
@@ -428,6 +436,7 @@ class CompilationManager:
         prepare_lora_fn: Callable | None = None,
         future_token_ids_map=None,
     ):
+        disagg_mode = getattr(model_runner.server_args, "disaggregation_mode", "null")
         self._precompile_encode(model_runner)
         self._precompile_extend(
             forward_fn,
@@ -436,9 +445,10 @@ class CompilationManager:
             prepare_lora_fn,
             future_token_ids_map,
         )
-        self._precompile_decode(
-            forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
-        )
+        if disagg_mode != "prefill":
+            self._precompile_decode(
+                forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+            )
 
     def _precompile_encode(self, model_runner) -> None:
         if not self.precompile_in_model_multimodal:
@@ -714,12 +724,12 @@ class CompilationManager:
         if invalid_cache_loc_size < 0:
             raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
 
-        valid_cache_loc = np.arange(bs)
+        valid_cache_loc = np.arange(bs, dtype=np.int32)
         invalid_cache_loc = np.array([0] * invalid_cache_loc_size, dtype=jnp.int32)
         lora_ids = ["0"] * bs
 
-        extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
-        logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
+        extend_seq_lens = np.array([1] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+        logits_indices = np.array([0] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
 
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
@@ -744,9 +754,14 @@ class CompilationManager:
             return_output_logprob_only=return_output_logprob_only,
             sampling_info=sampling_info,
             extend_input_logprob_token_ids=None,
+            extend_next_token_ids=(
+                np.full(bs, -1, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+            ),
             positions=np.concat([valid_positions, invalid_positions], axis=0),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
+            extend_prefix_lens=(
+                np.array([0] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+            ),
             extend_seq_lens=extend_seq_lens,
             top_logprobs_nums=None,
             token_ids_logprobs=None,

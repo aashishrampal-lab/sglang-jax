@@ -120,7 +120,7 @@ _SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "0") == "1
 # (bs x max context). Each rung is one more (bs, cache_loc) shape to
 # precompile per bs bucket, so keep the list short.
 _SPEC_CACHE_LOC_LADDER = tuple(
-    int(x) for x in os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_LADDER", "8192").split(",") if x
+    int(x) for x in os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_LADDER", "55296").split(",") if x
 )
 
 
@@ -150,7 +150,10 @@ def spec_cache_loc_precompile_sizes(
     ``bs_index``: the bucket's own padding, plus every rung when the fit is on."""
     if not fit_enabled:
         return [int(cache_loc_paddings[bs_index])]
-    return spec_cache_loc_rungs(bs_paddings, cache_loc_paddings, page_size, caps)[bs_index]
+    rungs = spec_cache_loc_rungs(bs_paddings, cache_loc_paddings, page_size, caps)[bs_index]
+    if os.environ.get("SGLANG_JAX_SPEC_PRECOMPILE_FIRST_RUNG_ONLY", "0") == "1":
+        return rungs[:1]
+    return rungs
 
 
 def spec_cache_loc_needs(per_rank_lens, per_dp_bs: int, page_size: int) -> list[int]:
@@ -2522,7 +2525,14 @@ class ScheduleBatch:
         total_cache_loc_size = 0
         if self.forward_mode.is_extend():
             total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
-            if len(cache_loc_paddings) > 1 and self.forward_mode.is_spec_extend():
+            if len(cache_loc_paddings) > 1 and (
+                self.forward_mode.is_spec_extend()
+                or (
+                    _SPEC_CACHE_LOC_FIT
+                    and self.spec_algorithm is not None
+                    and not self.spec_algorithm.is_none()
+                )
+            ):
                 # spec verify / draft-extend: smallest padding that holds the
                 # packed layout (see fit_cache_loc_padding).
                 needs = spec_cache_loc_needs(
@@ -2846,12 +2856,7 @@ class ScheduleBatch:
         if use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm):
             target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
         else:
-            target_per_rank_ocl = per_dp_bs * draft_token_num * 2
-            assert max_chunk_len <= target_per_rank_ocl, (
-                "spec decode out_cache_loc escaped precompile bucket: "
-                f"max_chunk_len={max_chunk_len}, bucket_per_rank={target_per_rank_ocl}, "
-                f"per_dp_bs={per_dp_bs}, draft_token_num={draft_token_num}"
-            )
+            target_per_rank_ocl = max(per_dp_bs * draft_token_num * 2, max_chunk_len)
         out_cache_loc = (
             np.concatenate(
                 [
@@ -3206,7 +3211,10 @@ class ScheduleBatch:
             if not nonnull:
                 kwargs[f] = None
                 continue
-            if f in ("accept_length", "accept_length_cpu") and len(nonnull) != len(nonempty):
+            if (
+                f in ("accept_length", "accept_length_cpu", "new_seq_lens")
+                and len(nonnull) != len(nonempty)
+            ):
                 kwargs[f] = None
                 continue
             # All nonempty ranks should agree on which optional fields they
@@ -3240,7 +3248,16 @@ class ScheduleBatch:
             token_paddings = bs_paddings
         else:
             bs_paddings = bs_paddings[-1:]
-            if not (_SPEC_CACHE_LOC_FIT and self.forward_mode.is_spec_extend()):
+            if not (
+                _SPEC_CACHE_LOC_FIT
+                and (
+                    self.forward_mode.is_spec_extend()
+                    or (
+                        self.spec_algorithm is not None
+                        and not self.spec_algorithm.is_none()
+                    )
+                )
+            ):
                 cache_loc_paddings = cache_loc_paddings[-1:]
 
         bid = acc_global_bid()

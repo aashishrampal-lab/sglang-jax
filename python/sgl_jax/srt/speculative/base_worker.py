@@ -291,9 +291,9 @@ class BaseSpecWorker:
         # EAGLE carries DP-padded allocation lengths. Other algorithms can own
         # committed KV lengths directly and return None from the hook.
         cur_allocate_lens = self._get_cur_allocate_lens(model_worker_batch)
-        if self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy:
-            # Current fused route covers greedy NEXTN decode; more speculative
-            # decode paths can be folded into this entry point over time.
+        if self._can_use_fused_spec_decode:
+            # Fused route covers both greedy and non-greedy NEXTN decode
+            # (matching forward_batch_speculative_decode_overlap).
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
             batch_output = spec_decode(self, model_worker_batch, cur_allocate_lens)
