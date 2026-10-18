@@ -864,6 +864,7 @@ class ScheduleReqsInfo:
     decoding_reqs: list[Req] = None
     extend_logprob_start_lens: list[int] = None
     extend_input_logprob_token_ids: np.ndarray | None = None
+    extend_next_token_ids: np.ndarray | None = None
 
     # Speculative decoding info (per DP)
     spec_info: EagleDraftInput | EagleVerifyInput | None = None
@@ -1319,6 +1320,7 @@ class ScheduleBatch:
                 info.out_cache_loc = None
                 info.seq_lens_sum = 0
                 info.extend_num_tokens = None
+                info.extend_next_token_ids = None
                 continue
 
             # Allocate req slots
@@ -1456,6 +1458,15 @@ class ScheduleBatch:
             info.prefix_lens = prefix_lens
             info.extend_lens = extend_lens
             info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+            info.extend_next_token_ids = np.asarray(
+                [
+                    r.origin_input_ids[seq_len]
+                    if seq_len < len(r.origin_input_ids)
+                    else -1
+                    for r, seq_len in zip(reqs, seq_lens)
+                ],
+                dtype=np.int32,
+            )
 
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
@@ -2588,7 +2599,10 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
-            seq_lens = np.asarray(info.seq_lens)
+            if getattr(self, "is_coop_prefill_batch", False):
+                seq_lens = np.asarray(self.reqs_info[-1].seq_lens)
+            else:
+                seq_lens = np.asarray(info.seq_lens)
             req_pool_indices = np.asarray(info.req_pool_indices)
 
             n_reqs = len(seq_lens)
@@ -3433,6 +3447,22 @@ class ScheduleBatch:
                 if chunks and self.forward_mode.is_extend():
                     merged_extend_input_logprob_token_ids = np.concatenate(chunks)
 
+        extend_next_token_ids_cpu = None
+        if self.forward_mode.is_extend() and any(
+            getattr(info, "extend_next_token_ids", None) is not None for info in self.reqs_info
+        ):
+            extend_next_token_ids_cpu = np.full(total_bs, -1, dtype=np.int32)
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if getattr(info, "extend_next_token_ids", None) is not None:
+                        extend_next_token_ids_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.extend_next_token_ids[:dp_bs]
+                        )
+                offset_bs += per_dp_bs_padding
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -3453,6 +3483,7 @@ class ScheduleBatch:
             extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=merged_extend_input_logprob_token_ids,
+            extend_next_token_ids=extend_next_token_ids_cpu,
             input_logprob_indices=input_logprob_indices,
             logits_indices=logits_indices,
             lora_ids=lora_ids,
@@ -3863,6 +3894,10 @@ class ModelWorkerBatch:
     # For padding
     real_bs: int
     real_bs_per_dp: list[int]
+
+    # Ground-truth next prompt token id per request for intermediate prefill chunks
+    # (-1 when the current extend reaches the end of the prompt).
+    extend_next_token_ids: np.ndarray | None = None
 
     # Maps "original request order" (DP-rank-then-req flat order) to the
     # DP-interleaved padded slot in the global batch. Host code applies

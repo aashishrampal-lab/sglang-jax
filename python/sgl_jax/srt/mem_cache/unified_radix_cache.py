@@ -359,7 +359,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
-        if self.disable:
+        if self.disable or node is None:
             return IncLockRefResult(delta=0)
 
         result = IncLockRefResult()
@@ -371,7 +371,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def dec_lock_ref(self, node: UnifiedTreeNode, params: DecLockRefParams | None = None):
-        if self.disable:
+        if self.disable or node is None:
             return 0
 
         for component in self._components_tuple:
@@ -983,6 +983,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if target_node is not self.root_node:
             self._refresh_component_lru(target_node, LRURefreshPhase.INSERT_END)
 
+        # HiCache write-through: a brand-new leaf counts as its first hit, exactly
+        # like a walked-through node does above (and like torch HiRadixCache's
+        # inc_hit_count(new_node)). Without this, a prefix seen once is never
+        # backed up and its first eviction destroys it -- the host tier would
+        # only ever hold prefixes that happened to be re-inserted while still
+        # resident. Runs after commit_insert_component_data so the node is
+        # fully formed when write_backup gathers it.
+        if is_new_leaf and self.hicache_enabled:
+            self._inc_hit_count(target_node)
+
         return result
 
     ##### HiCache (L1<->L2) Write Path #####
@@ -1035,6 +1045,9 @@ class UnifiedRadixCache(BasePrefixCache):
         element and divide by page_size to get local device page ids."""
         if node is self.root_node or node.backuped:
             return 0
+        if self.host_pool is None or self.hicache_controller is None:
+            # hicache_enabled without the L2 wiring (tests / partial init): nothing to back up to.
+            return 0
 
         if not write_back and node.parent is not self.root_node and not node.parent.backuped:
             self.write_backup(node.parent)
@@ -1078,7 +1091,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Precompile host<->device transfer kernels at startup (no-op if disabled)."""
         if not self.hicache_enabled or self.host_pool is None:
             return
-        self.host_pool.precompile_transfers()
+        if self.hicache_controller is not None:
+            # Issue from the single launch-owning thread (multi-host launch order).
+            self.hicache_controller.run_on_launcher(self.host_pool.precompile_transfers)
+        else:
+            self.host_pool.precompile_transfers()
 
     def writing_check(self) -> None:
         """Settle completed async D2H writes (non-blocking).
@@ -1102,7 +1119,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     exc,
                     len(host_pages),
                 )
-        self.hicache_controller.check_write_status()
+        # Failed backups were rolled back above (node simply stays device-only);
+        # a host-side allocation hiccup must not take the serving loop down.
+        try:
+            self.hicache_controller.check_write_status()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("HiCache D2H write failed (node left un-backed-up): %s", e)
 
     def check_hicache_events(self) -> None:
         """Non-blocking poll of in-flight D2H writes (scheduler hook)."""
@@ -1195,6 +1217,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if node is self.root_node:
             return False
         if not (node.evicted and node.backuped):
+            return False
+        if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
         return not any(child.backuped for child in node.children.values())
 
@@ -1293,16 +1317,28 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Lock attach_boundary across eviction so it isn't demoted (it's the
-        # device leaf whose sole child is the tombstone we're reloading).
+        # device leaf whose sole child is the tombstone we're reloading), and
+        # remove all nodes in ``selected`` from ``evictable_host_leaves`` (while
+        # bumping their lock_ref) so that write_back device eviction -> evict_host
+        # cannot evict the very host tombstone chain we are reloading.
         lock_res = self.inc_lock_ref(attach_boundary)
+        for n in selected:
+            n.component_data[BASE_COMPONENT_TYPE].lock_ref += 1
+            self.evictable_host_leaves.discard(n)
         try:
             avail = self.token_to_kv_pool_allocator.available_size(dp_rank)
             if avail < total:
                 self.evict(EvictParams(num_tokens=total - avail, dp_rank=dp_rank))
             device_indices_all = self.token_to_kv_pool_allocator.alloc(total, dp_rank=dp_rank)
         finally:
+            for n in selected:
+                n.component_data[BASE_COMPONENT_TYPE].lock_ref -= 1
             self.dec_lock_ref(attach_boundary, lock_res.to_dec_params())
-        if device_indices_all is None:
+        if device_indices_all is None or any(
+            n.component_data[BASE_COMPONENT_TYPE].host_value is None for n in selected
+        ):
+            for n in selected:
+                self._update_evictable_leaf_sets(n)
             return np.empty((0,), dtype=np.int32), last_host_node, []
 
         offset = 0
