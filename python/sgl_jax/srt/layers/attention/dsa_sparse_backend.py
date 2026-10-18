@@ -266,6 +266,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             else layer.scaling
         )
         dpa = self.attention_data_partition_axis
+        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+        if new_kv_c.dtype != kv_cache.dtype:
+            new_kv_c = new_kv_c.astype(kv_cache.dtype)
+        if new_k_pe.dtype != kv_cache.dtype:
+            new_k_pe = new_k_pe.astype(kv_cache.dtype)
         md = self.forward_metadata
 
         # ── dense short-circuit ────────────────────────────────────────────
@@ -535,11 +540,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             else:
                 topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
             if compute_pages:
+                max_k_pages_smem = max(32, 131072 // max(1, q_.shape[0]))
                 topk_pages = compute_topk_pages(
                     topk,
                     page_size=self.page_size,
                     pages_per_seq=pages_per_seq,
-                    k_pages_max=512,
+                    k_pages_max=min(512, max_k_pages_smem),
                 )
             else:
                 topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
@@ -597,14 +603,22 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            k_pages_max = (
-                min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
-            )
+            max_k_pages_smem = max(32, 131072 // max(1, ql_.shape[0]))
+            if _PAGE_TOPK_BUDGET > 0:
+                k_pages_max = min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1
+            elif has_pages and tpages_.shape[-1] < 512:
+                k_pages_max = min(tpages_.shape[-1] + 1, pages_per_seq + 1)
+            else:
+                k_pages_max = 512
+            k_pages_max = min(k_pages_max, max_k_pages_smem)
             if has_pages:
                 # Page lists from the prefill-form indexer (spec decode-form path)
                 # are index_topk/page_size wide; the page-level wrapper expects
                 # k_pages_max - 1 columns.
-                tpages_ = _pad_topk_pages(tpages_, k_pages_max - 1)
+                if tpages_.shape[-1] < k_pages_max - 1:
+                    tpages_ = _pad_topk_pages(tpages_, k_pages_max - 1)
+                elif tpages_.shape[-1] > k_pages_max - 1:
+                    tpages_ = tpages_[:, : k_pages_max - 1]
             return sparse_mla_page_level(
                 ql_,
                 qpe_,

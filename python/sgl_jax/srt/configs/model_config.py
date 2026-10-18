@@ -53,6 +53,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
     }
 )
 
@@ -577,7 +578,20 @@ class ModelConfig:
                 )
                 return None
 
-        # 3. No quantization config found
+        # 3. Fallback for GLM-5.2 / GlmMoeDsaForCausalLM when no HF quantization_config exists
+        if getattr(self.hf_config, "architectures", None) and any(
+            "GlmMoeDsaForCausalLM" in arch for arch in self.hf_config.architectures
+        ):
+            default_fp8_path = (
+                "/opt/sglang-jax/python/sgl_jax/srt/utils/quantization/configs/fp8_w8a8.yaml"
+            )
+            if os.path.exists(default_fp8_path):
+                logger.info(
+                    "No quantization config in HF config or CLI; defaulting GlmMoeDsaForCausalLM to %s",
+                    default_fp8_path,
+                )
+                return QuantizationConfig.from_path(default_fp8_path)
+
         logger.info("No quantization config found in HF config or user config")
         return None
 

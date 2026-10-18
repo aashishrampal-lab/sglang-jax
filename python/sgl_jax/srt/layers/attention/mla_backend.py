@@ -390,7 +390,7 @@ class MLAAttentionBackend(AttentionBackend):
         assert (
             res > 0
         ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
+        return max(32, res)
 
     def get_eagle_base_metadata(self, batch, **kwargs):
         """Metadata for the fused speculative JITs that rebuild dynamic fields on device.

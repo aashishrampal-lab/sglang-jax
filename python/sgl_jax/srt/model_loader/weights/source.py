@@ -166,9 +166,44 @@ class LocalSource(WeightSource):
         self._prefetched = False
         self._weight_info_cache = None
         self._lock = threading.Lock()
+        self._all_files = None
+        self._file_to_idx = {}
+        self._prefetch_submitted = set()
+        self._prefetch_pool = None
+
+    @staticmethod
+    def _prefetch_one_file(path):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_WILLNEED"):
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+            finally:
+                os.close(fd)
+            buf = bytearray(16 * 1024 * 1024)
+            with open(path, "rb", buffering=0) as fp:
+                while fp.readinto(buf):
+                    pass
+        except Exception:
+            pass
 
     def _get_handle(self, filename):
         with self._lock:
+            if self._all_files is None:
+                self._all_files = sorted(
+                    glob.glob(os.path.join(os.path.dirname(filename), "*.safetensors"))
+                )
+                self._file_to_idx = {f: i for i, f in enumerate(self._all_files)}
+            if self._prefetch_pool is None:
+                self._prefetch_pool = ThreadPoolExecutor(
+                    max_workers=8, thread_name_prefix="st-prefetch"
+                )
+                idx = self._file_to_idx.get(filename, 0)
+                order = self._all_files[idx:] + self._all_files[:idx]
+                for f in order:
+                    if f not in self._prefetch_submitted:
+                        self._prefetch_submitted.add(f)
+                        self._prefetch_pool.submit(self._prefetch_one_file, f)
             if filename not in self.handles:
                 self.handles[filename] = safe_open(filename, framework="np", device="cpu")
             return self.handles[filename]
@@ -284,7 +319,10 @@ class LocalSource(WeightSource):
     def close(self):
         # safe_open objects don't strictly require close() as they rely on RAII/GC,
         # but clearing references ensures we don't hold descriptors.
-        self.handles.clear()
+        # Keep self._prefetch_pool alive across chunked load() calls so sequential
+        # lookahead prefetching continues uninterrupted across all layer chunks.
+        with self._lock:
+            self.handles.clear()
 
     def release(self, filenames):
         """Drop completed file mappings once their last loading group is ready."""
