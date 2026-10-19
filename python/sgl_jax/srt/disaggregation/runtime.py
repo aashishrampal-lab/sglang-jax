@@ -21,11 +21,6 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     mode = server_args.disaggregation_mode
     if mode == "null":
         return
-    if server_args.dp_size > 1 and not server_args.disaggregation_use_raiden:
-        raise RuntimeError(
-            "PD disaggregation with dp_size>1 requires the Raiden transfer "
-            f"engine (got dp_size={server_args.dp_size})."
-        )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
 
@@ -63,9 +58,9 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     role = "prefill" if mode == "prefill" else "decode"
     shared_secret = resolve_secret(server_args.disaggregation_shared_secret)
 
-    if os.environ.get("DISAGG_LAUNCH_BOOTSTRAP", "") == "1":
+    if os.environ.get("DISAGG_LAUNCH_BOOTSTRAP", "") == "1" and server_args.node_rank == 0:
         scheduler.disagg_bootstrap_server = BootstrapServer(
-            host=local_host,
+            host="0.0.0.0",
             port=server_args.disaggregation_bootstrap_port,
             shared_secret=shared_secret,
         )

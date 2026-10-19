@@ -544,9 +544,12 @@ class Req:
             self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
         )
         # PD decode-side: KV was written externally; skip tree_cache.match_prefix
-        # for this req's first decode iter.
+        # for this req's first decode iter. Keep _pd_skip_prefix_match True while
+        # kv_committed_len == 0 so a deferred admission in waiting_queue (e.g.
+        # DP_BUDGET_EXHAUSTED or NO_TOKEN) does not wipe prefix_indices on retry.
         if getattr(self, "_pd_skip_prefix_match", False):
-            self._pd_skip_prefix_match = False
+            if self.kv_committed_len > 0:
+                self._pd_skip_prefix_match = False
             root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
             self.last_node = root
             self.last_host_node = root
@@ -564,7 +567,16 @@ class Req:
         # ChunkCache (--disable-radix-cache). If RadixCache support is added,
         # continuation rounds must also preserve/update last_node and radix
         # lock state, not just prefix_indices.
-        if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
+        if (
+            getattr(self, "bootstrap_room", None) is not None
+            and not self.output_ids
+            and getattr(self, "last_node", None) is None
+            and (
+                tree_cache is None
+                or getattr(tree_cache, "disable", False)
+                or isinstance(tree_cache, ChunkCache)
+            )
+        ):
             # A completed middle chunk decrements is_chunked before
             # this continuation round is initialized. kv_committed_len, not the
             # in-flight counter, is the durable signal that prefix_indices owns
@@ -579,7 +591,7 @@ class Req:
             self.host_hit_length = 0
             return
         if tree_cache is not None:
-            if getattr(tree_cache, "disable", False):
+            if getattr(tree_cache, "disable", False) or isinstance(tree_cache, ChunkCache):
                 self.prefix_indices = np.empty((0,), dtype=np.int32)
                 self.last_node = tree_cache.root_node
                 self.last_host_node = tree_cache.root_node
@@ -1463,8 +1475,9 @@ class ScheduleBatch:
             info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
             info.extend_next_token_ids = np.asarray(
                 [
-                    r.origin_input_ids[seq_len]
-                    if seq_len < len(r.origin_input_ids)
+                    r.origin_input_ids[seq_len + int(getattr(r, "_pd_seq_pos_offset", 0))]
+                    if (seq_len + int(getattr(r, "_pd_seq_pos_offset", 0)))
+                    < len(r.origin_input_ids)
                     else -1
                     for r, seq_len in zip(reqs, seq_lens)
                 ],
@@ -2240,9 +2253,19 @@ class ScheduleBatch:
             if self.forward_mode.is_extend():
                 # For extend: positions are [prefix_len, prefix_len+1, ..., seq_len-1] for each request
                 pt = offset
-                for seq_len, prefix_len in zip(info.seq_lens, info.prefix_lens):
+                reqs_list = info.reqs or []
+                for req_idx, (seq_len, prefix_len) in enumerate(
+                    zip(info.seq_lens, info.prefix_lens)
+                ):
+                    pos_off = (
+                        int(getattr(reqs_list[req_idx], "_pd_seq_pos_offset", 0))
+                        if req_idx < len(reqs_list)
+                        else 0
+                    )
                     next_pt = pt + (seq_len - prefix_len)
-                    positions_cpu[pt:next_pt] = np.arange(prefix_len, seq_len, dtype=np.int32)
+                    positions_cpu[pt:next_pt] = np.arange(
+                        prefix_len + pos_off, seq_len + pos_off, dtype=np.int32
+                    )
                     pt = next_pt
             else:
                 # For decode: positions are [seq_len-1] for each request
@@ -2470,11 +2493,23 @@ class ScheduleBatch:
 
             # Copy batch metadata
             req_pool_indices_cpu[offset_bs : offset_bs + dp_bs] = info.req_pool_indices
-            seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens
+            reqs_list = info.reqs or []
+            if reqs_list and any(getattr(r, "_pd_seq_pos_offset", 0) for r in reqs_list):
+                pos_offs = np.array(
+                    [int(getattr(r, "_pd_seq_pos_offset", 0)) for r in reqs_list], dtype=np.int32
+                )
+                seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens + pos_offs
+            else:
+                seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens
 
             if self.forward_mode.is_extend():
                 # Copy extend-specific metadata
-                extend_prefix_lens[offset_bs : offset_bs + dp_bs] = info.prefix_lens
+                if reqs_list and any(getattr(r, "_pd_seq_pos_offset", 0) for r in reqs_list):
+                    extend_prefix_lens[offset_bs : offset_bs + dp_bs] = (
+                        np.asarray(info.prefix_lens, dtype=np.int32) + pos_offs
+                    )
+                else:
+                    extend_prefix_lens[offset_bs : offset_bs + dp_bs] = info.prefix_lens
                 extend_seq_lens[offset_bs : offset_bs + dp_bs] = info.extend_lens
                 dp_extend_lens = np.array(info.extend_lens, dtype=np.int32)
                 local_last = np.cumsum(dp_extend_lens, dtype=np.int32) - 1
@@ -2609,8 +2644,14 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
+            reqs_list = info.reqs or []
             if getattr(self, "is_coop_prefill_batch", False):
                 seq_lens = np.asarray(self.reqs_info[-1].seq_lens)
+            elif reqs_list and any(getattr(r, "_pd_seq_pos_offset", 0) for r in reqs_list):
+                pos_offs = np.array(
+                    [int(getattr(r, "_pd_seq_pos_offset", 0)) for r in reqs_list], dtype=np.int32
+                )
+                seq_lens = np.asarray(info.seq_lens) + pos_offs
             else:
                 seq_lens = np.asarray(info.seq_lens)
             req_pool_indices = np.asarray(info.req_pool_indices)

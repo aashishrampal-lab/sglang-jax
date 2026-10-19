@@ -443,6 +443,48 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages=topk_pages if (is_full and not reuse_topk) else None,
         )
 
+    @named_scope
+    def forward_kv_only(
+        self,
+        k: jax.Array,
+        k_rope: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        **kwargs,
+    ):
+        """KV-only prefill write-back for draft layers on PD Disagg prefill workers.
+
+        Writes ``(c_kv, k_rope)`` into ``kv_cache`` and ``k_idx`` into ``idx_cache``
+        without running indexer top-k or attention kernels.
+        """
+        indexer_type: str = kwargs.get("indexer_type", "full")
+        k_idx: jax.Array | None = kwargs.get("k_idx")
+
+        layer_id = layer.layer_id
+        is_full = indexer_type == "full"
+        slot = self.full_slot.get(layer_id) if is_full else None
+
+        new_kv_c = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
+        new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
+
+        kv_cache = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+        idx_cache = token_to_kv_pool.get_indexer_key_buffer(slot) if is_full else None
+
+        dpa = self.attention_data_partition_axis
+        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+        if new_kv_c.dtype != kv_cache.dtype:
+            new_kv_c = new_kv_c.astype(kv_cache.dtype)
+        if new_k_pe.dtype != kv_cache.dtype:
+            new_k_pe = new_k_pe.astype(kv_cache.dtype)
+        md = self.forward_metadata
+
+        kv_cache = self._write_kv_only_prefill(
+            new_kv_c, new_k_pe, kv_cache, dpa, md, forward_batch
+        )
+        idx_cache = self._write_idx_only(is_full, k_idx, idx_cache, dpa, md)
+        return DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
+
     # ────────────────────────────────────────────────────────────────────────
     # internals
     # ────────────────────────────────────────────────────────────────────────
@@ -521,6 +563,106 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
             cache_ = jax.lax.cond(coop_flag < 0, _coop_update, lambda c_: c_, cache_)
         return cache_, seq_lens_
+
+    def _write_idx_only(self, is_full, k_idx, idx_cache, dpa, md):
+        if not is_full or k_idx is None or idx_cache is None:
+            return idx_cache
+        in_specs = (
+            P(dpa, None),  # k_idx [T, D_idx]
+            P(dpa, None, None, None),  # idx_cache paged
+            P(dpa),  # seq_lens
+            P(dpa),  # page_indices
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+        )
+        out_specs = P(dpa, None, None, None)
+
+        def _run(k_, cache_, seq_lens_, pi_, cuq_, cukv_):
+            page_size = cache_.shape[1] * cache_.shape[2]
+            idx_dim = cache_.shape[3]
+            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
+            cache3d, _ = self._scatter_or_coop_idx(
+                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
+            )
+            return cache3d.reshape(cache_.shape)
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            k_idx,
+            idx_cache,
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+        )
+
+    def _write_kv_only_prefill(self, kvc, kpe, cache, dpa, md, forward_batch):
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        mode = forward_batch.forward_mode
+        derive_loc = mode.is_target_verify() or mode.is_draft_extend()
+        readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+        if readonly:
+            return cache
+        if derive_loc:
+            loc = None
+        else:
+            loc = forward_batch.out_cache_loc.astype(jnp.int32)
+            if loc.shape[0] != kvc.shape[0]:
+                raise ValueError(
+                    "kv_only prefill self-write: out_cache_loc has "
+                    f"{loc.shape[0]} entries for {kvc.shape[0]} tokens ({mode.name})"
+                )
+
+        in_specs = (
+            P(dpa, None),  # kvc [T, kv_lora_rank]
+            P(dpa, None),  # kpe [T, rope]
+            P(dpa, None, None, None),  # cache
+            P(dpa),  # seq_lens [S]
+            P(dpa),  # cu_q_lens [S+1]
+            P(dpa),  # cu_kv_lens [S+1]
+            P(dpa),  # page_indices [total_pages]
+        )
+        args = [
+            kvc,
+            kpe,
+            cache,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        ]
+        if loc is not None:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
+        out_specs = P(dpa, None, None, None)
+        use_interpret = jax.default_backend() == "cpu"
+
+        def _run(kvc_, kpe_, cache_, sl_, cuq_, cukv_, pi_, *rest):
+            cache_, sl_ = self._coop_kv_update(kvc_, kpe_, cache_, sl_, pi_, dpa)
+            if rest:
+                loc_ = rest[0]
+            else:
+                loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, kvc_.shape[0], page_size)
+            T = kvc_.shape[0]
+            rope = kpe_.shape[-1]
+            Dk_pad = cache_.shape[3]
+            S = sl_.shape[0]
+            row = jnp.zeros((T, Dk_pad), cache_.dtype)
+            row = row.at[:, :kv_lora_rank].set(kvc_.astype(cache_.dtype))
+            row = row.at[:, kv_lora_rank : kv_lora_rank + rope].set(
+                kpe_.reshape(T, rope).astype(cache_.dtype)
+            )
+            return paged_write_back(
+                cache_,
+                row,
+                loc_.astype(jnp.int32),
+                page_size=page_size,
+                r_cap=T // page_size + S + 34,
+                interpret=use_interpret,
+            )
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
 
     def _maybe_index(
         self,

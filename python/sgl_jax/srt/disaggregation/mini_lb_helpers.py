@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
+import itertools
 import random
 import urllib.parse
 import uuid
 from typing import Any
+
+_ROOM_COUNTER = itertools.count(random.randint(0, 2**30 - 1))
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -16,7 +19,7 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 
 def generate_bootstrap_room() -> int:
-    return random.randint(0, 2**63 - 1)
+    return next(_ROOM_COUNTER) & ((1 << 31) - 1)
 
 
 def get_request_batch_size(request: dict[str, Any]) -> int | None:
@@ -101,7 +104,6 @@ def inject_bootstrap_fields(
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(prefill_server)
     hostname = bootstrap_host_override or maybe_wrap_ipv6_address(parsed.hostname or "")
-    room = generate_bootstrap_room()
     modified_request = ensure_request_identity_fields(request_data)
 
     batch_size = get_request_batch_size(modified_request)
@@ -110,10 +112,11 @@ def inject_bootstrap_fields(
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [room + i for i in range(batch_size)],
+                "bootstrap_room": [generate_bootstrap_room() for _ in range(batch_size)],
             }
         )
     else:
+        room = generate_bootstrap_room()
         modified_request.update(
             {
                 "bootstrap_host": hostname,

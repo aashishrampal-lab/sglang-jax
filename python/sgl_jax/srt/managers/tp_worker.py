@@ -174,10 +174,7 @@ class ModelWorker:
             if self.dp_size > 1
             else self.max_total_num_tokens
         )
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            per_rank_tokens - 1,
-        )
+        self.max_req_len = self.model_config.context_len - 1
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
@@ -351,6 +348,18 @@ class ModelWorker:
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
         )
+
+    def submit_device_job(self, fn):
+        """Run a device-touching callable now; the calling (scheduler) thread is
+        the sole launcher in non-overlap mode. Mirrors ModelWorkerClient's API."""
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        try:
+            future.set_result(fn())
+        except BaseException as e:  # noqa: BLE001 - surfaced to the submitter
+            future.set_exception(e)
+        return future
 
     def get_embedding_pool(self):
         return self.model_runner.embedding_pool
@@ -685,10 +694,7 @@ class MockModelWorker:
         per_rank_tokens = (
             self.max_total_num_tokens // dp_size if dp_size > 1 else self.max_total_num_tokens
         )
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            per_rank_tokens - 1,
-        )
+        self.max_req_len = self.model_config.context_len - 1
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
