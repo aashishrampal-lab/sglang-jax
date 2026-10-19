@@ -3535,6 +3535,8 @@ class Scheduler(
                     if batch.forward_mode.is_decode()
                     else None
                 )
+                if batch_output.next_draft_input is not None:
+                    batch_output.next_draft_input.new_seq_lens = None
 
         if batch_output.next_draft_input is not None:
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(

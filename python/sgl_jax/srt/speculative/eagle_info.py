@@ -123,7 +123,7 @@ class EagleDraftInput:
     future_indices: np.ndarray | None = None
 
     def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
-        target_alloc = self.ALLOC_LEN_PER_DECODE * 2
+        target_alloc = self.ALLOC_LEN_PER_DECODE * 3
         total = 0
         for req in requests:
             cur = req.kv_allocated_len

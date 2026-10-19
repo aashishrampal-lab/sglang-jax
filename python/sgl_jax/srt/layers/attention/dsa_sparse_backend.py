@@ -115,11 +115,13 @@ _SPEC_VERIFY_PAGE_SHARE = int(os.environ.get("DSA_SPEC_VERIFY_PAGE_SHARE", "1") 
 # pseudo-sequences -- the request's KV is read once (see sparse_mla_page_level
 # group_queries). Implies the page-share page set. Default OFF.
 _SPEC_VERIFY_QGROUP = os.environ.get("DSA_SPEC_VERIFY_QGROUP", "0") == "1"
-# Grouped verify only pays off when many requests share a step: at bs1 the one
-# grouped sequence on the mixed kernel matches the four one-query pseudo
-# sequences on the batched decode kernel (12.4 vs 12.9 ms attention) while the
-# step lost ~0.8 ms elsewhere, so keep the per-token path below this batch.
-_SPEC_VERIFY_QGROUP_MIN_BS = int(os.environ.get("DSA_SPEC_VERIFY_QGROUP_MIN_BS", "8"))
+_SPEC_VERIFY_QGROUP_MIN_BS = int(os.environ.get("DSA_SPEC_VERIFY_QGROUP_MIN_BS", "1"))
+# When page_share_group == q_group on speculative verify, sparse_mla_page_level
+# only reads the last query's top-k pages per request (idx = q_group - 1,
+# 2*q_group - 1, ...). Computing _prefill_page_topk on only that last query
+# per request and repeating across the q_group window cuts verify indexer
+# compute & HBM reads by q_group-fold (4x for 4 draft tokens, 5x for 5).
+_SPEC_VERIFY_LAST_Q_ONLY = os.environ.get("DSA_SPEC_VERIFY_LAST_Q_ONLY", "1") == "1"
 
 
 def _use_verify_qgroup(is_verify: bool, draft_group: int | None, num_tokens: int) -> bool:
@@ -139,8 +141,8 @@ def _use_verify_qgroup(is_verify: bool, draft_group: int | None, num_tokens: int
 # [S, pages_per_seq*page_size, D] keys; the kernel only DMAs up to kv_len).
 # Default OFF.
 _IDX_VERIFY_BATCHED = os.environ.get("DSA_IDX_VERIFY_BATCHED", "0") == "1"
-_IDX_VERIFY_BATCHED_MIN_BS = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MIN_BS", "8"))
-_IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV", "8192"))
+_IDX_VERIFY_BATCHED_MIN_BS = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MIN_BS", "1"))
+_IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV", "131072"))
 
 
 @register_pytree_node_class
@@ -792,21 +794,51 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 return cache3d.reshape(cache_.shape), jnp.full(
                     (q_.shape[0], k_pages), -1, jnp.int32
                 )
-            topk_pages = _prefill_page_topk(
-                q_,
-                w_,
-                cache3d,
-                seq_lens_,
-                pi_,
-                cuq_,
-                cukv_,
-                dist_,
-                k_pages=k_pages,
-                pages_per_seq=pages_per_seq,
-                num_queries_per_block=num_queries_per_block,
-                q_group=q_group,
-                kernel_cache_shape=cache_.shape,
-            )
+            if (
+                _SPEC_VERIFY_LAST_Q_ONLY
+                and q_group is not None
+                and q_group > 1
+                and q_.shape[0] % q_group == 0
+                and (
+                    _SPEC_VERIFY_QGROUP
+                    or (_SPEC_VERIFY_PAGE_SHARE >= q_group and (q_group & (q_group - 1)) == 0)
+                )
+            ):
+                q_last = q_[q_group - 1 :: q_group]
+                w_last = w_[q_group - 1 :: q_group]
+                cuq_last = cuq_ // q_group
+                topk_pages_last = _prefill_page_topk(
+                    q_last,
+                    w_last,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_last,
+                    cukv_,
+                    dist_,
+                    k_pages=k_pages,
+                    pages_per_seq=pages_per_seq,
+                    num_queries_per_block=1,
+                    q_group=1,
+                    kernel_cache_shape=cache_.shape,
+                )
+                topk_pages = jnp.repeat(topk_pages_last, q_group, axis=0)
+            else:
+                topk_pages = _prefill_page_topk(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    k_pages=k_pages,
+                    pages_per_seq=pages_per_seq,
+                    num_queries_per_block=num_queries_per_block,
+                    q_group=q_group,
+                    kernel_cache_shape=cache_.shape,
+                )
             return cache3d.reshape(cache_.shape), topk_pages
 
         idx_cache, topk_pages = jax.shard_map(
