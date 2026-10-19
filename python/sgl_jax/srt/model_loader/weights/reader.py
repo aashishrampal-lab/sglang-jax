@@ -525,7 +525,7 @@ class JaxShardReader(WeightReader):
             and (
                 file_manager.prefers_bulk
                 or (
-                    (deferred or os.environ.get("SGLANG_MOE_BULK_READ") == "1")
+                    os.environ.get("SGLANG_MOE_BULK_READ") == "1"
                     and expert_bytes >= 1 << 20
                 )
             )

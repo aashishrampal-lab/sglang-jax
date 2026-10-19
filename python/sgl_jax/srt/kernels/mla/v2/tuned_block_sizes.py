@@ -193,7 +193,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # blocks (128 pages split into 43 grid steps). Seed them with the
         # validated 4-head bs1 value (16, 1, 2) pending a proper sweep.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (4, 1, 4),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 1, 2),
@@ -208,6 +208,13 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 1, 4),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 1, 4),
+        # Speculative verify in decode form runs bs x num_draft_tokens queries
+        # through the decode kernel (cc64 x 4 = 256, cc128 x 4 = 512). These
+        # buckets had no entry and fell back to the (3, 1) default: attention
+        # was 62 ms of a 168 ms verify step at cc64 on v7x tp16. Seed with the
+        # validated 64/128 value pending a sweep.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 1, 4),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 64),
@@ -255,6 +262,22 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
             4,
         ),  # Capped from 64 to prevent VMEM OOM when dbs=4
         ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 64): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 128): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 256): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 512): (16, 1, 4),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 1): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 2): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 4): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 8): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 16): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 32): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 64): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 256): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 512): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 1024): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 2048): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 4096): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 8192): (2, 256),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 16384): (1, 512),
         ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 1): (4, 1, 4),
@@ -413,3 +436,37 @@ def get_fallback_block_sizes_mla(
     num_queries_per_block = max(sublane_tile, (sublane_tile * sublane_tile) // heads_padded)
     num_kv_pages_per_block = max(1, 2048 // page_size)
     return (num_kv_pages_per_block, num_queries_per_block)
+
+
+# Extend tuned MLA block sizes for page_size=128/256, mnt=2048/4096, and fp8 KV cache (float8_e4m3fn / float8_e5m2)
+for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
+    for _tk, _tv in list(_dst.items()):
+        if len(_tk) == 8 and _tk[7] == 1024:
+            for _mnt in (2048, 4096):
+                _dst.setdefault(_tk[:7] + (_mnt,), _tv)
+    for _tk, _tv in list(_dst.items()):
+        if len(_tk) == 8 and _tk[6] == 128:
+            _k256 = _tk[:6] + (256, _tk[7])
+            _dst.setdefault(_k256, (max(1, _tv[0] // 2),) + _tv[1:])
+    _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 2)] = (4, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 256)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1024)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2048)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4096)] = (8, 1, 2)
+    _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 256, 2)] = (2, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 256)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 1024)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 2048)] = (4, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 4096)] = (4, 1, 2)
+    for _tk, _tv in list(_dst.items()):
+        if len(_tk) == 8 and _tk[2] == "bfloat16":
+            for _fp8_dt in ("float8_e4m3fn", "float8_e5m2"):
+                _k_fp8 = (_tk[0], _tk[1], _fp8_dt) + _tk[3:]
+                if _tk[6] == 256:
+                    _v_fp8 = (_tv[0] * 2,) + _tv[1:]
+                elif _tk[0] == "decode" and _tk[6] == 128 and _tk[7] == 2:
+                    _v_fp8 = (8, 1, 1)
+                else:
+                    _v_fp8 = _tv
+                _dst[_k_fp8] = _v_fp8
+

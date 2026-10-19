@@ -314,7 +314,13 @@ class TopK(nnx.Module):
     ):
         if routing_spec is None:
             routing_spec = P("data", None)
-        if not _topk_kernel_enabled():
+        dp_size = (
+            self.mesh.shape["data"]
+            if (self.mesh is not None and "data" in self.mesh.shape)
+            else 1
+        )
+        local_bs = router_logits.shape[0] // max(dp_size, 1)
+        if not _topk_kernel_enabled() or local_bs < 128 or local_bs % 128 != 0:
             return self._biased_grouped_topk_jax(router_logits, correction_bias)
         fn = functools.partial(
             grouped_topk_pallas,
