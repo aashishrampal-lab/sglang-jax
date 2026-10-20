@@ -200,6 +200,12 @@ def _scores_kernel(
 
             kv_p_start = bkv_idx * bkv_p
             page_indices_offset = cu_kv_pages_ref[seq_idx + batch_idx] + kv_p_start
+            if page_pool_size is not None:
+                seq_kv_len = seq_lens_ref[seq_idx + batch_idx] // compression_ratio
+                seq_pages = cdiv(seq_kv_len, page_pool_size // compression_ratio)
+                actual_pages = jnp.clip(seq_pages - kv_p_start, 1, bkv_p)
+            else:
+                actual_pages = bkv_p
 
             if not wait:
 
@@ -233,13 +239,13 @@ def _scores_kernel(
                     # of compile per kernel instance (measured v7x, T=8192); a
                     # fori_loop compiles in <1s with identical steady-state
                     # performance (DMA issue rate is not the bottleneck).
-                    lax.fori_loop(0, bkv_p, _start_fetch_page, None, unroll=False)
+                    lax.fori_loop(0, actual_pages, _start_fetch_page, None, unroll=False)
                 else:
                     # Keep the merged decode path (bkv_p<=64) byte-identical.
                     for i in range(bkv_p):
                         _start_fetch_page(i, None)
             else:
-                dma_bkv_sz = bkv_p * page_size_per_kv_packing
+                dma_bkv_sz = actual_pages * page_size_per_kv_packing
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
                 _async_copy(src=dst_kv, dst=dst_kv, sem=sem, wait=True)
 
@@ -568,6 +574,11 @@ def _scores_kernel(
 
     @pl.when(batch_start_seq_idx == start_seq_idx)
     def prologue():
+        if page_pool_size is not None:
+            for b_i in range(2):
+                bkv_x2_ref[b_i, ...] = jnp.zeros(
+                    bkv_x2_ref.shape[1:], dtype=bkv_x2_ref.dtype
+                )
         start_fetch_bq(start_seq_idx, 0, 0)
         start_fetch_bkv(start_seq_idx, 0, 0)
 

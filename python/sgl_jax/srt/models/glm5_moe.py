@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Any
 
@@ -1058,6 +1059,70 @@ class Glm5DecoderLayer(nnx.Module):
         )
         hidden_states += residual
         residual = hidden_states
+
+        if (
+            self.is_moe_layer
+            and self.moe_backend == MoEBackend.FUSED_V2
+            and self.shared_experts is None
+            and os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER", "1") == "1"
+        ):
+            mesh = self.mlp.mesh
+            mesh_ep_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+            orig_num_tokens = hidden_states.shape[0]
+            padded_num_tokens = (
+                ((orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size) * mesh_ep_size
+            )
+            pad_t = padded_num_tokens - orig_num_tokens
+            ep_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
+            ep_mask_sharding = NamedSharding(mesh, P(("data", "tensor")))
+
+            def _prep_ep(hs_in, mask_in):
+                if pad_t > 0:
+                    hs_in = jnp.pad(hs_in, ((0, pad_t), (0, 0)))
+                hs_ep_out = jax.sharding.reshard(hs_in, ep_sharding)
+                if mask_in is None:
+                    return hs_ep_out, None
+                if pad_t > 0:
+                    mask_in = jnp.pad(mask_in, (0, pad_t), constant_values=False)
+                return hs_ep_out, jax.sharding.reshard(mask_in, ep_mask_sharding)
+
+            if getattr(mesh, "_any_axis_explicit", False):
+                if token_valid_mask is not None:
+                    hs_ep, mask_ep = jax.sharding.auto_axes(
+                        _prep_ep, out_sharding=(ep_sharding, ep_mask_sharding)
+                    )(hidden_states, token_valid_mask)
+                else:
+                    hs_ep = jax.sharding.auto_axes(
+                        lambda h: _prep_ep(h, None)[0], out_sharding=ep_sharding
+                    )(hidden_states)
+                    mask_ep = None
+            else:
+                hs_ep, mask_ep = _prep_ep(hidden_states, token_valid_mask)
+
+            hs_ep = self.post_attention_layernorm(hs_ep)
+            router_logits = self.moe_gate(hs_ep)
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+            topk_weights, topk_ids = self.topk(
+                router_logits,
+                correction_bias,
+                dispatch_info=dispatch_info,
+                routing_sharding=ep_sharding,
+            )
+            if mask_ep is not None:
+                topk_ids = jnp.where(mask_ep[:, None], topk_ids, -1)
+            hidden_states = self.mlp(hs_ep, topk_weights, topk_ids)
+            if pad_t > 0:
+                if getattr(mesh, "_any_axis_explicit", False):
+                    out_sh = NamedSharding(mesh, P("data", None))
+                    hidden_states = jax.sharding.auto_axes(
+                        lambda h: h[:orig_num_tokens], out_sharding=out_sh
+                    )(hidden_states)
+                else:
+                    hidden_states = hidden_states[:orig_num_tokens]
+            if not getattr(forward_batch, "return_routed_experts", False):
+                topk_ids = None
+            return hidden_states, residual, kv_fused, topk_ids
+
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
