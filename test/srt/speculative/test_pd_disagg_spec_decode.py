@@ -1456,23 +1456,20 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             self.assertEqual(int(np.asarray(updated.new_seq_lens)[0, 1]), 17)
             self.assertEqual(int(np.asarray(updated.new_seq_lens)[1, 2]), 33)
 
-            # Also verify _admit_pd_direct_decode_reqs end-to-end with draft_worker.spec_relay_buffers
-            class _DummyReqPool:
-                def __init__(self):
-                    self.req_to_token = np.zeros((4, 32), dtype=np.int32)
-                    self._next = [0, 0]
+            # Also verify _admit_pd_direct_decode_reqs end-to-end with real ReqToTokenPool + PagedTokenToKVPoolAllocator
+            from sgl_jax.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+            from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+            from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
-                def available_size(self, dp_rank=0):
-                    return 4 - self._next[dp_rank]
-
-                def alloc(self, n, dp_rank=0):
-                    idx = self._next[dp_rank]
-                    self._next[dp_rank] += n
-                    return [idx]
-
-                def write(self, key, val):
-                    row, sl = key
-                    self.req_to_token[row, sl] = val
+            req_pool = ReqToTokenPool(size=4, max_context_len=128)
+            kv_alloc = PagedTokenToKVPoolAllocator(
+                size=1024, page_size=16, kvcache=SimpleNamespace(), dp_size=2
+            )
+            tree_cache = ChunkCache(
+                req_to_token_pool=req_pool,
+                token_to_kv_pool_allocator=kv_alloc,
+                page_size=16,
+            )
 
             req0 = Req(
                 rid="r0",
@@ -1483,7 +1480,7 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             req0.dp_rank = 0
             req0._pd_direct_decode_ready = True
             req0._pd_first_output_id = 101
-            req0._pd_prealloc_kv_indices = np.arange(16, dtype=np.int32)
+            req0._pd_prealloc_kv_indices = kv_alloc.alloc(16, dp_rank=0)
 
             req1 = Req(
                 rid="r1",
@@ -1494,15 +1491,14 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             req1.dp_rank = 1
             req1._pd_direct_decode_ready = True
             req1._pd_first_output_id = 202
-            req1._pd_prealloc_kv_indices = np.arange(16, 32, dtype=np.int32)
+            req1._pd_prealloc_kv_indices = kv_alloc.alloc(16, dp_rank=1)
 
-            req_pool = _DummyReqPool()
             empty_running = ScheduleBatch.init_new(
                 [[], []],
                 req_pool,
-                SimpleNamespace(page_size=64),
-                SimpleNamespace(),
-                SimpleNamespace(hidden_size=4),
+                kv_alloc,
+                tree_cache,
+                SimpleNamespace(hidden_size=4, vocab_size=32000),
                 True,
                 2,
                 spec_algorithm=SpeculativeAlgorithm.NEXTN,
@@ -1520,9 +1516,9 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
                     speculative_num_steps=1,
                 ),
                 req_to_token_pool=req_pool,
-                token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
-                tree_cache=SimpleNamespace(cache_finished_req=lambda r: None),
-                model_config=SimpleNamespace(hidden_size=4),
+                token_to_kv_pool_allocator=kv_alloc,
+                tree_cache=tree_cache,
+                model_config=SimpleNamespace(hidden_size=4, vocab_size=32000),
                 enable_overlap=True,
                 spec_algorithm=SpeculativeAlgorithm.NEXTN,
                 mesh=mesh,
@@ -1544,14 +1540,18 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
                 int(np.asarray(draft_worker.spec_relay_buffers.verified_id)[0, 0]), 101
             )
             self.assertEqual(
-                int(np.asarray(draft_worker.spec_relay_buffers.verified_id)[1, 0]), 202
+                int(np.asarray(draft_worker.spec_relay_buffers.verified_id)[1, 1]), 202
             )
             self.assertEqual(
                 int(np.asarray(draft_worker.spec_relay_buffers.new_seq_lens)[0, 0]), 17
             )
             self.assertEqual(
-                int(np.asarray(draft_worker.spec_relay_buffers.new_seq_lens)[1, 0]), 17
+                int(np.asarray(draft_worker.spec_relay_buffers.new_seq_lens)[1, 1]), 17
             )
+            EagleDraftInput.ALLOC_LEN_PER_DECODE = 5
+            sched.running_batch.prepare_for_decode()
+            self.assertEqual(int(sched.running_batch.reqs_info[0].spec_info.allocate_lens[0]), 26)
+            self.assertEqual(int(sched.running_batch.reqs_info[1].spec_info.allocate_lens[0]), 26)
 
     def test_patch_tarball_contains_all_modified_files(self):
         """Verify /tmp/patch.tar.xz contains all modified files in python/sgl_jax/srt byte-for-byte."""

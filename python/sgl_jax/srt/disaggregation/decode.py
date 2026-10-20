@@ -1666,6 +1666,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         ready_reqs: list[Req] = []
         remaining_waiting: list[Req] = []
+        avail_req_slots = self.req_to_token_pool.available_size()
         for req in self.waiting_queue:
             if not getattr(req, "_pd_direct_decode_ready", False):
                 remaining_waiting.append(req)
@@ -1677,11 +1678,12 @@ class SchedulerDisaggregationDecodeMixin:
             dp_rank = _request_dp_rank(req, self.dp_size)
             if (
                 running_per_dp[dp_rank] >= max_bs_per_dp
-                or self.req_to_token_pool.available_size(dp_rank) < 1
+                or avail_req_slots < 1
             ):
                 remaining_waiting.append(req)
                 continue
             running_per_dp[dp_rank] += 1
+            avail_req_slots -= 1
             ready_reqs.append(req)
 
         if not ready_reqs:
@@ -1691,11 +1693,12 @@ class SchedulerDisaggregationDecodeMixin:
         is_spec = self._is_spec_decode_enabled()
         topk = int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1)
         num_steps = int(getattr(self.server_args, "speculative_num_steps", 1) or 1)
+        from sgl_jax.srt.mem_cache.common import release_kv_cache
 
         admitted_reqs: list[Req] = []
         for req in ready_reqs:
-            dp_rank = _request_dp_rank(req, self.dp_size)
-            req_pool_indices = self.req_to_token_pool.alloc(1, dp_rank=dp_rank)
+            req.req_pool_idx = None
+            req_pool_indices = self.req_to_token_pool.alloc([req])
             if req_pool_indices is None:
                 self.waiting_queue.insert(0, req)
                 continue
@@ -1720,8 +1723,7 @@ class SchedulerDisaggregationDecodeMixin:
             req.output_ids.append(first_tok)
             req.check_finished()
             if req.finished():
-                self._pd_chunk_cache_finished_req(req)
-                self.tree_cache.cache_finished_req(req)
+                release_kv_cache(req, self.tree_cache, allow_overallocated=is_spec)
             req._pd_direct_decode_ready = False
             admitted_reqs.append(req)
 
