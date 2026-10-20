@@ -136,6 +136,144 @@ class GroupedVerifyLayoutTest(unittest.TestCase):
         self.assertEqual(kv_lens.shape, (len(LAST_POS) * G,))
         self.assertEqual(list(np.asarray(dist)), [8, 8, 8])
 
+    def test_grouped_topk_pages_and_precomputed_meta_parity(self):
+        inputs = _inputs()
+        ql, qpe, kv, kpe, cache, kv_lens, topk, page_indices, cu_q, cu_kv, dist = inputs
+        topk_pages = jnp.tile(jnp.array([[0, 1, 2, -1]], dtype=jnp.int32), (ql.shape[0], 1))
+        meta = sparse_mla_mod.prepare_sparse_mla_page_level_metadata(
+            T=ql.shape[0],
+            num_cache_pages=cache.shape[0],
+            kv_lens=kv_lens,
+            topk_indices=topk,
+            page_indices=page_indices,
+            cu_q_lens=cu_q,
+            cu_kv_lens=cu_kv,
+            topk_pages=topk_pages,
+            page_size=PS,
+            pages_per_seq=PPS,
+            k_pages_max=KP,
+            page_share_group=G,
+            group_queries=True,
+        )
+        captured_direct = {}
+        captured_pre = {}
+
+        def fake_direct(*args, **kw):
+            captured_direct["meta"] = args[5:10]
+            return jnp.zeros((ql.shape[0], HEADS, RANK), jnp.bfloat16), cache
+
+        def fake_pre(*args, **kw):
+            captured_pre["meta"] = args[5:10]
+            return jnp.zeros((ql.shape[0], HEADS, RANK), jnp.bfloat16), cache
+
+        with jax.disable_jit(), mock.patch.object(sparse_mla_mod, "mla_ragged_paged_attention", fake_direct):
+            sparse_mla_mod.sparse_mla_page_level(
+                ql, qpe, kv, kpe, cache, kv_lens, topk, page_indices, cu_q, cu_kv, dist,
+                topk_pages=topk_pages, sm_scale=1.0, page_size=PS, pages_per_seq=PPS,
+                kv_lora_rank=RANK, k_pages_max=KP, page_share_group=G, group_queries=True,
+            )
+        with jax.disable_jit(), mock.patch.object(sparse_mla_mod, "mla_ragged_paged_attention", fake_pre):
+            sparse_mla_mod.sparse_mla_page_level(
+                ql, qpe, kv, kpe, cache, kv_lens, topk, page_indices, cu_q, cu_kv, dist,
+                topk_pages=None, sm_scale=1.0, page_size=PS, pages_per_seq=PPS,
+                kv_lora_rank=RANK, k_pages_max=KP, page_share_group=G, group_queries=True,
+                precomputed_meta=meta,
+            )
+        for a, b in zip(captured_direct["meta"], captured_pre["meta"]):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_sharded_rejection_sampling_bit_exact_parity(self):
+        from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_rejection_sampling
+
+        devs = np.array(jax.devices())
+        if devs.size < 2:
+            self.skipTest("Requires >= 2 host CPU devices")
+        mesh = Mesh(
+            devs.reshape(1, devs.size),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
+        vocab = 256
+        n = 5
+        steps = 4
+        with jax.set_mesh(mesh):
+            for bs in (1, 2, 4, 8, 16):
+                key = jax.random.PRNGKey(100 + bs)
+                k1, k2, k3, k4 = jax.random.split(key, 4)
+                th = jax.device_put(
+                    jax.random.normal(k1, (bs * n, 32), dtype=jnp.bfloat16),
+                    NamedSharding(mesh, P("data", None)),
+                )
+                tl = jax.device_put(
+                    jax.random.normal(k2, (bs * n, vocab), dtype=jnp.bfloat16),
+                    NamedSharding(mesh, P(None, ("data", "tensor"))),
+                )
+                pos = jax.device_put(jnp.arange(bs * n, dtype=jnp.int32), NamedSharding(mesh, P("data")))
+                sl = jax.device_put(jnp.full((bs,), 64, dtype=jnp.int32), NamedSharding(mesh, P("data")))
+                dt = jax.device_put(
+                    jax.random.randint(k3, (bs * n,), 0, vocab, dtype=jnp.int32),
+                    NamedSharding(mesh, P("data")),
+                )
+                temp = jax.device_put(jnp.full((bs,), 0.9, dtype=jnp.float32), NamedSharding(mesh, P("data")))
+                tk = jax.device_put(jnp.full((bs,), -1, dtype=jnp.int32), NamedSharding(mesh, P("data")))
+                tp = jax.device_put(jnp.full((bs,), 0.95, dtype=jnp.float32), NamedSharding(mesh, P("data")))
+                coins = jax.device_put(
+                    jax.random.uniform(k4, (bs, n - 1), dtype=jnp.float32), NamedSharding(mesh, P())
+                )
+                coin_f = jax.device_put(
+                    jax.random.uniform(k1, (bs,), dtype=jnp.float32), NamedSharding(mesh, P())
+                )
+                with mock.patch.dict(os.environ, {"SGLANG_JAX_SHARDED_REJECT_SAMPLING": "0"}):
+                    ref = jax.jit(
+                        lambda th, pos, sl, dt, tl, temp, tk, tp, c, cf: _verify_rejection_sampling(
+                            target_hidden=th,
+                            positions=pos,
+                            seq_lens=sl,
+                            draft_tokens=dt,
+                            target_logits=tl,
+                            temperatures=temp,
+                            top_ks=tk,
+                            top_ps=tp,
+                            coins=c,
+                            coin_f=cf,
+                            threshold_single=1.0,
+                            threshold_acc=1.0,
+                            enable_top_k=False,
+                            enable_top_p=True,
+                            speculative_num_steps=steps,
+                            speculative_num_draft_tokens=n,
+                        )
+                    )(th, pos, sl, dt, tl, temp, tk, tp, coins, coin_f)
+                with mock.patch.dict(os.environ, {"SGLANG_JAX_SHARDED_REJECT_SAMPLING": "1"}):
+                    opt = jax.jit(
+                        lambda th, pos, sl, dt, tl, temp, tk, tp, c, cf: _verify_rejection_sampling(
+                            target_hidden=th,
+                            positions=pos,
+                            seq_lens=sl,
+                            draft_tokens=dt,
+                            target_logits=tl,
+                            temperatures=temp,
+                            top_ks=tk,
+                            top_ps=tp,
+                            coins=c,
+                            coin_f=cf,
+                            threshold_single=1.0,
+                            threshold_acc=1.0,
+                            enable_top_k=False,
+                            enable_top_p=True,
+                            speculative_num_steps=steps,
+                            speculative_num_draft_tokens=n,
+                        )
+                    )(th, pos, sl, dt, tl, temp, tk, tp, coins, coin_f)
+                for fname in ref._fields:
+                    np.testing.assert_array_equal(
+                        np.asarray(getattr(ref, fname)),
+                        np.asarray(getattr(opt, fname)),
+                        err_msg=f"bs={bs} field={fname}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
+

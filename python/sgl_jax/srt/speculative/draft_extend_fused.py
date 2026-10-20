@@ -578,52 +578,176 @@ def _verify_rejection_sampling(
     def _rep(x):
         return jax.sharding.reshard(x, NamedSharding(mesh, P())) if mesh is not None else x
 
-    tl = _rep(target_logits.astype(jnp.float32))
     draft_2d = _rep(draft_tokens.reshape(bs, n).astype(jnp.int32))
     seq_lens_r = _rep(seq_lens.astype(jnp.int32))
     temp = _rep(temperatures.reshape(bs, 1).astype(jnp.float32))
     coins_r = _rep(coins.astype(jnp.float32))
     coin_f_r = _rep(coin_f.astype(jnp.float32))
-
-    # target probs: temperature scale, then optional top_k/top_p renorm.
-    # Everything is replicated here, so the renorm kernels behave exactly like
-    # the non-overlap reference path (eagle_util.sample) when enabled.
-    probs_3d = jax.nn.softmax(tl.reshape(bs, n, vocab) / temp[:, :, None], axis=-1)
-    probs_2d = probs_3d.reshape(bs * n, vocab)
-    if enable_top_k:
-        tk = _rep(top_ks.astype(jnp.int32))
-        tk_flat = jnp.broadcast_to(tk[:, None], (bs, n)).reshape(bs * n)
-        probs_2d = top_k_renorm_prob(probs_2d, tk_flat)
-    if enable_top_p:
-        tp = _rep(top_ps.astype(jnp.float32))
-        tp_flat = jnp.broadcast_to(tp[:, None], (bs, n)).reshape(bs * n)
-        probs_2d = top_p_renorm_prob(probs_2d, tp_flat)
-    probs_3d = probs_2d.reshape(bs, n, vocab)
-
     cand = draft_2d[:, 1:]  # (bs, n-1) candidate tokens d1..d_{n-1}
-    p_cand = jnp.take_along_axis(probs_3d[:, : n - 1, :], cand[:, :, None], axis=-1)[:, :, 0]
 
-    accept_mask = (coins_r <= p_cand / threshold_acc) | (p_cand >= threshold_single)
+    use_row_sharded_verify = (
+        mesh is not None
+        and not mesh.empty
+        and mesh.size > 1
+        and simulation_rng is None
+        and os.environ.get("SGLANG_JAX_SHARDED_REJECT_SAMPLING", "1") == "1"
+    )
+    if use_row_sharded_verify:
+        row_axes = tuple(ax for ax in ("data", "tensor") if ax in mesh.axis_names)
+        if not row_axes:
+            row_axes = tuple(mesh.axis_names)
+        row_axis = row_axes[0] if len(row_axes) == 1 else row_axes
+        num_devices = int(
+            np.prod([mesh.shape[ax] for ax in (row_axis if isinstance(row_axis, tuple) else (row_axis,))])
+        )
+        rows = bs * n
+        padded_rows = ((rows + num_devices - 1) // num_devices) * num_devices
+        pad_rows = padded_rows - rows
+        tk_rep = _rep(top_ks.astype(jnp.int32)) if enable_top_k else jnp.zeros((bs,), dtype=jnp.int32)
+        tp_rep = _rep(top_ps.astype(jnp.float32)) if enable_top_p else jnp.ones((bs,), dtype=jnp.float32)
 
-    is_padding = seq_lens_r == 0
-    accepted_children = jnp.cumprod(accept_mask.astype(jnp.int32), axis=1).astype(jnp.bool_)
-    accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
-    accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
-    accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
+        def _sharded_prob_and_sample_region(tl_in, cand_in, temp_in, coin_f_in, tk_in, tp_in):
+            if pad_rows > 0:
+                tl_in = jnp.pad(tl_in, ((0, pad_rows), (0, 0)))
+            cand_full_flat = jnp.concatenate(
+                [cand_in, jnp.zeros((bs, 1), dtype=jnp.int32)], axis=1
+            ).reshape(rows)
+            is_non_bonus_flat = jnp.broadcast_to(
+                (jnp.arange(n, dtype=jnp.int32)[None, :] < (n - 1)), (bs, n)
+            ).reshape(rows)
+            temp_flat = jnp.broadcast_to(temp_in, (bs, n)).reshape(rows)
+            coin_f_flat = jnp.broadcast_to(coin_f_in[:, None], (bs, n)).reshape(rows)
+            tk_flat = (
+                jnp.broadcast_to(tk_in[:, None], (bs, n)).reshape(rows)
+                if enable_top_k
+                else jnp.full((rows,), vocab, dtype=jnp.int32)
+            )
+            tp_flat = (
+                jnp.broadcast_to(tp_in[:, None], (bs, n)).reshape(rows)
+                if enable_top_p
+                else jnp.ones((rows,), dtype=jnp.float32)
+            )
+            if pad_rows > 0:
+                cand_full_flat = jnp.pad(cand_full_flat, (0, pad_rows), constant_values=0)
+                is_non_bonus_flat = jnp.pad(is_non_bonus_flat, (0, pad_rows), constant_values=False)
+                temp_flat = jnp.pad(temp_flat, (0, pad_rows), constant_values=1.0)
+                coin_f_flat = jnp.pad(coin_f_flat, (0, pad_rows), constant_values=0.5)
+                tk_flat = jnp.pad(tk_flat, (0, pad_rows), constant_values=vocab)
+                tp_flat = jnp.pad(tp_flat, (0, pad_rows), constant_values=1.0)
 
-    # residual / bonus sampling at emit position = accept_length_raw
-    emit_pos = accept_length_raw.astype(jnp.int32)  # (bs,) in [0, n-1]
-    p_emit = jnp.take_along_axis(probs_3d, emit_pos[:, None, None], axis=1)[:, 0, :]  # (bs, vocab)
-    has_rejected_child = emit_pos < (n - 1)
-    safe_reject_pos = jnp.minimum(emit_pos, n - 2)
-    rejected_token = jnp.take_along_axis(cand, safe_reject_pos[:, None], axis=1)[:, 0]
-    vocab_ids = jnp.arange(vocab, dtype=jnp.int32)[None, :]
-    residual_probs = jnp.where(vocab_ids == rejected_token[:, None], 0.0, p_emit)
-    final_probs = jnp.where(has_rejected_child[:, None], residual_probs, p_emit)
-    cdf = jnp.cumsum(final_probs, axis=-1)
-    u = coin_f_r * cdf[:, -1]
-    sampled = jnp.sum((cdf <= u[:, None]).astype(jnp.int32), axis=-1).astype(jnp.int32)
-    sampled = jnp.minimum(sampled, jnp.int32(vocab - 1))  # (bs,)
+            def _per_shard_prob_and_sample(
+                tl_local, temp_local, tk_local, tp_local, cand_local, is_non_bonus_local, coin_f_local
+            ):
+                probs_local = jax.nn.softmax(
+                    tl_local.astype(jnp.float32) / temp_local[:, None], axis=-1
+                )
+                if enable_top_k:
+                    probs_local = top_k_renorm_prob(probs_local, tk_local)
+                if enable_top_p:
+                    probs_local = top_p_renorm_prob(probs_local, tp_local)
+                p_cand_local = jnp.take_along_axis(
+                    probs_local, cand_local[:, None], axis=-1
+                )[:, 0]
+                vocab_ids = jnp.arange(vocab, dtype=jnp.int32)[None, :]
+                final_probs_local = jnp.where(
+                    is_non_bonus_local[:, None] & (vocab_ids == cand_local[:, None]),
+                    0.0,
+                    probs_local,
+                )
+                cdf_local = jnp.cumsum(final_probs_local, axis=-1)
+                u_local = coin_f_local * cdf_local[:, -1]
+                sampled_local = jnp.sum(
+                    (cdf_local <= u_local[:, None]).astype(jnp.int32), axis=-1
+                ).astype(jnp.int32)
+                sampled_local = jnp.minimum(sampled_local, jnp.int32(vocab - 1))
+                return p_cand_local, sampled_local
+
+            p_cand_padded, sampled_padded = jax.shard_map(
+                _per_shard_prob_and_sample,
+                mesh=None if getattr(mesh, "_any_axis_explicit", False) else mesh,
+                in_specs=(
+                    P(row_axis, None),
+                    P(row_axis),
+                    P(row_axis),
+                    P(row_axis),
+                    P(row_axis),
+                    P(row_axis),
+                    P(row_axis),
+                ),
+                out_specs=(P(row_axis), P(row_axis)),
+                check_vma=False,
+            )(
+                tl_in,
+                temp_flat,
+                tk_flat,
+                tp_flat,
+                cand_full_flat,
+                is_non_bonus_flat,
+                coin_f_flat,
+            )
+            return p_cand_padded[:rows].reshape(bs, n), sampled_padded[:rows].reshape(bs, n)
+
+        rep_sh = NamedSharding(mesh, P())
+        region_fn = (
+            jax.sharding.auto_axes(_sharded_prob_and_sample_region, out_sharding=(rep_sh, rep_sh))
+            if getattr(mesh, "_any_axis_explicit", False)
+            else _sharded_prob_and_sample_region
+        )
+        p_cand_all, sampled_all = region_fn(
+            target_logits, cand, temp, coin_f_r, tk_rep, tp_rep
+        )
+        p_cand_all = _rep(p_cand_all)
+        sampled_all = _rep(sampled_all)
+        p_cand = p_cand_all[:, : n - 1]
+
+        accept_mask = (coins_r <= p_cand / threshold_acc) | (p_cand >= threshold_single)
+        is_padding = seq_lens_r == 0
+        accepted_children = jnp.cumprod(accept_mask.astype(jnp.int32), axis=1).astype(jnp.bool_)
+        accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
+        accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
+        accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
+
+        emit_pos = accept_length_raw.astype(jnp.int32)  # (bs,) in [0, n-1]
+        sampled = jnp.take_along_axis(sampled_all, emit_pos[:, None], axis=1)[:, 0]
+        tl = None
+    else:
+        tl = _rep(target_logits.astype(jnp.float32))
+        # target probs: temperature scale, then optional top_k/top_p renorm.
+        probs_3d = jax.nn.softmax(tl.reshape(bs, n, vocab) / temp[:, :, None], axis=-1)
+        probs_2d = probs_3d.reshape(bs * n, vocab)
+        if enable_top_k:
+            tk = _rep(top_ks.astype(jnp.int32))
+            tk_flat = jnp.broadcast_to(tk[:, None], (bs, n)).reshape(bs * n)
+            probs_2d = top_k_renorm_prob(probs_2d, tk_flat)
+        if enable_top_p:
+            tp = _rep(top_ps.astype(jnp.float32))
+            tp_flat = jnp.broadcast_to(tp[:, None], (bs, n)).reshape(bs * n)
+            probs_2d = top_p_renorm_prob(probs_2d, tp_flat)
+        probs_3d = probs_2d.reshape(bs, n, vocab)
+
+        p_cand = jnp.take_along_axis(probs_3d[:, : n - 1, :], cand[:, :, None], axis=-1)[:, :, 0]
+
+        accept_mask = (coins_r <= p_cand / threshold_acc) | (p_cand >= threshold_single)
+
+        is_padding = seq_lens_r == 0
+        accepted_children = jnp.cumprod(accept_mask.astype(jnp.int32), axis=1).astype(jnp.bool_)
+        accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
+        accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
+        accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
+
+        # residual / bonus sampling at emit position = accept_length_raw
+        emit_pos = accept_length_raw.astype(jnp.int32)  # (bs,) in [0, n-1]
+        p_emit = jnp.take_along_axis(probs_3d, emit_pos[:, None, None], axis=1)[:, 0, :]  # (bs, vocab)
+        has_rejected_child = emit_pos < (n - 1)
+        safe_reject_pos = jnp.minimum(emit_pos, n - 2)
+        rejected_token = jnp.take_along_axis(cand, safe_reject_pos[:, None], axis=1)[:, 0]
+        vocab_ids = jnp.arange(vocab, dtype=jnp.int32)[None, :]
+        residual_probs = jnp.where(vocab_ids == rejected_token[:, None], 0.0, p_emit)
+        final_probs = jnp.where(has_rejected_child[:, None], residual_probs, p_emit)
+        cdf = jnp.cumsum(final_probs, axis=-1)
+        u = coin_f_r * cdf[:, -1]
+        sampled = jnp.sum((cdf <= u[:, None]).astype(jnp.int32), axis=-1).astype(jnp.int32)
+        sampled = jnp.minimum(sampled, jnp.int32(vocab - 1))  # (bs,)
 
     # predict_2d[:, k] = cand[:, k] (=d_{k+1}); override emit_pos slot with sampled
     predict_2d = jnp.concatenate([cand, jnp.zeros((bs, 1), dtype=jnp.int32)], axis=1).astype(
@@ -639,18 +763,19 @@ def _verify_rejection_sampling(
     accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
     accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
-    target_predict_2d = jnp.argmax(tl, axis=-1).astype(jnp.int32).reshape(bs, n)
-    accept_index_2d, predict, accept_length = apply_simulated_acceptance(
-        accept_index=accept_index_2d,
-        predict=predict,
-        accept_lens=accept_length,
-        candidates=draft_2d,
-        target_predict=target_predict_2d,
-        valid_mask=~is_padding,
-        spec_steps=speculative_num_steps,
-        topk=1,
-        rng=simulation_rng,
-    )
+    if simulation_rng is not None:
+        target_predict_2d = jnp.argmax(tl, axis=-1).astype(jnp.int32).reshape(bs, n)
+        accept_index_2d, predict, accept_length = apply_simulated_acceptance(
+            accept_index=accept_index_2d,
+            predict=predict,
+            accept_lens=accept_length,
+            candidates=draft_2d,
+            target_predict=target_predict_2d,
+            valid_mask=~is_padding,
+            spec_steps=speculative_num_steps,
+            topk=1,
+            rng=simulation_rng,
+        )
     accept_index = accept_index_2d.reshape(-1)
 
     accept_width = speculative_num_steps + 1
@@ -927,10 +1052,11 @@ def mtp_index_share_enabled(hf_config, topk: int) -> bool:
     ``SGLANG_JAX_MTP_INDEX_SHARE=0/1`` forces it for A/B runs. Only the
     topk=1 chain is supported (rows are not reordered between steps).
     """
-    forced = os.environ.get("SGLANG_JAX_MTP_INDEX_SHARE", "1")
+    forced = os.environ.get("SGLANG_JAX_MTP_INDEX_SHARE")
     if forced is not None:
         return forced.strip() not in ("", "0", "false", "False") and topk == 1
-    return bool(getattr(hf_config, "index_share_for_mtp_iteration", True)) and topk == 1
+    default_share = getattr(hf_config, "model_type", "") == "glm_moe_dsa"
+    return bool(getattr(hf_config, "index_share_for_mtp_iteration", default_share)) and topk == 1
 
 
 def _build_draft_extend(
@@ -1775,7 +1901,7 @@ def _build_verify(topk: int):
         target_model = nnx.merge(target_model_def, target_state)
         target_logits_metadata = replace(
             target_logits_metadata,
-            preserve_vocab_sharding=is_greedy and not return_target_logits,
+            preserve_vocab_sharding=not return_target_logits,
         )
         target_output, target_pool_updates, _, _ = target_model(
             target_forward_batch,

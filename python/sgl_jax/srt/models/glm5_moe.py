@@ -97,7 +97,19 @@ class GlmNorm(nnx.Module):
         return normalized * self.weight.value + self.bias.value
 
 
+def _build_hadamard_np(n: int) -> np.ndarray:
+    if n == 1:
+        return np.array([[1.0]], dtype=np.float32)
+    h = _build_hadamard_np(n // 2)
+    return np.block([[h, h], [h, -h]])
+
+
+_HADAMARD_128_SCALED_NP = _build_hadamard_np(128) * (128**-0.5)
+
+
 def get_hadamard_matrix(n):
+    if n == 128:
+        return jnp.asarray(_build_hadamard_np(128))
     if n == 1:
         return jnp.array([[1.0]])
     h = get_hadamard_matrix(n // 2)
@@ -150,14 +162,26 @@ class GlmDsaIndexer(nnx.Module):
         )
 
     def project(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        *,
+        q_group: int = 1,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Indexer projections only (query, key, per-head weights); no top-k.
 
-        Returns query [T, n_head, head_dim], key [T, head_dim], weights [T, n_head]
+        Returns query [T_q, n_head, head_dim], key [T, head_dim], weights [T_q, n_head]
         after RoPE + Hadamard, ready for the DSA backend's streamindex_topk.
+        When ``q_group > 1``, only the last query per group is projected.
         """
-        query, _ = self.wq_b(qr)
+        use_q_slice = q_group > 1 and qr.shape[0] % q_group == 0
+        qr_q = qr[q_group - 1 :: q_group] if use_q_slice else qr
+        hs_q = hidden_states[q_group - 1 :: q_group] if use_q_slice else hidden_states
+        pos_q = positions.flatten()[q_group - 1 :: q_group] if use_q_slice else positions
+
+        query, _ = self.wq_b(qr_q)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
         key, _ = self.wk(hidden_states)
@@ -166,7 +190,11 @@ class GlmDsaIndexer(nnx.Module):
         rope_dim = 64
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim][:, None, :]
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+        if use_q_slice:
+            q_rope, _ = rotary_emb(pos_q, q_rope, q_rope[:, :1, :])
+            _, k_rope = rotary_emb(positions, k_rope, k_rope)
+        else:
+            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
         if _INDEXER_ROPE_CONCAT:
             # concat instead of at[].set: avoids a read-modify-write of the
             # full [T, n_head, head_dim] tensor (values are identical).
@@ -176,11 +204,11 @@ class GlmDsaIndexer(nnx.Module):
             query = query.at[:, :, :rope_dim].set(q_rope)
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
+        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP)
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
 
-        weights, _ = self.weights_proj(hidden_states)
+        weights, _ = self.weights_proj(hs_q)
         return query, key, weights
 
     def project_key_only(
@@ -198,7 +226,7 @@ class GlmDsaIndexer(nnx.Module):
         else:
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
+        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP)
         key = jnp.einsum("td,de->te", key, h_matrix)
         return key
 
@@ -519,12 +547,49 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
             dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
-                q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states, q_compressed, positions, self.rotary_emb
+                readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+                reuse = bool(
+                    dsa_topk_reuse and (dsa_topk_in is not None or dsa_topk_pages_in is not None)
                 )
-                dsa_kwargs["q_idx"] = q_idx
-                dsa_kwargs["k_idx"] = k_idx
-                dsa_kwargs["idx_weights"] = idx_w
+                if readonly and reuse:
+                    pass
+                else:
+                    from sgl_jax.srt.layers.attention import dsa_sparse_backend as _dsa_mod
+
+                    num_tokens = hidden_states.shape[0]
+                    mode = getattr(forward_batch, "forward_mode", None)
+                    is_verify = bool(mode is not None and mode.is_target_verify())
+                    draft_group = (
+                        _dsa_mod._spec_draft_group(forward_batch, num_tokens)
+                        if (is_verify and _dsa_mod._SPEC_AS_DECODE and _dsa_mod._SPEC_VERIFY_LAST_Q_ONLY)
+                        else None
+                    )
+                    q_group = (
+                        int(draft_group)
+                        if (
+                            draft_group is not None
+                            and draft_group > 1
+                            and num_tokens % draft_group == 0
+                            and (
+                                _dsa_mod._SPEC_VERIFY_QGROUP
+                                or (
+                                    _dsa_mod._SPEC_VERIFY_PAGE_SHARE >= draft_group
+                                    and (draft_group & (draft_group - 1)) == 0
+                                )
+                            )
+                        )
+                        else 1
+                    )
+                    q_idx, k_idx, idx_w = self.indexer.project(
+                        hidden_states,
+                        q_compressed,
+                        positions,
+                        self.rotary_emb,
+                        q_group=q_group,
+                    )
+                    dsa_kwargs["q_idx"] = q_idx
+                    dsa_kwargs["k_idx"] = k_idx
+                    dsa_kwargs["idx_weights"] = idx_w
         elif self.indexer is not None:
             _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
 

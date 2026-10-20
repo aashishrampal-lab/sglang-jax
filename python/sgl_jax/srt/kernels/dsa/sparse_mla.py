@@ -96,167 +96,37 @@ def sparse_mla_page_level(
     vmem_limit_bytes: int | None = None,
     page_share_group: int = 1,
     group_queries: bool = False,
+    precomputed_meta: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Page-level sparse MLA: dense kernel over only the topk-touched pages.
-
-    ``page_share_group`` > 1 (opt-in A/B for decode-form speculative verify,
-    where every group of ``page_share_group`` consecutive tokens belongs to one
-    request): all tokens of a group use the LAST token's page list, so the
-    ``page_indices[start + local]`` physical-page gather runs once per group
-    instead of once per token. Changes the attention page set of the earlier
-    tokens in the group; not for default use.
-    ``group_queries`` (with ``page_share_group`` = G > 1): the G tokens of a
-    request become ONE ragged sequence with G query rows instead of G
-    one-query pseudo-sequences, so the kernel reads the request's KV once and
-    applies its causal rule (query i sees k_pos <= kv_len - G + i). Layout:
-    [last token's hit pages (minus the previous page when the group crosses a
-    page boundary), previous page if crossing, new page, pad]; the tail G
-    positions are then exactly the G consecutive tokens, so the in-place
-    new-kv writes land on the true slots. Page set = the last token's
-    selection (identical to per-token when every page is selected).
-
-    Decode-only (each seq contributes exactly one query token). Builds a
-    per-seq page list of length ``k_pages_max``:
-      [unique pages of topk_indices ... pad ... new-token's page]
-    and hands that as ``page_indices`` to the unmodified dense kernel with
-    ``kv_len`` set so the kernel's in-place new-kv write lands on the true
-    slot (last page × page_size + new_off + 1 - 1).
-
-    Returns ``(o_latent, updated_cache_kv)`` — the cache is written in place
-    by the dense kernel, so no separate ``_scatter_paged`` is needed.
-    """
+    """Page-level sparse MLA: dense kernel over only the topk-touched pages."""
     T = ql_nope.shape[0]
-    S = kv_lens.shape[0]
-
-    # Per-token seq id (decode: token t belongs to seq t after cu_q_lens=[0..T]).
-    seq_id = jnp.searchsorted(cu_q_lens[1:], jnp.arange(T), side="right")
-    seq_id = jnp.clip(seq_id, 0, S - 1)
-    tok_valid = kv_lens[seq_id] > 0  # [T] — padding seqs (bs padding) have kv_len==0
-    # page_indices is packed per-seq at cu_kv_lens[i]//page_size (variable stride
-    # via cumsum(aligned_lens)), NOT seq_id*pages_per_seq.
-    seq_page_start = cu_kv_lens[seq_id] // page_size  # [T]
-
-    valid = topk_indices >= 0
-    safe_idx = jnp.where(valid, topk_indices, 0)
-    page_local = safe_idx // page_size  # [T, k] seq-local page ids
-
-    # New token's seq-local slot = kv_len-1; its page/offset. Clamp for padding
-    # seqs (kv_len==0) so the -1 doesn't index page_indices[-1] and corrupt the
-    # previous real seq's tail page via the kernel's in-place kv write.
-    new_abs = jnp.maximum(kv_lens[seq_id] - 1, 0)  # [T]
-    new_page_local = new_abs // page_size
-    new_off = new_abs % page_size
-
-    if topk_pages is not None:
-        # Precomputed by the indexer (shared across the 4-layer IndexShare
-        # group), so this branch skips the ~0.25ms one_hot+top_k per layer.
-        # Compact valid entries to the front via sort — new_page may sit in
-        # the middle of topk_pages (compute_topk_pages doesn't know it), and
-        # the sp_local layout below assumes hit_pages[:n_hit_c] are all valid.
-        raw = topk_pages[..., : k_pages_max - 1]
-        hit_is_valid = (raw >= 0) & (raw != new_page_local[:, None])
-        n_hit_c = jnp.minimum(jnp.sum(hit_is_valid, -1), k_pages_max - 1)
-        hit_pages = jnp.sort(jnp.where(hit_is_valid, raw, jnp.iinfo(jnp.int32).max), axis=-1)
-    else:
-        # Unique pages via one-hot OR over the k topk positions (page count is
-        # bounded by pages_per_seq which is static). Keeps everything jit-static.
-        page_hits = jax.nn.one_hot(page_local, pages_per_seq, dtype=jnp.int32)
-        page_hits = jnp.where(valid[..., None], page_hits, 0)
-        page_mask = jnp.any(page_hits, axis=1)  # [T, P] bool
-        page_mask = page_mask & (jnp.arange(pages_per_seq)[None, :] != new_page_local[:, None])
-        n_hit = jnp.sum(page_mask, axis=-1)
-        _, hit_pages = jax.lax.top_k(page_mask.astype(jnp.int32), k_pages_max - 1)
-        n_hit_c = jnp.minimum(n_hit, k_pages_max - 1)
-    n_used = n_hit_c + 1  # +1 for the new-token page
-
-    # Layout: [hit_pages[0..n_hit_c-1], new_page, pad...] so the kernel's
-    # kv_len mask (k_span < sp_kv_len) drops the pad tail while keeping the
-    # new-token page inside. Padding points at the sentinel last cache page.
-    col = jnp.arange(k_pages_max)[None, :]  # [1, kp]
-    sp_local = jnp.where(
-        col < n_hit_c[:, None],
-        jnp.pad(hit_pages, ((0, 0), (0, 1))),
-        jnp.where(col == n_hit_c[:, None], new_page_local[:, None], 0),
-    )
     grouped = bool(group_queries) and page_share_group > 1 and T % page_share_group == 0
-    if grouped:
-        G = page_share_group
-        Ng = T // G
-        rep = slice(G - 1, None, G)  # last token of every group
-        int_max = jnp.iinfo(jnp.int32).max
-        new_pl = new_page_local[rep]  # [Ng]
-        new_of = new_off[rep]
-        # the group's G consecutive positions end at new_of inside new_page; if
-        # fewer than G slots precede it there, the group starts in the previous page
-        straddle = new_of < (G - 1)
-        prev_pl = jnp.maximum(new_pl - 1, 0)
-        hp = hit_pages[rep]  # [Ng, kp-1], valid entries first
-        colh = jnp.arange(k_pages_max - 1)[None, :]
-        hv = colh < n_hit_c[rep][:, None]
-        is_prev = hv & straddle[:, None] & (hp == prev_pl[:, None])
-        hp2 = jnp.sort(jnp.where(hv & ~is_prev, hp, int_max), axis=-1)
-        s_i = straddle.astype(jnp.int32)
-        n_hit_g = n_hit_c[rep] - jnp.sum(is_prev, axis=-1)
-        n_hit_g = jnp.minimum(n_hit_g, k_pages_max - 1 - s_i)
-        n_used_g = n_hit_g + 1 + s_i
-        colg = jnp.arange(k_pages_max)[None, :]
-        hp2p = jnp.pad(hp2, ((0, 0), (0, 1)))
-        tail0 = jnp.where(straddle, prev_pl, new_pl)
-        sp_local_g = jnp.where(
-            colg < n_hit_g[:, None],
-            hp2p,
-            jnp.where(
-                colg == n_hit_g[:, None],
-                tail0[:, None],
-                jnp.where((colg == n_hit_g[:, None] + 1) & straddle[:, None], new_pl[:, None], 0),
-            ),
-        )
-        valid_g = tok_valid[rep]
-        sp_phys = jnp.where(
-            (colg < n_used_g[:, None]) & valid_g[:, None],
-            page_indices[seq_page_start[rep][:, None] + sp_local_g],
-            cache_kv.shape[0] - 1,
-        )
-        # bs-padding groups (kv_len == 0) still carry G query rows, and the mixed
-        # kernel sizes its KV loop by kv_len: kv_len == 0 skips the loop, so the
-        # query-block DMA is never waited (semaphore non-zero at kernel exit) or
-        # the next sequence is never prefetched (hang). Give them G all-new
-        # positions on the sentinel page, like the per-token path's kv_len == 1.
-        sp_kv_len = jnp.where(
-            valid_g, n_hit_g * page_size + s_i * page_size + new_of + 1, G
-        ).astype(jnp.int32)
-        sp_page_indices = sp_phys.reshape(-1)  # [Ng * k_pages_max]
-        sp_cu_q = jnp.arange(Ng + 1, dtype=jnp.int32) * G
-        sp_cu_kv = jnp.arange(Ng + 1, dtype=jnp.int32) * (k_pages_max * page_size)
-        sp_dist = jnp.array([0, 0, Ng], dtype=jnp.int32)  # all sequences are mixed
-    elif page_share_group > 1 and T % page_share_group == 0:
-        G = page_share_group
-        rep = slice(G - 1, None, G)  # last token of every group
-        sp_local_g = sp_local[rep]
-        phys_g = page_indices[seq_page_start[rep][:, None] + sp_local_g]  # [T/G, kp]
-        sp_phys = jnp.where(
-            (col < jnp.repeat(n_used[rep], G)[:, None]) & tok_valid[:, None],
-            jnp.repeat(phys_g, G, axis=0),
-            cache_kv.shape[0] - 1,
-        )
-        n_hit_c = jnp.repeat(n_hit_c[rep], G)
+
+    if precomputed_meta is not None:
+        sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist = precomputed_meta
     else:
-        sp_phys = jnp.where(
-            (col < n_used[:, None]) & tok_valid[:, None],
-            page_indices[seq_page_start[:, None] + sp_local],
-            cache_kv.shape[0] - 1,
+        sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist = (
+            prepare_sparse_mla_page_level_metadata(
+                T=T,
+                num_cache_pages=cache_kv.shape[0],
+                kv_lens=kv_lens,
+                topk_indices=topk_indices,
+                page_indices=page_indices,
+                cu_q_lens=cu_q_lens,
+                cu_kv_lens=cu_kv_lens,
+                topk_pages=topk_pages,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                k_pages_max=k_pages_max,
+                page_share_group=page_share_group,
+                group_queries=group_queries,
+            )
         )
 
-    if not grouped:
-        # Metadata for the dense kernel: T "sequences", each kv_len positions.
-        sp_kv_len = (n_hit_c * page_size + new_off + 1).astype(jnp.int32)  # [T]
-        sp_page_indices = sp_phys.reshape(-1)  # [T * k_pages_max]
-        sp_cu_q = jnp.arange(T + 1, dtype=jnp.int32)
-        sp_cu_kv = jnp.arange(T + 1, dtype=jnp.int32) * (k_pages_max * page_size)
-        sp_dist = jnp.array([T, T, T], dtype=jnp.int32)
-    elif num_kv_pages_per_block is None and k_pages_max <= 32:
-        # Hardware-tuned bkv_p for grouped verify/draft-extend on TPU v7x (k_pages_max=17):
-        if T <= 8:
+    if grouped and num_kv_pages_per_block is None and k_pages_max <= 32:
+        if k_pages_max <= 16:
+            num_kv_pages_per_block = 4 if T <= 8 else 16
+        elif T <= 8:
             num_kv_pages_per_block = 4
         elif T <= 24:
             num_kv_pages_per_block = 16
@@ -288,6 +158,210 @@ def sparse_mla_page_level(
         mixed_static_q_len=page_share_group if grouped else None,
     )
     return o[..., :kv_lora_rank], cache_out
+
+
+def prepare_sparse_mla_page_level_metadata(
+    *,
+    T: int,
+    num_cache_pages: int,
+    kv_lens: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    topk_pages: jax.Array | None,
+    page_size: int,
+    pages_per_seq: int,
+    k_pages_max: int,
+    page_share_group: int = 1,
+    group_queries: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build `(sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist)` for `sparse_mla_page_level`."""
+    S = kv_lens.shape[0]
+    grouped = bool(group_queries) and page_share_group > 1 and T % page_share_group == 0
+
+    if grouped and topk_pages is not None:
+        G = page_share_group
+        Ng = T // G
+        rep = slice(G - 1, None, G)
+        int_max = jnp.iinfo(jnp.int32).max
+        seq_id_rep = jnp.searchsorted(cu_q_lens[1:], jnp.arange(G - 1, T, G), side="right")
+        seq_id_rep = jnp.clip(seq_id_rep, 0, S - 1)
+        valid_g = kv_lens[seq_id_rep] > 0
+        seq_page_start_rep = cu_kv_lens[seq_id_rep] // page_size
+        new_abs_rep = jnp.maximum(kv_lens[seq_id_rep] - 1, 0)
+        new_pl = new_abs_rep // page_size
+        new_of = new_abs_rep % page_size
+        straddle = new_of < (G - 1)
+        prev_pl = jnp.maximum(new_pl - 1, 0)
+        s_i = straddle.astype(jnp.int32)
+
+        raw_rep = topk_pages[rep]
+        if raw_rep.shape[-1] < k_pages_max - 1:
+            raw_rep = jnp.pad(
+                raw_rep,
+                ((0, 0), (0, (k_pages_max - 1) - raw_rep.shape[-1])),
+                constant_values=-1,
+            )
+        hit_valid_g = (
+            (raw_rep >= 0)
+            & (raw_rep != new_pl[:, None])
+            & (~straddle[:, None] | (raw_rep != prev_pl[:, None]))
+        )
+        max_hist_g = k_pages_max - 1 - s_i
+        valid_rank_g = jnp.cumsum(hit_valid_g.astype(jnp.int32), axis=-1) <= max_hist_g[:, None]
+        keep_g = hit_valid_g & valid_rank_g
+        n_hit_g = jnp.sum(keep_g.astype(jnp.int32), axis=-1)
+        n_used_g = n_hit_g + 1 + s_i
+        hp2 = jnp.sort(jnp.where(keep_g, raw_rep, int_max), axis=-1)[..., : k_pages_max - 1]
+        colg = jnp.arange(k_pages_max)[None, :]
+        hp2p = jnp.pad(hp2, ((0, 0), (0, 1)))
+        tail0 = jnp.where(straddle, prev_pl, new_pl)
+        sp_local_g = jnp.where(
+            colg < n_hit_g[:, None],
+            hp2p,
+            jnp.where(
+                colg == n_hit_g[:, None],
+                tail0[:, None],
+                jnp.where((colg == n_hit_g[:, None] + 1) & straddle[:, None], new_pl[:, None], 0),
+            ),
+        )
+        sp_phys = jnp.where(
+            (colg < n_used_g[:, None]) & valid_g[:, None],
+            page_indices[seq_page_start_rep[:, None] + sp_local_g],
+            num_cache_pages - 1,
+        )
+        sp_kv_len = jnp.where(
+            valid_g, n_hit_g * page_size + s_i * page_size + new_of + 1, G
+        ).astype(jnp.int32)
+        sp_page_indices = sp_phys.reshape(-1)
+        sp_cu_q = jnp.arange(Ng + 1, dtype=jnp.int32) * G
+        sp_cu_kv = jnp.arange(Ng + 1, dtype=jnp.int32) * (k_pages_max * page_size)
+        sp_dist = jnp.array([0, 0, Ng], dtype=jnp.int32)
+        return sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist
+
+    # Per-token seq id (decode: token t belongs to seq t after cu_q_lens=[0..T]).
+    seq_id = jnp.searchsorted(cu_q_lens[1:], jnp.arange(T), side="right")
+    seq_id = jnp.clip(seq_id, 0, S - 1)
+    tok_valid = kv_lens[seq_id] > 0  # [T] — padding seqs (bs padding) have kv_len==0
+    # page_indices is packed per-seq at cu_kv_lens[i]//page_size (variable stride
+    # via cumsum(aligned_lens)), NOT seq_id*pages_per_seq.
+    seq_page_start = cu_kv_lens[seq_id] // page_size  # [T]
+
+    valid = topk_indices >= 0
+    safe_idx = jnp.where(valid, topk_indices, 0)
+    page_local = safe_idx // page_size  # [T, k] seq-local page ids
+
+    # New token's seq-local slot = kv_len-1; its page/offset. Clamp for padding
+    # seqs (kv_len==0) so the -1 doesn't index page_indices[-1] and corrupt the
+    # previous real seq's tail page via the kernel's in-place kv write.
+    new_abs = jnp.maximum(kv_lens[seq_id] - 1, 0)  # [T]
+    new_page_local = new_abs // page_size
+    new_off = new_abs % page_size
+
+    if topk_pages is not None:
+        raw = topk_pages
+        if raw.shape[-1] < k_pages_max - 1:
+            raw = jnp.pad(
+                raw, ((0, 0), (0, (k_pages_max - 1) - raw.shape[-1])), constant_values=-1
+            )
+        hit_is_valid = (raw >= 0) & (raw != new_page_local[:, None])
+        valid_rank = jnp.cumsum(hit_is_valid.astype(jnp.int32), axis=-1) <= (k_pages_max - 1)
+        hit_is_valid = hit_is_valid & valid_rank
+        n_hit_c = jnp.sum(hit_is_valid.astype(jnp.int32), axis=-1)
+        hit_pages = jnp.sort(jnp.where(hit_is_valid, raw, jnp.iinfo(jnp.int32).max), axis=-1)[
+            ..., : k_pages_max - 1
+        ]
+    else:
+        # Unique pages via one-hot OR over the k topk positions (page count is
+        # bounded by pages_per_seq which is static). Keeps everything jit-static.
+        page_hits = jax.nn.one_hot(page_local, pages_per_seq, dtype=jnp.int32)
+        page_hits = jnp.where(valid[..., None], page_hits, 0)
+        page_mask = jnp.any(page_hits, axis=1)  # [T, P] bool
+        page_mask = page_mask & (jnp.arange(pages_per_seq)[None, :] != new_page_local[:, None])
+        n_hit = jnp.sum(page_mask, axis=-1)
+        _, hit_pages = jax.lax.top_k(page_mask.astype(jnp.int32), k_pages_max - 1)
+        n_hit_c = jnp.minimum(n_hit, k_pages_max - 1)
+    n_used = n_hit_c + 1  # +1 for the new-token page
+
+    # Layout: [hit_pages[0..n_hit_c-1], new_page, pad...] so the kernel's
+    # kv_len mask (k_span < sp_kv_len) drops the pad tail while keeping the
+    # new-token page inside. Padding points at the sentinel last cache page.
+    col = jnp.arange(k_pages_max)[None, :]  # [1, kp]
+    sp_local = jnp.where(
+        col < n_hit_c[:, None],
+        jnp.pad(hit_pages, ((0, 0), (0, 1))),
+        jnp.where(col == n_hit_c[:, None], new_page_local[:, None], 0),
+    )
+    if grouped:
+        G = page_share_group
+        Ng = T // G
+        rep = slice(G - 1, None, G)  # last token of every group
+        int_max = jnp.iinfo(jnp.int32).max
+        new_pl = new_page_local[rep]  # [Ng]
+        new_of = new_off[rep]
+        straddle = new_of < (G - 1)
+        prev_pl = jnp.maximum(new_pl - 1, 0)
+        hp = hit_pages[rep]  # [Ng, kp-1], valid entries first
+        colh = jnp.arange(k_pages_max - 1)[None, :]
+        hv = colh < n_hit_c[rep][:, None]
+        is_prev = hv & straddle[:, None] & (hp == prev_pl[:, None])
+        hp2 = jnp.sort(jnp.where(hv & ~is_prev, hp, int_max), axis=-1)
+        s_i = straddle.astype(jnp.int32)
+        n_hit_g = n_hit_c[rep] - jnp.sum(is_prev, axis=-1)
+        n_hit_g = jnp.minimum(n_hit_g, k_pages_max - 1 - s_i)
+        n_used_g = n_hit_g + 1 + s_i
+        colg = jnp.arange(k_pages_max)[None, :]
+        hp2p = jnp.pad(hp2, ((0, 0), (0, 1)))
+        tail0 = jnp.where(straddle, prev_pl, new_pl)
+        sp_local_g = jnp.where(
+            colg < n_hit_g[:, None],
+            hp2p,
+            jnp.where(
+                colg == n_hit_g[:, None],
+                tail0[:, None],
+                jnp.where((colg == n_hit_g[:, None] + 1) & straddle[:, None], new_pl[:, None], 0),
+            ),
+        )
+        valid_g = tok_valid[rep]
+        sp_phys = jnp.where(
+            (colg < n_used_g[:, None]) & valid_g[:, None],
+            page_indices[seq_page_start[rep][:, None] + sp_local_g],
+            num_cache_pages - 1,
+        )
+        sp_kv_len = jnp.where(
+            valid_g, n_hit_g * page_size + s_i * page_size + new_of + 1, G
+        ).astype(jnp.int32)
+        sp_page_indices = sp_phys.reshape(-1)  # [Ng * k_pages_max]
+        sp_cu_q = jnp.arange(Ng + 1, dtype=jnp.int32) * G
+        sp_cu_kv = jnp.arange(Ng + 1, dtype=jnp.int32) * (k_pages_max * page_size)
+        sp_dist = jnp.array([0, 0, Ng], dtype=jnp.int32)  # all sequences are mixed
+        return sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist
+    elif page_share_group > 1 and T % page_share_group == 0:
+        G = page_share_group
+        rep = slice(G - 1, None, G)  # last token of every group
+        sp_local_g = sp_local[rep]
+        phys_g = page_indices[seq_page_start[rep][:, None] + sp_local_g]  # [T/G, kp]
+        sp_phys = jnp.where(
+            (col < jnp.repeat(n_used[rep], G)[:, None]) & tok_valid[:, None],
+            jnp.repeat(phys_g, G, axis=0),
+            num_cache_pages - 1,
+        )
+        n_hit_c = jnp.repeat(n_hit_c[rep], G)
+    else:
+        sp_phys = jnp.where(
+            (col < n_used[:, None]) & tok_valid[:, None],
+            page_indices[seq_page_start[:, None] + sp_local],
+            num_cache_pages - 1,
+        )
+
+    # Metadata for the dense kernel: T "sequences", each kv_len positions.
+    sp_kv_len = (n_hit_c * page_size + new_off + 1).astype(jnp.int32)  # [T]
+    sp_page_indices = sp_phys.reshape(-1)  # [T * k_pages_max]
+    sp_cu_q = jnp.arange(T + 1, dtype=jnp.int32)
+    sp_cu_kv = jnp.arange(T + 1, dtype=jnp.int32) * (k_pages_max * page_size)
+    sp_dist = jnp.array([T, T, T], dtype=jnp.int32)
+    return sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist
 
 
 @functools.partial(

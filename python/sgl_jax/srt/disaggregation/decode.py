@@ -54,6 +54,13 @@ def _jit_scatter_all_layers(bufs, page_indices, stacked_kv, out_sharding):
     ]
 
 
+@jax.jit
+def _jit_unstack_layers(stacked_kv):
+    """Unstack a 5-D stacked KV array along axis 0 in a single JIT call."""
+    return tuple(stacked_kv[i] for i in range(stacked_kv.shape[0]))
+
+
+
 @partial(jax.jit, static_argnames=("out_sharding", "dp_size"), donate_argnums=(0,))
 def _jit_broadcast_prefix_one_layer(
     buf, src_page_indices, dst_page_indices, out_sharding, dp_size: int
@@ -354,6 +361,8 @@ class SchedulerDisaggregationDecodeMixin:
         implemented, new native receive admission requires a whole-pool device
         fence. Steady decode and polling existing receives need no such fence.
         """
+        if not getattr(self, "disagg_use_raiden", False):
+            return
         with jax.profiler.TraceAnnotation("pd_decode_admission_fence"):
             self._wait_donation_safe()
             jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
@@ -1270,6 +1279,7 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     ev_entry["evict_on_zero"] = True
 
+            min_prefix_skip = int(os.environ.get("SGL_PD_MIN_PREFIX_SKIP_TOKENS", "2048"))
             cached_entry = None
             reuse_skip_tokens = 0
             reuse_lcp_tokens = 0
@@ -1288,7 +1298,7 @@ class SchedulerDisaggregationDecodeMixin:
                         ((seqlen - page_size) // page_size) * page_size,
                     )
                     cmp_len = min(len(c_ids), cap_cmp + 1)
-                    if cmp_len >= 4096:
+                    if cmp_len >= min_prefix_skip:
                         if entry.req.origin_input_ids[:cmp_len] == c_ids[:cmp_len]:
                             lcp_tokens = cmp_len
                         else:
@@ -1305,7 +1315,7 @@ class SchedulerDisaggregationDecodeMixin:
                         )
                         cand_skip = (usable_lcp // page_size) * page_size
                         if (
-                            cand_skip >= 4096
+                            cand_skip >= min_prefix_skip
                             and seqlen >= cand_skip + page_size
                             and (_SHARDED_PREFIX_PAGES == 0 or cand_skip == target_prefix_len)
                             and cand_skip > reuse_skip_tokens
@@ -1346,6 +1356,10 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 skip_tokens = 0
             entry.req._pd_transfer_skip_tokens = skip_tokens
+            if skip_tokens > 0:
+                entry.req.cached_tokens = max(
+                    int(getattr(entry.req, "cached_tokens", 0) or 0), int(skip_tokens)
+                )
             req_pull_bytes = getattr(self, "_req_pull_bytes_per_device", lambda r: 0)(entry.req)
             if (n_transfer + admitted) > 0 and (inflight_pull_bytes + req_pull_bytes) > pull_budget_bytes:
                 # Keep requests that would exceed Decode HBM pull budget waiting in
@@ -1547,7 +1561,7 @@ class SchedulerDisaggregationDecodeMixin:
                     target_prefix_len,
                     ((seqlen - page_size) // page_size) * page_size,
                 )
-                if cap_len >= 4096 and (shard_prefix_len == 0 or seqlen >= target_prefix_len + page_size):
+                if cap_len >= min_prefix_skip and (shard_prefix_len == 0 or seqlen >= target_prefix_len + page_size):
                     while len(slot_list) >= max_prefix_slots and slot_list:
                         ev_victim = slot_list.pop(0)
                         _evict_prefix_entry(ev_victim)
@@ -2097,17 +2111,23 @@ class SchedulerDisaggregationDecodeMixin:
             t_scatter0 = time.perf_counter()
             kv_cursor = 0
             idx_cursor = 0
+            kv_layers = _jit_unstack_layers(kv) if isinstance(kv, jax.Array) else kv
+            idx_layers = (
+                _jit_unstack_layers(indexer_kv)
+                if (indexer_kv is not None and isinstance(indexer_kv, jax.Array))
+                else indexer_kv
+            )
             use_fused_scatter = (
-                os.environ.get("SGL_FUSED_KV_SCATTER", "0") == "1" and padded_pages <= 256
+                os.environ.get("SGL_FUSED_KV_SCATTER", "1") == "1" and padded_pages <= 256
             )
             for pool in all_pools:
                 n_layers = pool.layer_num
                 if use_fused_scatter and n_layers > 1:
                     try:
-                        chunk_sz = 13 if n_layers % 13 == 0 else n_layers
+                        chunk_sz = 6 if n_layers % 6 == 0 else (13 if n_layers % 13 == 0 else n_layers)
                         for s in range(0, n_layers, chunk_sz):
                             e = min(s + chunk_sz, n_layers)
-                            kv_vals = [kv[kv_cursor + j] for j in range(s, e)]
+                            kv_vals = list(kv_layers[kv_cursor + s : kv_cursor + e])
                             pool.kv_buffer[s:e] = _jit_scatter_all_layers(
                                 pool.kv_buffer[s:e],
                                 page_indices,
@@ -2119,7 +2139,7 @@ class SchedulerDisaggregationDecodeMixin:
                             pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
                                 pool.kv_buffer[layer_idx],
                                 page_indices,
-                                kv[kv_cursor + layer_idx],
+                                kv_layers[kv_cursor + layer_idx],
                                 pool.kv_sharding,
                             )
                 else:
@@ -2127,18 +2147,18 @@ class SchedulerDisaggregationDecodeMixin:
                         pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
                             pool.kv_buffer[layer_idx],
                             page_indices,
-                            kv[kv_cursor + layer_idx],
+                            kv_layers[kv_cursor + layer_idx],
                             pool.kv_sharding,
                         )
                 kv_cursor += n_layers
-                if indexer_kv is not None and getattr(pool, "indexer_key_buffer", None):
+                if idx_layers is not None and getattr(pool, "indexer_key_buffer", None):
                     n_idx = len(pool.indexer_key_buffer)
                     if use_fused_scatter and n_idx > 1:
                         try:
                             idx_chunk = 7 if n_idx % 7 == 0 else n_idx
                             for s in range(0, n_idx, idx_chunk):
                                 e = min(s + idx_chunk, n_idx)
-                                idx_vals = [indexer_kv[idx_cursor + j] for j in range(s, e)]
+                                idx_vals = list(idx_layers[idx_cursor + s : idx_cursor + e])
                                 pool.indexer_key_buffer[s:e] = _jit_scatter_all_layers(
                                     pool.indexer_key_buffer[s:e],
                                     page_indices,
@@ -2150,7 +2170,7 @@ class SchedulerDisaggregationDecodeMixin:
                                 pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
                                     pool.indexer_key_buffer[slot_idx],
                                     page_indices,
-                                    indexer_kv[idx_cursor + slot_idx],
+                                    idx_layers[idx_cursor + slot_idx],
                                     pool.kv_sharding,
                                 )
                     else:
@@ -2158,7 +2178,7 @@ class SchedulerDisaggregationDecodeMixin:
                             pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
                                 pool.indexer_key_buffer[slot_idx],
                                 page_indices,
-                                indexer_kv[idx_cursor + slot_idx],
+                                idx_layers[idx_cursor + slot_idx],
                                 pool.kv_sharding,
                             )
                     idx_cursor += n_idx

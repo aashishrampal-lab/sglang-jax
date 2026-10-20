@@ -3134,6 +3134,9 @@ class Scheduler(
                         matched_idx = -1
                         matched_lcp_tokens = 0
                         matched_cmp_len = 0
+                        min_prefix_skip = int(
+                            os.environ.get("SGL_PD_MIN_PREFIX_SKIP_TOKENS", "2048")
+                        )
                         if slot_list and seqlen >= self.page_size * 2:
                             cap_cmp = min(
                                 target_prefix_len,
@@ -3142,7 +3145,7 @@ class Scheduler(
                             for s_idx in range(len(slot_list) - 1, -1, -1):
                                 prev_prefix_ids = slot_list[s_idx]
                                 cmp_len = min(len(prev_prefix_ids), cap_cmp + 1)
-                                if cmp_len >= 4096:
+                                if cmp_len >= min_prefix_skip:
                                     if req.origin_input_ids[:cmp_len] == prev_prefix_ids[:cmp_len]:
                                         lcp_tokens = cmp_len
                                     else:
@@ -3161,7 +3164,7 @@ class Scheduler(
                                     )
                                     cand_skip = (usable_lcp // self.page_size) * self.page_size
                                     if (
-                                        cand_skip >= 4096
+                                        cand_skip >= min_prefix_skip
                                         and seqlen >= cand_skip + self.page_size
                                         and cand_skip > skip_tokens
                                     ):
@@ -3188,7 +3191,7 @@ class Scheduler(
                                 target_prefix_len,
                                 ((seqlen - self.page_size) // self.page_size) * self.page_size,
                             )
-                            if cap_len >= 4096:
+                            if cap_len >= min_prefix_skip:
                                 while len(slot_list) >= max_prefix_slots and slot_list:
                                     slot_list.pop(0)
                                 slot_list.append(list(req.origin_input_ids[: cap_len + 1]))
