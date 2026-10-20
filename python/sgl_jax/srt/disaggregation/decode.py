@@ -2105,21 +2105,31 @@ class SchedulerDisaggregationDecodeMixin:
             t_scatter0 = time.perf_counter()
             kv_cursor = 0
             idx_cursor = 0
-            use_fused_scatter = os.environ.get("SGL_FUSED_KV_SCATTER", "1") == "1"
+            use_fused_scatter = (
+                os.environ.get("SGL_FUSED_KV_SCATTER", "1") == "1" and padded_pages <= 256
+            )
             for pool in all_pools:
                 n_layers = pool.layer_num
                 if use_fused_scatter and n_layers > 1:
-                    kv_slice = (
-                        kv
-                        if (kv_cursor == 0 and n_layers == kv.shape[0])
-                        else kv[kv_cursor : kv_cursor + n_layers]
-                    )
-                    pool.kv_buffer = _jit_scatter_all_layers(
-                        pool.kv_buffer,
-                        page_indices,
-                        kv_slice,
-                        pool.kv_sharding,
-                    )
+                    try:
+                        chunk_sz = 13 if n_layers % 13 == 0 else n_layers
+                        for s in range(0, n_layers, chunk_sz):
+                            e = min(s + chunk_sz, n_layers)
+                            kv_vals = [kv[kv_cursor + j] for j in range(s, e)]
+                            pool.kv_buffer[s:e] = _jit_scatter_all_layers(
+                                pool.kv_buffer[s:e],
+                                page_indices,
+                                kv_vals,
+                                pool.kv_sharding,
+                            )
+                    except Exception:
+                        for layer_idx in range(n_layers):
+                            pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
+                                pool.kv_buffer[layer_idx],
+                                page_indices,
+                                kv[kv_cursor + layer_idx],
+                                pool.kv_sharding,
+                            )
                 else:
                     for layer_idx in range(n_layers):
                         pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
@@ -2132,17 +2142,25 @@ class SchedulerDisaggregationDecodeMixin:
                 if indexer_kv is not None and getattr(pool, "indexer_key_buffer", None):
                     n_idx = len(pool.indexer_key_buffer)
                     if use_fused_scatter and n_idx > 1:
-                        idx_slice = (
-                            indexer_kv
-                            if (idx_cursor == 0 and n_idx == indexer_kv.shape[0])
-                            else indexer_kv[idx_cursor : idx_cursor + n_idx]
-                        )
-                        pool.indexer_key_buffer = _jit_scatter_all_layers(
-                            pool.indexer_key_buffer,
-                            page_indices,
-                            idx_slice,
-                            pool.kv_sharding,
-                        )
+                        try:
+                            idx_chunk = 7 if n_idx % 7 == 0 else n_idx
+                            for s in range(0, n_idx, idx_chunk):
+                                e = min(s + idx_chunk, n_idx)
+                                idx_vals = [indexer_kv[idx_cursor + j] for j in range(s, e)]
+                                pool.indexer_key_buffer[s:e] = _jit_scatter_all_layers(
+                                    pool.indexer_key_buffer[s:e],
+                                    page_indices,
+                                    idx_vals,
+                                    pool.kv_sharding,
+                                )
+                        except Exception:
+                            for slot_idx in range(n_idx):
+                                pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
+                                    pool.indexer_key_buffer[slot_idx],
+                                    page_indices,
+                                    indexer_kv[idx_cursor + slot_idx],
+                                    pool.kv_sharding,
+                                )
                     else:
                         for slot_idx in range(n_idx):
                             pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
