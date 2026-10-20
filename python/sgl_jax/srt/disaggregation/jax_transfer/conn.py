@@ -598,6 +598,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._transfer_started_at: float | None = None
         self._state_lock = threading.Lock()
         self._holds_pull_sem = False
+        self.first_output_id: int = -1
 
     def _release_pull_sem(self) -> None:
         with self._state_lock:
@@ -637,6 +638,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         results = self._results
         self._results = None
         try:
+            if "spec_meta" in results:
+                with suppress(Exception):
+                    self.first_output_id = int(
+                        np.asarray(results["spec_meta"]).reshape(-1)[0]
+                    )
             if "indexer_kv" in results:
                 install((results["kv"], results["indexer_kv"]))
             else:

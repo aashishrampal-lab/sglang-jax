@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import deque
 from contextlib import suppress
@@ -202,6 +203,18 @@ def local_kv_spec_for_pool(
     lmesh = _Mesh(_np.asarray(ldev), ("_local",))
     lspec = _P(*("_local" if i == sd else None for i in range(len(gshape))))
     return jax.ShapeDtypeStruct(lshape, kv_pool.dtype, sharding=_NamedSharding(lmesh, lspec))
+
+
+def local_spec_meta_sharding():
+    """Return ``((num_local_devices, 8), NamedSharding(local_mesh, P("_local", None)))`` for spec_meta."""
+    import numpy as _np
+    from jax.sharding import Mesh as _Mesh
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    ldev = jax.local_devices()
+    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
+    return (len(ldev), 8), _NamedSharding(lmesh, _P("_local", None))
 
 
 @dataclass
@@ -630,6 +643,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             and req.rid not in self.disagg_prefill_queue._entries
         ]
+        if ready_to_transfer:
+            self._populate_pd_first_output_ids(batch, result, ready_to_transfer)
         if ready_to_transfer and handoffs is None:
             import time as _time
 
@@ -973,13 +988,65 @@ class SchedulerDisaggregationPrefillMixin:
         if pending is not None and pending[dp_rank] is req:
             pending[dp_rank] = None
 
+    def _use_pd_spec_meta_transfer(self: Scheduler) -> bool:
+        if os.environ.get("SGL_PD_DIRECT_DECODE", "1") != "1":
+            return False
+        if getattr(self, "disagg_use_d2h_staging", False):
+            return False
+        mgr = getattr(self, "disagg_kv_manager", None)
+        return getattr(mgr, "engine_name", None) == "jax" and not getattr(
+            mgr, "requires_host_staging", False
+        )
+
+    def _populate_pd_first_output_ids(
+        self: Scheduler, batch, result, ready_reqs: list[Req]
+    ) -> None:
+        if batch is None or not ready_reqs:
+            return
+        reqs_info = getattr(batch, "reqs_info", None)
+        if not reqs_info:
+            return
+        for info in reqs_info:
+            out_ids = getattr(info, "output_ids", None)
+            if out_ids is not None and len(out_ids) > 0:
+                for i, r in enumerate(getattr(info, "reqs", None) or ()):
+                    if i < len(out_ids):
+                        r._pd_first_output_id = int(out_ids[i])
+        if all(getattr(r, "_pd_first_output_id", None) is not None for r in ready_reqs):
+            return
+        raw_nt = getattr(result, "next_token_ids", None) if result is not None else None
+        if raw_nt is None:
+            return
+        if hasattr(raw_nt, "copy_to_host_async"):
+            raw_nt.copy_to_host_async()
+        nt_flat = np.asarray(raw_nt, dtype=np.int32).reshape(-1)
+        dp_size = max(1, int(getattr(batch, "dp_size", len(reqs_info)) or 1))
+        per_dp_bs = int(getattr(batch, "per_dp_bs_size", 0) or 0)
+        if per_dp_bs <= 0:
+            per_dp_bs = max(1, len(nt_flat) // dp_size)
+        for dp_rank, info in enumerate(reqs_info):
+            for i, r in enumerate(getattr(info, "reqs", None) or ()):
+                idx = dp_rank * per_dp_bs + i
+                if idx < len(nt_flat):
+                    r._pd_first_output_id = int(nt_flat[idx])
+
     def _extract_req_payload(self: Scheduler, req: Req) -> dict[str, Any]:
         """Extract KV (and optional indexer_kv for DSA sparse attention) for ``req``."""
         kv_out = self._extract_req_kv(req, include_indexer=True)
         if isinstance(kv_out, tuple):
             kv, indexer_kv = kv_out
-            return {"kv": kv, "indexer_kv": indexer_kv}
-        return {"kv": kv_out}
+            payload = {"kv": kv, "indexer_kv": indexer_kv}
+        else:
+            payload = {"kv": kv_out}
+        if self._use_pd_spec_meta_transfer():
+            first_tok = int(getattr(req, "_pd_first_output_id", -1))
+            if first_tok < 0 and getattr(req, "output_ids", None):
+                first_tok = int(req.output_ids[-1])
+            meta_shape, meta_sharding = local_spec_meta_sharding()
+            meta_np = np.full(meta_shape, -1, dtype=np.int32)
+            meta_np[:, 0] = first_tok
+            payload["spec_meta"] = jax.device_put(meta_np, meta_sharding)
+        return payload
 
     def _extract_req_kv(self: Scheduler, req: Req, *, include_indexer: bool = False):
         """Gather prefilled KV from the paged pool for ``req``.

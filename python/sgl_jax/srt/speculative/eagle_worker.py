@@ -128,6 +128,21 @@ class EAGLEWorker(BaseSpecWorker):
                     jax.block_until_ready(self.spec_relay_buffers)
                 else:
                     self.forward_batch_speculative_generation(model_worker_batch)
+                chunk_size = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0)
+                if (
+                    getattr(self.server_args, "disaggregation_mode", "null") == "null"
+                    and chunk_size > 0
+                    and num_tokens >= chunk_size
+                ):
+                    model_worker_batch.extend_next_token_ids = np.zeros(
+                        (model_worker_batch.req_pool_indices.shape[0],), dtype=np.int32
+                    )
+                    model_worker_batch.forward_batch = None
+                    if self.spec_relay_buffers is not None:
+                        self.forward_batch_speculative_prefill_overlap(model_worker_batch)
+                        jax.block_until_ready(self.spec_relay_buffers)
+                    else:
+                        self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 

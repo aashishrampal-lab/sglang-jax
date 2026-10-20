@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -112,6 +113,50 @@ def update_spec_relay_buffers(
             mode="drop",
             out_sharding=RELAY_STATE_SPEC,
         ),
+        verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
+            verified_id,
+            mode="drop",
+            out_sharding=RELAY_ID_SPEC,
+        ),
+        new_seq_lens=buffers.new_seq_lens.at[dp_indices, scatter_indices].set(
+            new_seq_lens,
+            mode="drop",
+            out_sharding=RELAY_ID_SPEC,
+        ),
+    )
+
+
+@partial(jax.jit, donate_argnums=(0,), static_argnames=("dp_size",))
+def update_spec_relay_buffers_admit(
+    buffers: SpecRelayBuffers,
+    future_indices,
+    valid_mask,
+    topk_index,
+    verified_id,
+    new_seq_lens,
+    *,
+    dp_size: int,
+) -> SpecRelayBuffers:
+    """Write newly admitted PD decode requests' seed tokens and seq_lens into relay buffers."""
+    per_dp_bs = future_indices.shape[0] // dp_size
+    indices = future_indices.reshape((dp_size, per_dp_bs))
+    valid = valid_mask.reshape((dp_size, per_dp_bs))
+    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    scatter_indices = jnp.where(
+        valid,
+        indices,
+        jnp.full_like(indices, buffers.topk_index.shape[1]),
+    )
+    topk_index = topk_index.reshape((dp_size, per_dp_bs) + topk_index.shape[1:])
+    verified_id = verified_id.reshape((dp_size, per_dp_bs))
+    new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
+    return SpecRelayBuffers(
+        topk_index=buffers.topk_index.at[dp_indices, scatter_indices].set(
+            topk_index,
+            mode="drop",
+            out_sharding=RELAY_STATE_SPEC,
+        ),
+        hidden_states=buffers.hidden_states,
         verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
             verified_id,
             mode="drop",

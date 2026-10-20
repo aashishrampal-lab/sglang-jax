@@ -1413,6 +1413,49 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             self.assertEqual(selected_layer0_hidden.shape, (1, 4))
             self.assertEqual(stacked_idx.shape, (1, 1))
 
+    def test_pd_direct_decode_admission_and_spec_relay_update(self):
+        """Verify 1P spec_meta transfer and 1D direct-to-decode admission with update_spec_relay_buffers_admit."""
+        from jax.sharding import NamedSharding, PartitionSpec
+        from sgl_jax.srt.speculative.relay_buffer import (
+            create_spec_relay_buffers,
+            update_spec_relay_buffers_admit,
+        )
+
+        mesh = _make_mesh(dp_size=2)
+        with jax.set_mesh(mesh):
+            dummy_pool = SimpleNamespace(req_to_token=np.zeros((4, 16), dtype=np.int32))
+            buffers = create_spec_relay_buffers(
+                mesh,
+                dummy_pool,
+                dp_size=2,
+                num_steps=1,
+                hidden_size=4,
+                hidden_dtype=jnp.bfloat16,
+            )
+            sh_1d = NamedSharding(mesh, PartitionSpec("data"))
+            sh_2d = NamedSharding(mesh, PartitionSpec("data", None))
+            fut_idx = jax.device_put(np.array([1, 2], dtype=np.int32), sh_1d)
+            val_mask = jax.device_put(np.array([True, True], dtype=np.bool_), sh_1d)
+            topk_idx = jax.device_put(np.array([[77], [88]], dtype=np.int32), sh_2d)
+            ver_id = jax.device_put(np.array([77, 88], dtype=np.int32), sh_1d)
+            new_seq = jax.device_put(np.array([17, 33], dtype=np.int32), sh_1d)
+
+            updated = update_spec_relay_buffers_admit(
+                buffers,
+                fut_idx,
+                val_mask,
+                topk_idx,
+                ver_id,
+                new_seq,
+                dp_size=2,
+            )
+            self.assertEqual(int(np.asarray(updated.verified_id)[0, 1]), 77)
+            self.assertEqual(int(np.asarray(updated.verified_id)[1, 2]), 88)
+            self.assertEqual(int(np.asarray(updated.topk_index)[0, 1, 0]), 77)
+            self.assertEqual(int(np.asarray(updated.topk_index)[1, 2, 0]), 88)
+            self.assertEqual(int(np.asarray(updated.new_seq_lens)[0, 1]), 17)
+            self.assertEqual(int(np.asarray(updated.new_seq_lens)[1, 2]), 33)
+
     def test_patch_tarball_contains_all_modified_files(self):
         """Verify /tmp/patch.tar.xz contains all modified files in python/sgl_jax/srt byte-for-byte."""
         import subprocess

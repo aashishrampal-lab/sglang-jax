@@ -895,17 +895,30 @@ class SchedulerDisaggregationDecodeMixin:
                         )
                     else:
                         full_kv_indices = np.asarray(entry.kv_indices)
-                    # D recomputes the last prompt token. If that token alone
-                    # occupies the final received page, the extend allocator
-                    # will allocate a replacement page: no prefix slot retains
-                    # ownership of this one. Transfer is terminal before reuse.
+                    first_output_id = int(getattr(entry.receiver, "first_output_id", -1))
+                    entry.req._pd_first_output_id = first_output_id
+                    use_direct_decode = (
+                        os.environ.get("SGL_PD_DIRECT_DECODE", "1") == "1"
+                        and first_output_id >= 0
+                        and (
+                            self._is_spec_decode_enabled()
+                            or not getattr(self, "enable_overlap", False)
+                        )
+                        and not getattr(entry.req, "return_logprob", False)
+                        and not getattr(entry.req, "return_output_logprob_only", False)
+                        and getattr(entry.req, "grammar", None) is None
+                    )
+                    # D recomputes the last prompt token only when falling back to EXTEND.
+                    # With direct-to-decode admission, P already wrote KV for all
+                    # len(origin_input_ids) prompt tokens and transferred t_0.
                     pos_off = int(getattr(entry.req, "_pd_seq_pos_offset", 0) or 0)
                     prefix_len = len(entry.req.origin_input_ids) - pos_off - 1
-                    if prefix_len >= 0 and prefix_len % page_size == 0:
+                    if not use_direct_decode and prefix_len >= 0 and prefix_len % page_size == 0:
                         unused_tail = full_kv_indices[prefix_len:]
                         full_kv_indices = full_kv_indices[:prefix_len]
                         self._release_decode_kv_indices(unused_tail, entry.req.dp_rank)
                     entry.kv_indices = full_kv_indices
+                    entry.req._pd_direct_decode_ready = bool(use_direct_decode)
                     self._set_decode_bookkeeping(entry.req, entry.kv_indices)
                     self._enqueue_for_decode(entry.req)
                     self._pd_mark_time(entry.req, "first_token")
@@ -1086,11 +1099,11 @@ class SchedulerDisaggregationDecodeMixin:
         per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
-        inflight_pull_bytes = self._inflight_pull_bytes_per_device()
-        pull_budget_bytes = self._pull_budget_bytes_per_device()
+        inflight_pull_bytes = getattr(self, "_inflight_pull_bytes_per_device", lambda: 0)()
+        pull_budget_bytes = getattr(self, "_pull_budget_bytes_per_device", lambda: 1 << 60)()
         transfer_per_dp = self.disagg_transfer_queue.count_by_rank(self.dp_size)
         waiting_per_dp = [0] * self.dp_size
-        for wreq in self.waiting_queue:
+        for wreq in getattr(self, "waiting_queue", ()):
             w_dp = _request_dp_rank(wreq, self.dp_size)
             if 0 <= w_dp < self.dp_size:
                 waiting_per_dp[w_dp] += 1
@@ -1170,7 +1183,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + transfer_per_dp[decode_dp_rank]
                 + admitted_per_dp[decode_dp_rank]
             )
-            if n_active_dp >= self.per_dp_max_running_requests:
+            if n_active_dp >= getattr(self, "per_dp_max_running_requests", 1 << 30):
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
@@ -1321,7 +1334,7 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 skip_tokens = 0
             entry.req._pd_transfer_skip_tokens = skip_tokens
-            req_pull_bytes = self._req_pull_bytes_per_device(entry.req)
+            req_pull_bytes = getattr(self, "_req_pull_bytes_per_device", lambda r: 0)(entry.req)
             if (n_transfer + admitted) > 0 and (inflight_pull_bytes + req_pull_bytes) > pull_budget_bytes:
                 # Keep requests that would exceed Decode HBM pull budget waiting in
                 # disagg_prealloc_queue (CPU) until in-flight transfers scatter & free.
@@ -1341,7 +1354,9 @@ class SchedulerDisaggregationDecodeMixin:
             )
             running_rem_tokens = 0
             if (
-                not self.running_batch.is_empty()
+                self.running_batch is not None
+                and not getattr(self.running_batch, "is_empty", lambda: False)()
+                and hasattr(self.running_batch, "reqs_info")
                 and decode_dp_rank < len(self.running_batch.reqs_info)
                 and self.running_batch.reqs_info[decode_dp_rank].reqs
             ):
@@ -1618,6 +1633,213 @@ class SchedulerDisaggregationDecodeMixin:
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 
+    def _use_pd_spec_meta_transfer(self: Scheduler) -> bool:
+        if os.environ.get("SGL_PD_DIRECT_DECODE", "1") != "1":
+            return False
+        if getattr(self, "disagg_use_d2h_staging", False):
+            return False
+        mgr = getattr(self, "disagg_kv_manager", None)
+        return getattr(mgr, "engine_name", None) == "jax" and not getattr(
+            mgr, "requires_host_staging", False
+        )
+
+    def _admit_pd_direct_decode_reqs(self: Scheduler) -> int:
+        """Directly admit PD requests that already received their first output token into running_batch."""
+        if not self.waiting_queue:
+            return 0
+        from jax.sharding import NamedSharding, PartitionSpec
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+        from sgl_jax.srt.speculative.relay_buffer import update_spec_relay_buffers_admit
+
+        running_per_dp = [
+            len(info.reqs) if info.reqs else 0 for info in self.running_batch.reqs_info
+        ]
+        max_bs_per_dp = max(1, int(self.max_total_num_tokens) // max(1, int(self.dp_size)))
+        if getattr(self.server_args, "max_running_requests", None):
+            max_bs_per_dp = min(
+                max_bs_per_dp,
+                max(1, int(self.server_args.max_running_requests) // max(1, int(self.dp_size))),
+            )
+
+        ready_reqs: list[Req] = []
+        remaining_waiting: list[Req] = []
+        for req in self.waiting_queue:
+            if not getattr(req, "_pd_direct_decode_ready", False):
+                remaining_waiting.append(req)
+                continue
+            prefix_entry = getattr(req, "_pd_shared_prefix_entry", None)
+            if prefix_entry is not None and not prefix_entry.get("populated", True):
+                remaining_waiting.append(req)
+                continue
+            dp_rank = _request_dp_rank(req, self.dp_size)
+            if (
+                running_per_dp[dp_rank] >= max_bs_per_dp
+                or self.req_to_token_pool.available_size(dp_rank) < 1
+            ):
+                remaining_waiting.append(req)
+                continue
+            running_per_dp[dp_rank] += 1
+            ready_reqs.append(req)
+
+        if not ready_reqs:
+            return 0
+
+        self.waiting_queue = remaining_waiting
+        is_spec = self._is_spec_decode_enabled()
+        topk = int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1)
+
+        admitted_reqs: list[Req] = []
+        for req in ready_reqs:
+            dp_rank = _request_dp_rank(req, self.dp_size)
+            req_pool_indices = self.req_to_token_pool.alloc(1, dp_rank=dp_rank)
+            if req_pool_indices is None:
+                self.waiting_queue.insert(0, req)
+                continue
+            req.req_pool_idx = req_pool_indices[0]
+            pos_off = int(getattr(req, "_pd_seq_pos_offset", 0) or 0)
+            seqlen = len(req.origin_input_ids) - pos_off
+            prealloc = np.asarray(req._decode_prealloc_tokens, dtype=np.int32)
+            write_len = min(seqlen, len(prealloc))
+            self.req_to_token_pool.write((req.req_pool_idx, slice(0, write_len)), prealloc[:write_len])
+            if len(prealloc) > seqlen:
+                req._decode_prealloc_tokens = prealloc[seqlen:]
+            else:
+                req._decode_prealloc_tokens = np.empty((0,), dtype=np.int32)
+            req.kv_committed_len = seqlen
+            req.kv_allocated_len = seqlen
+            req.fill_ids = list(req.origin_input_ids)
+            req.extend_input_len = 0
+            req.prefix_indices = np.empty((0,), dtype=np.int32)
+            first_tok = int(getattr(req, "_pd_first_output_id", 0))
+            req.output_ids.append(first_tok)
+            req.check_finished()
+            if req.finished():
+                self._pd_chunk_cache_finished_req(req)
+                self.tree_cache.cache_finished_req(req)
+                req._decode_prealloc_tokens = None
+            req._pd_direct_decode_ready = False
+            admitted_reqs.append(req)
+
+        if not admitted_reqs:
+            return 0
+
+        self.stream_output(admitted_reqs, False)
+        active_reqs = [r for r in admitted_reqs if not r.finished()]
+        if not active_reqs:
+            return len(admitted_reqs)
+
+        admit_batch = ScheduleBatch.init_new(
+            active_reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            self.server_args.chunked_prefill_size,
+            self.mesh,
+            self.server_args.precompile_bs_paddings,
+        )
+        for dp_rank, info in enumerate(admit_batch.reqs_info):
+            if not info.reqs:
+                continue
+            info.req_pool_indices = [r.req_pool_idx for r in info.reqs]
+            if is_spec:
+                info.seq_lens = [
+                    len(r.origin_input_ids)
+                    - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                    + len(r.output_ids)
+                    for r in info.reqs
+                ]
+                info.orig_seq_lens = [
+                    len(r.origin_input_ids) + len(r.output_ids) for r in info.reqs
+                ]
+            else:
+                info.seq_lens = [
+                    len(r.origin_input_ids)
+                    - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                    + max(0, len(r.output_ids) - 1)
+                    for r in info.reqs
+                ]
+                info.orig_seq_lens = [
+                    len(r.origin_input_ids) + max(0, len(r.output_ids) - 1)
+                    for r in info.reqs
+                ]
+            info.extend_lens = [1] * len(info.reqs)
+            info.prefix_lens = [
+                len(r.origin_input_ids) - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                for r in info.reqs
+            ]
+            info.positions = list(info.seq_lens)
+            info.output_ids = [int(r.output_ids[-1]) for r in info.reqs]
+
+        if is_spec:
+            n_active = len(active_reqs)
+            first_toks = np.asarray([int(r.output_ids[-1]) for r in active_reqs], dtype=np.int32)
+            req_indices_np = np.asarray([r.req_pool_idx for r in active_reqs], dtype=np.int32)
+            alloc_lens_np = np.asarray(
+                [
+                    len(r.origin_input_ids)
+                    - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                    + len(r.output_ids)
+                    for r in active_reqs
+                ],
+                dtype=np.int32,
+            )
+            hidden_size = int(self.model_config.hidden_size)
+            admit_batch.spec_info = EagleDraftInput(
+                topk_p=np.ones((n_active, topk), dtype=np.float32),
+                topk_index=np.repeat(first_toks[:, None], topk, axis=1),
+                hidden_states=np.zeros((n_active, hidden_size), dtype=np.float32),
+                verified_id=first_toks,
+                accept_length=np.zeros((n_active,), dtype=np.int32),
+                allocate_lens=alloc_lens_np,
+                future_indices=req_indices_np,
+            )
+            relay_buffers = getattr(self.tp_worker, "spec_relay_buffers", None)
+            if relay_buffers is not None:
+                dp_size = int(self.dp_size)
+                per_dp_cap = max(
+                    sum(1 for r in active_reqs if _request_dp_rank(r, dp_size) == d)
+                    for d in range(dp_size)
+                )
+                per_dp_cap = max(1, per_dp_cap)
+                total_slots = dp_size * per_dp_cap
+                fut_idx_np = np.zeros((total_slots,), dtype=np.int32)
+                val_mask_np = np.zeros((total_slots,), dtype=np.bool_)
+                topk_idx_np = np.zeros((total_slots, topk), dtype=np.int32)
+                ver_id_np = np.zeros((total_slots,), dtype=np.int32)
+                new_seq_np = np.zeros((total_slots,), dtype=np.int32)
+                dp_cursors = [0] * dp_size
+                for r in active_reqs:
+                    d = _request_dp_rank(r, dp_size)
+                    slot = d * per_dp_cap + dp_cursors[d]
+                    dp_cursors[d] += 1
+                    fut_idx_np[slot] = int(r.req_pool_idx)
+                    val_mask_np[slot] = True
+                    t0 = int(r.output_ids[-1])
+                    topk_idx_np[slot, :] = t0
+                    ver_id_np[slot] = t0
+                    new_seq_np[slot] = len(r.origin_input_ids) + len(r.output_ids)
+                sh_1d = NamedSharding(self.mesh, PartitionSpec("data"))
+                sh_2d = NamedSharding(self.mesh, PartitionSpec("data", None))
+                self.tp_worker.spec_relay_buffers = update_spec_relay_buffers_admit(
+                    relay_buffers,
+                    jax.device_put(fut_idx_np, sh_1d),
+                    jax.device_put(val_mask_np, sh_1d),
+                    jax.device_put(topk_idx_np, sh_2d),
+                    jax.device_put(ver_id_np, sh_1d),
+                    jax.device_put(new_seq_np, sh_1d),
+                    dp_size=dp_size,
+                )
+
+        if self.running_batch.is_empty():
+            self.running_batch = admit_batch
+        else:
+            self.running_batch.merge_batch(admit_batch)
+        return len(admitted_reqs)
+
     def _build_kv_spec_for_req(self: Scheduler, req: Req):
         """Build per-layer ShapeDtypeStructs matching P's KV layout (and indexer_kv if present)."""
 
@@ -1625,6 +1847,7 @@ class SchedulerDisaggregationDecodeMixin:
             _pad_to_page_bucket,
             _page_transfer_axis_and_multiple,
             local_kv_spec_for_pool,
+            local_spec_meta_sharding,
         )
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -1641,6 +1864,16 @@ class SchedulerDisaggregationDecodeMixin:
         _, _, min_multiple = _page_transfer_axis_and_multiple(kv_pool)
         padded_pages = _pad_to_page_bucket(num_pages, min_multiple=min_multiple)
         indexer_buffers = getattr(kv_pool, "indexer_key_buffer", None)
+        use_spec_meta = self._use_pd_spec_meta_transfer()
+        if use_spec_meta:
+            meta_shape, meta_sharding = local_spec_meta_sharding()
+            spec_meta_spec = jax.ShapeDtypeStruct(
+                meta_shape,
+                jnp.int32,
+                sharding=meta_sharding,
+            )
+        else:
+            spec_meta_spec = None
         if jax.process_count() > 1:
             kv_spec = local_kv_spec_for_pool(kv_pool, total_layers, padded_pages)
             if indexer_buffers and total_indexer_layers > 0:
@@ -1651,7 +1884,12 @@ class SchedulerDisaggregationDecodeMixin:
                     padded_pages,
                     per_layer_tail=idx_tail,
                 )
-                return {"kv": kv_spec, "indexer_kv": idx_spec}
+                out = {"kv": kv_spec, "indexer_kv": idx_spec}
+                if spec_meta_spec is not None:
+                    out["spec_meta"] = spec_meta_spec
+                return out
+            if spec_meta_spec is not None:
+                return {"kv": kv_spec, "spec_meta": spec_meta_spec}
             return kv_spec
         per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
         shape = (padded_pages, *per_layer_tail)
@@ -1667,7 +1905,12 @@ class SchedulerDisaggregationDecodeMixin:
                 jax.ShapeDtypeStruct(idx_shape, kv_pool.dtype, sharding=sharding)
                 for _ in range(total_indexer_layers)
             ]
-            return {"kv": kv_spec, "indexer_kv": idx_spec}
+            out = {"kv": kv_spec, "indexer_kv": idx_spec}
+            if spec_meta_spec is not None:
+                out["spec_meta"] = spec_meta_spec
+            return out
+        if spec_meta_spec is not None:
+            return {"kv": kv_spec, "spec_meta": spec_meta_spec}
         return kv_spec
 
     def _install_received_kv(self: Scheduler, req: Req, kv_indices, kv) -> None:

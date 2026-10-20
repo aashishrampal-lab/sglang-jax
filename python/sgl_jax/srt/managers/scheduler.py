@@ -2172,6 +2172,13 @@ class Scheduler(
                 if cur_bs < prev_bs_per_dp[dp_rank] or self.running_batch.is_empty():
                     info.batch_is_full = False
 
+        if (
+            self.waiting_queue
+            and hasattr(self, "_admit_pd_direct_decode_reqs")
+            and any(getattr(r, "_pd_direct_decode_ready", False) for r in self.waiting_queue)
+        ):
+            self._admit_pd_direct_decode_reqs()
+
         # decode-first interleave: when enabled, force 1:N decode:prefill ratio
         # to bound Max ITL by ~prefill_chunk_time instead of letting a burst of
         # waiting prefills starve running decodes (observed 110s spike at c64).

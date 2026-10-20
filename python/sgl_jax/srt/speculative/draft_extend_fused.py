@@ -2916,23 +2916,6 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
 
-    is_disagg_prefill = (
-        getattr(getattr(spec_worker, "server_args", None), "disaggregation_mode", "null")
-        == "prefill"
-    )
-    prefill_num_layers = (
-        len(all_memory_pools) if is_disagg_prefill else draft_worker.speculative_num_steps
-    )
-    if not hasattr(draft_worker, "_fused_greedy_prefill_jit_fn"):
-        hf_config = getattr(
-            getattr(draft_worker._worker.model_runner, "model_config", None), "hf_config", None
-        )
-        draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
-            num_layers=prefill_num_layers,
-            topk=draft_worker.topk,
-            hidden_relay=mtp_hidden_relay_enabled(hf_config),
-        )
-
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
     extend_next_token_ids = getattr(model_worker_batch, "extend_next_token_ids", None)
     if extend_next_token_ids is None:
@@ -2952,6 +2935,26 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         total_bs=model_worker_batch.req_pool_indices.shape[0],
         per_dp_bs=model_worker_batch.per_dp_bs_size,
     )
+    is_disagg_prefill = (
+        getattr(getattr(spec_worker, "server_args", None), "disaggregation_mode", "null")
+        == "prefill"
+    )
+    is_intermediate_chunk = bool(
+        np.any(valid_mask) and np.all(extend_next_token_ids[valid_mask] >= 0)
+    )
+    use_kv_only = is_disagg_prefill or is_intermediate_chunk
+    prefill_num_layers = (
+        len(all_memory_pools) if use_kv_only else draft_worker.speculative_num_steps
+    )
+    if not hasattr(draft_worker, "_fused_greedy_prefill_jit_fn"):
+        hf_config = getattr(
+            getattr(draft_worker._worker.model_runner, "model_config", None), "hf_config", None
+        )
+        draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
+            num_layers=prefill_num_layers,
+            topk=draft_worker.topk,
+            hidden_relay=mtp_hidden_relay_enabled(hf_config),
+        )
     safe_indices = np.where(
         valid_mask,
         np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
@@ -2993,7 +2996,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
             dp_size=model_worker_batch.dp_size,
             per_dp_bs=model_worker_batch.per_dp_bs_size,
             update_relay=update_relay,
-            kv_only=is_disagg_prefill,
+            kv_only=use_kv_only,
         )
         cache_miss_count = count()
     prefill_output_token_ids = None
@@ -3046,7 +3049,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         host_next_token_ids = process_allgather(host_next_token_ids, tiled=True)
 
     jax.copy_to_host_async(host_next_token_ids)
-    if is_disagg_prefill:
+    if use_kv_only:
         n_sel = int(np.sum(sel)) if sel.dtype == np.bool_ else len(sel)
         model_worker_batch.spec_info_padded.hidden_states = np.zeros(
             (n_sel, hidden_size), dtype=np.float32
