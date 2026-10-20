@@ -479,11 +479,13 @@ class Scheduler(
         # model/runtime initialization. nnodes=1 does not prove one JAX process,
         # and the multimodal launch flag does not identify every model type.
         if server_args.disaggregation_enable_overlap_schedule and (
-            self.is_hybrid or self.model_config.is_multimodal or jax.process_count() != 1
+            self.is_hybrid
+            or self.model_config.is_multimodal
+            or (server_args.disaggregation_mode != "decode" and jax.process_count() != 1)
         ):
             raise ValueError(
-                "PD scheduler overlap currently requires a single-process, "
-                "full-attention text model"
+                "PD scheduler overlap currently requires a full-attention text model "
+                "(and single-process for prefill mode)"
             )
         self.sliding_window_size = None
         if self.is_hybrid:
@@ -3088,69 +3090,94 @@ class Scheduler(
                     )
                     if "__pskip_" in tid and seqlen >= target_prefix_len + self.page_size:
                         req._pd_transfer_skip_tokens = target_prefix_len
-                        last_prefix_map[dp_rank] = list(
-                            req.origin_input_ids[: target_prefix_len + 1]
-                        )
+                        last_prefix_map[dp_rank] = [
+                            list(req.origin_input_ids[: target_prefix_len + 1])
+                        ]
                     elif "__pfull_" in tid:
                         req._pd_transfer_skip_tokens = 0
                         if seqlen >= target_prefix_len + self.page_size:
-                            last_prefix_map[dp_rank] = list(
-                                req.origin_input_ids[: target_prefix_len + 1]
-                            )
+                            last_prefix_map[dp_rank] = [
+                                list(req.origin_input_ids[: target_prefix_len + 1])
+                            ]
                         else:
                             last_prefix_map.pop(dp_rank, None)
                     else:
-                        prev_prefix_ids = last_prefix_map.get(dp_rank)
+                        max_prefix_slots = (
+                            1
+                            if _SHARDED_PREFIX_PAGES > 0
+                            else int(os.environ.get("SGL_PD_MAX_PREFIX_SLOTS", "8"))
+                        )
+                        raw_slots = last_prefix_map.get(dp_rank)
+                        if not raw_slots:
+                            slot_list: list[list[int]] = []
+                        elif isinstance(raw_slots[0], int):
+                            slot_list = [raw_slots]
+                        else:
+                            slot_list = list(raw_slots)
+                        last_prefix_map[dp_rank] = slot_list
                         skip_tokens = 0
-                        if prev_prefix_ids is not None and seqlen >= self.page_size * 2:
+                        matched_idx = -1
+                        matched_lcp_tokens = 0
+                        matched_cmp_len = 0
+                        if slot_list and seqlen >= self.page_size * 2:
                             cap_cmp = min(
                                 target_prefix_len,
                                 ((seqlen - self.page_size) // self.page_size) * self.page_size,
                             )
-                            cmp_len = min(len(prev_prefix_ids), cap_cmp + 1)
-                            if cmp_len >= 4096:
-                                if req.origin_input_ids[:cmp_len] == prev_prefix_ids[:cmp_len]:
-                                    lcp_tokens = cmp_len
-                                else:
-                                    arr_cur = np.asarray(
-                                        req.origin_input_ids[:cmp_len], dtype=np.int32
-                                    )
-                                    arr_prev = np.asarray(
-                                        prev_prefix_ids[:cmp_len], dtype=np.int32
-                                    )
-                                    diff = np.nonzero(arr_cur != arr_prev)[0]
-                                    lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
-                                usable_lcp = (
-                                    max(0, lcp_tokens - 1)
-                                    if (is_spec and lcp_tokens < cmp_len)
-                                    else min(lcp_tokens, cap_cmp)
-                                )
-                                cand_skip = (usable_lcp // self.page_size) * self.page_size
-                                if cand_skip >= 4096 and seqlen >= cand_skip + self.page_size:
-                                    skip_tokens = cand_skip
-                                    if (
-                                        lcp_tokens == cmp_len
-                                        and os.environ.get("SGL_PD_MULTI_TURN_PREFIX_EXTEND", "1") == "1"
-                                    ):
-                                        cap_len = min(
-                                            target_prefix_len,
-                                            ((seqlen - self.page_size) // self.page_size) * self.page_size,
+                            for s_idx in range(len(slot_list) - 1, -1, -1):
+                                prev_prefix_ids = slot_list[s_idx]
+                                cmp_len = min(len(prev_prefix_ids), cap_cmp + 1)
+                                if cmp_len >= 4096:
+                                    if req.origin_input_ids[:cmp_len] == prev_prefix_ids[:cmp_len]:
+                                        lcp_tokens = cmp_len
+                                    else:
+                                        arr_cur = np.asarray(
+                                            req.origin_input_ids[:cmp_len], dtype=np.int32
                                         )
-                                        if cap_len > skip_tokens:
-                                            last_prefix_map[dp_rank] = list(
-                                                req.origin_input_ids[: cap_len + 1]
-                                            )
+                                        arr_prev = np.asarray(
+                                            prev_prefix_ids[:cmp_len], dtype=np.int32
+                                        )
+                                        diff = np.nonzero(arr_cur != arr_prev)[0]
+                                        lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
+                                    usable_lcp = (
+                                        max(0, lcp_tokens - 1)
+                                        if (is_spec and lcp_tokens < cmp_len)
+                                        else min(lcp_tokens, cap_cmp)
+                                    )
+                                    cand_skip = (usable_lcp // self.page_size) * self.page_size
+                                    if (
+                                        cand_skip >= 4096
+                                        and seqlen >= cand_skip + self.page_size
+                                        and cand_skip > skip_tokens
+                                    ):
+                                        skip_tokens = cand_skip
+                                        matched_idx = s_idx
+                                        matched_lcp_tokens = lcp_tokens
+                                        matched_cmp_len = cmp_len
                         req._pd_transfer_skip_tokens = skip_tokens
-                        if skip_tokens == 0:
+                        if skip_tokens > 0 and matched_idx >= 0:
+                            matched_ids = slot_list.pop(matched_idx)
+                            if (
+                                matched_lcp_tokens == matched_cmp_len
+                                and os.environ.get("SGL_PD_MULTI_TURN_PREFIX_EXTEND", "1") == "1"
+                            ):
+                                cap_len = min(
+                                    target_prefix_len,
+                                    ((seqlen - self.page_size) // self.page_size) * self.page_size,
+                                )
+                                if cap_len > skip_tokens:
+                                    matched_ids = list(req.origin_input_ids[: cap_len + 1])
+                            slot_list.append(matched_ids)
+                        elif skip_tokens == 0:
                             cap_len = min(
                                 target_prefix_len,
                                 ((seqlen - self.page_size) // self.page_size) * self.page_size,
                             )
                             if cap_len >= 4096:
-                                last_prefix_map[dp_rank] = list(
-                                    req.origin_input_ids[: cap_len + 1]
-                                )
-                            else:
+                                while len(slot_list) >= max_prefix_slots and slot_list:
+                                    slot_list.pop(0)
+                                slot_list.append(list(req.origin_input_ids[: cap_len + 1]))
+                            elif max_prefix_slots <= 1:
                                 last_prefix_map.pop(dp_rank, None)
 
             if res != AddReqResult.CONTINUE:

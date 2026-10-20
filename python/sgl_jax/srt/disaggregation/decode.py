@@ -582,22 +582,24 @@ class SchedulerDisaggregationDecodeMixin:
             return
         by_leader: dict[int, tuple[dict, list[tuple[int, dict]]]] = {}
         for dp_rank in sorted(prefix_cache.keys()):
-            entry = prefix_cache[dp_rank]
-            if (
-                entry is not None
-                and not entry.get("populated", True)
-                and entry.get("source_leader_entry") is not None
-                and entry.get("kv_indices") is not None
-            ):
-                leader_entry = entry["source_leader_entry"]
+            val = prefix_cache[dp_rank]
+            entries = val if isinstance(val, list) else ([val] if val is not None else [])
+            for entry in entries:
                 if (
-                    leader_entry.get("populated", False)
-                    and leader_entry.get("kv_indices") is not None
+                    entry is not None
+                    and not entry.get("populated", True)
+                    and entry.get("source_leader_entry") is not None
+                    and entry.get("kv_indices") is not None
                 ):
-                    lid = id(leader_entry)
-                    if lid not in by_leader:
-                        by_leader[lid] = (leader_entry, [])
-                    by_leader[lid][1].append((dp_rank, entry))
+                    leader_entry = entry["source_leader_entry"]
+                    if (
+                        leader_entry.get("populated", False)
+                        and leader_entry.get("kv_indices") is not None
+                    ):
+                        lid = id(leader_entry)
+                        if lid not in by_leader:
+                            by_leader[lid] = (leader_entry, [])
+                        by_leader[lid][1].append((dp_rank, entry))
         if not by_leader:
             return
 
@@ -762,7 +764,11 @@ class SchedulerDisaggregationDecodeMixin:
                 and all(
                     r in prefix_cache
                     and prefix_cache[r] is not None
-                    and prefix_cache[r].get("populated", False)
+                    and (
+                        any(e.get("populated", False) for e in prefix_cache[r])
+                        if isinstance(prefix_cache[r], list)
+                        else prefix_cache[r].get("populated", False)
+                    )
                     for r in range(dp_size)
                 )
             ):
@@ -1204,66 +1210,91 @@ class SchedulerDisaggregationDecodeMixin:
                 and not self.spec_algorithm.is_none()
             )
 
-            cached_entry = prefix_cache.get(decode_dp_rank)
+            max_prefix_slots = (
+                1
+                if _SHARDED_PREFIX_PAGES > 0
+                else int(os.environ.get("SGL_PD_MAX_PREFIX_SLOTS", "8"))
+            )
+            raw_slots = prefix_cache.get(decode_dp_rank)
+            if raw_slots is None:
+                slot_list: list[dict] = []
+            elif isinstance(raw_slots, list):
+                slot_list = [
+                    e
+                    for e in raw_slots
+                    if isinstance(e, dict) and e.get("kv_indices") is not None
+                ]
+            elif isinstance(raw_slots, dict):
+                slot_list = [raw_slots] if raw_slots.get("kv_indices") is not None else []
+            else:
+                slot_list = []
+            prefix_cache[decode_dp_rank] = slot_list
+
+            def _evict_prefix_entry(ev_entry: dict) -> None:
+                if ev_entry.get("kv_indices") is None:
+                    return
+                if int(ev_entry.get("ref_count", 0)) <= 0:
+                    if ev_entry.get("scatter_kv_extra") is not None:
+                        self._release_decode_kv_indices(
+                            ev_entry["scatter_kv_extra"], decode_dp_rank
+                        )
+                        ev_entry["scatter_kv_extra"] = None
+                        ev_entry["scatter_kv_indices"] = None
+                    self._release_decode_kv_indices(ev_entry["kv_indices"], decode_dp_rank)
+                    ev_entry["kv_indices"] = None
+                else:
+                    ev_entry["evict_on_zero"] = True
+
+            cached_entry = None
             reuse_skip_tokens = 0
             reuse_lcp_tokens = 0
             reuse_cmp_len = 0
-            if (
-                not force_pfull
-                and cached_entry is not None
-                and cached_entry.get("kv_indices") is not None
-                and not cached_entry.get("evict_on_zero", False)
-                and seqlen >= page_size * 2
-            ):
-                c_ids = cached_entry.get("prefix_ids", ())
-                cap_cmp = min(
-                    target_prefix_len,
-                    len(cached_entry["kv_indices"]),
-                    ((seqlen - page_size) // page_size) * page_size,
-                )
-                cmp_len = min(len(c_ids), cap_cmp + 1)
-                if cmp_len >= 4096:
-                    if entry.req.origin_input_ids[:cmp_len] == c_ids[:cmp_len]:
-                        lcp_tokens = cmp_len
-                    else:
-                        arr_cur = np.asarray(
-                            entry.req.origin_input_ids[:cmp_len], dtype=np.int32
-                        )
-                        arr_prev = np.asarray(c_ids[:cmp_len], dtype=np.int32)
-                        diff = np.nonzero(arr_cur != arr_prev)[0]
-                        lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
-                    usable_lcp = (
-                        max(0, lcp_tokens - 1)
-                        if (is_spec and lcp_tokens < cmp_len)
-                        else min(lcp_tokens, cap_cmp)
-                    )
-                    cand_skip = (usable_lcp // page_size) * page_size
+            if not force_pfull and slot_list and seqlen >= page_size * 2:
+                for cand_entry in reversed(slot_list):
                     if (
-                        cand_skip >= 4096
-                        and seqlen >= cand_skip + page_size
-                        and (_SHARDED_PREFIX_PAGES == 0 or cand_skip == target_prefix_len)
+                        cand_entry.get("kv_indices") is None
+                        or cand_entry.get("evict_on_zero", False)
                     ):
-                        reuse_skip_tokens = cand_skip
-                        reuse_lcp_tokens = lcp_tokens
-                        reuse_cmp_len = cmp_len
-            can_reuse_prefix = reuse_skip_tokens > 0
-            if (
-                not can_reuse_prefix
-                and cached_entry is not None
-                and cached_entry.get("ref_count", 0) <= 0
-            ):
-                if cached_entry.get("scatter_kv_extra") is not None:
-                    self._release_decode_kv_indices(
-                        cached_entry["scatter_kv_extra"], decode_dp_rank
+                        continue
+                    c_ids = cand_entry.get("prefix_ids", ())
+                    cap_cmp = min(
+                        target_prefix_len,
+                        len(cand_entry["kv_indices"]),
+                        ((seqlen - page_size) // page_size) * page_size,
                     )
-                    cached_entry["scatter_kv_extra"] = None
-                    cached_entry["scatter_kv_indices"] = None
-                old_kv = cached_entry.get("kv_indices")
-                if old_kv is not None:
-                    self._release_decode_kv_indices(old_kv, decode_dp_rank)
-                    cached_entry["kv_indices"] = None
-                prefix_cache.pop(decode_dp_rank, None)
-                cached_entry = None
+                    cmp_len = min(len(c_ids), cap_cmp + 1)
+                    if cmp_len >= 4096:
+                        if entry.req.origin_input_ids[:cmp_len] == c_ids[:cmp_len]:
+                            lcp_tokens = cmp_len
+                        else:
+                            arr_cur = np.asarray(
+                                entry.req.origin_input_ids[:cmp_len], dtype=np.int32
+                            )
+                            arr_prev = np.asarray(c_ids[:cmp_len], dtype=np.int32)
+                            diff = np.nonzero(arr_cur != arr_prev)[0]
+                            lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
+                        usable_lcp = (
+                            max(0, lcp_tokens - 1)
+                            if (is_spec and lcp_tokens < cmp_len)
+                            else min(lcp_tokens, cap_cmp)
+                        )
+                        cand_skip = (usable_lcp // page_size) * page_size
+                        if (
+                            cand_skip >= 4096
+                            and seqlen >= cand_skip + page_size
+                            and (_SHARDED_PREFIX_PAGES == 0 or cand_skip == target_prefix_len)
+                            and cand_skip > reuse_skip_tokens
+                        ):
+                            cached_entry = cand_entry
+                            reuse_skip_tokens = cand_skip
+                            reuse_lcp_tokens = lcp_tokens
+                            reuse_cmp_len = cmp_len
+            can_reuse_prefix = reuse_skip_tokens > 0 and cached_entry is not None
+            if not can_reuse_prefix and (force_pfull or max_prefix_slots <= 1):
+                for ev_e in list(slot_list):
+                    if int(ev_e.get("ref_count", 0)) <= 0:
+                        _evict_prefix_entry(ev_e)
+                        slot_list.remove(ev_e)
 
             can_bcast_from_leader = False
             leader_entry = None
@@ -1304,7 +1335,7 @@ class SchedulerDisaggregationDecodeMixin:
             req_sp = getattr(entry.req, "sampling_params", None)
             req_max_new = int(getattr(req_sp, "max_new_tokens", 0) or 0)
             if not getattr(req_sp, "ignore_eos", False):
-                req_max_new = min(req_max_new, 16384)
+                req_max_new = min(req_max_new, reserved_per)
             eff_reserved_per = max(
                 reserved_per, ((req_max_new + page_size - 1) // page_size) * page_size
             )
@@ -1318,7 +1349,7 @@ class SchedulerDisaggregationDecodeMixin:
                     r_sp = getattr(r_req, "sampling_params", None)
                     r_max = int(getattr(r_sp, "max_new_tokens", 0) or reserved_per)
                     if not getattr(r_sp, "ignore_eos", False):
-                        r_max = min(r_max, 16384)
+                        r_max = min(r_max, reserved_per)
                     r_aligned = ((r_max + page_size - 1) // page_size) * page_size
                     r_gen = len(getattr(r_req, "output_ids", ()) or ())
                     running_rem_tokens += max(reserved_per, r_aligned - r_gen)
@@ -1338,6 +1369,21 @@ class SchedulerDisaggregationDecodeMixin:
                 if (not can_reuse_prefix and seqlen >= target_prefix_len + page_size)
                 else 0
             )
+            if (
+                not can_reuse_prefix
+                and slot_list
+                and alloc_tokens + reserved + extra_wave_reserve
+                > allocator.available_size(decode_dp_rank)
+            ):
+                for ev_e in list(slot_list):
+                    if (
+                        alloc_tokens + reserved + extra_wave_reserve
+                        <= allocator.available_size(decode_dp_rank)
+                    ):
+                        break
+                    if int(ev_e.get("ref_count", 0)) <= 0:
+                        _evict_prefix_entry(ev_e)
+                        slot_list.remove(ev_e)
             if alloc_tokens + reserved + extra_wave_reserve > allocator.available_size(decode_dp_rank):
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
@@ -1418,6 +1464,9 @@ class SchedulerDisaggregationDecodeMixin:
                     active_wave_dpseq = dpseq
                 self._pd_next_expected_dpseq[decode_dp_rank] = dpseq + 1
             if can_reuse_prefix and cached_entry is not None:
+                if cached_entry in slot_list:
+                    slot_list.remove(cached_entry)
+                slot_list.append(cached_entry)
                 cached_entry["ref_count"] = int(cached_entry.get("ref_count", 0)) + 1
                 entry.req._pd_shared_prefix_entry = cached_entry
                 prefix_len = skip_tokens if shard_prefix_len == 0 else eff_prefix_len
@@ -1447,18 +1496,13 @@ class SchedulerDisaggregationDecodeMixin:
                     0 if shard_prefix_len == 0 else (target_prefix_len - eff_prefix_len)
                 )
             elif can_bcast_from_leader and leader_entry is not None:
-                if cached_entry is not None and cached_entry.get("kv_indices") is not None:
-                    if int(cached_entry.get("ref_count", 0)) <= 0:
-                        if cached_entry.get("scatter_kv_extra") is not None:
-                            self._release_decode_kv_indices(
-                                cached_entry["scatter_kv_extra"], decode_dp_rank
-                            )
-                            cached_entry["scatter_kv_extra"] = None
-                            cached_entry["scatter_kv_indices"] = None
-                        self._release_decode_kv_indices(cached_entry["kv_indices"], decode_dp_rank)
-                        cached_entry["kv_indices"] = None
-                    else:
-                        cached_entry["evict_on_zero"] = True
+                while len(slot_list) >= max_prefix_slots and slot_list:
+                    ev_victim = next(
+                        (e for e in slot_list if int(e.get("ref_count", 0)) <= 0),
+                        slot_list[0],
+                    )
+                    slot_list.remove(ev_victim)
+                    _evict_prefix_entry(ev_victim)
                 new_cache_entry = {
                     "prefix_ids": list(entry.req.origin_input_ids[: target_prefix_len + 1]),
                     "kv_indices": prefix_kv_indices,
@@ -1471,28 +1515,23 @@ class SchedulerDisaggregationDecodeMixin:
                     "dp_rank": decode_dp_rank,
                 }
                 leader_entry["ref_count"] = int(leader_entry.get("ref_count", 0)) + 1
-                prefix_cache[decode_dp_rank] = new_cache_entry
+                slot_list.append(new_cache_entry)
                 entry.req._pd_shared_prefix_entry = new_cache_entry
                 entry.req._pd_shared_prefix_len = eff_prefix_len
                 entry.req._pd_seq_pos_offset = target_prefix_len - eff_prefix_len
             else:
-                if cached_entry is not None and cached_entry.get("kv_indices") is not None:
-                    if int(cached_entry.get("ref_count", 0)) <= 0:
-                        if cached_entry.get("scatter_kv_extra") is not None:
-                            self._release_decode_kv_indices(
-                                cached_entry["scatter_kv_extra"], decode_dp_rank
-                            )
-                            cached_entry["scatter_kv_extra"] = None
-                            cached_entry["scatter_kv_indices"] = None
-                        self._release_decode_kv_indices(cached_entry["kv_indices"], decode_dp_rank)
-                        cached_entry["kv_indices"] = None
-                    else:
-                        cached_entry["evict_on_zero"] = True
                 cap_len = min(
                     target_prefix_len,
                     ((seqlen - page_size) // page_size) * page_size,
                 )
                 if cap_len >= 4096 and (shard_prefix_len == 0 or seqlen >= target_prefix_len + page_size):
+                    while len(slot_list) >= max_prefix_slots and slot_list:
+                        ev_victim = next(
+                            (e for e in slot_list if int(e.get("ref_count", 0)) <= 0),
+                            slot_list[0],
+                        )
+                        slot_list.remove(ev_victim)
+                        _evict_prefix_entry(ev_victim)
                     kv_indices_np = np.asarray(kv_indices)
                     store_kv_len = eff_prefix_len if shard_prefix_len > 0 else cap_len
                     new_cache_entry = {
@@ -1514,7 +1553,7 @@ class SchedulerDisaggregationDecodeMixin:
                         "source_leader_entry": None,
                         "dp_rank": decode_dp_rank,
                     }
-                    prefix_cache[decode_dp_rank] = new_cache_entry
+                    slot_list.append(new_cache_entry)
                     self._pd_latest_leader_prefix = new_cache_entry
                     entry.req._pd_shared_prefix_entry = new_cache_entry
                     entry.req._pd_shared_prefix_len = store_kv_len
@@ -1522,6 +1561,10 @@ class SchedulerDisaggregationDecodeMixin:
                         target_prefix_len - eff_prefix_len if shard_prefix_len > 0 else 0
                     )
                 else:
+                    if max_prefix_slots <= 1:
+                        for ev_e in list(slot_list):
+                            _evict_prefix_entry(ev_e)
+                        slot_list.clear()
                     entry.req._pd_shared_prefix_entry = None
                     entry.req._pd_shared_prefix_len = 0
                     entry.req._pd_seq_pos_offset = 0

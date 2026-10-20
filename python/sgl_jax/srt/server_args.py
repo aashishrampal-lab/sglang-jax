@@ -426,16 +426,18 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+        max_decode_mem = float(os.environ.get("SGL_DECODE_MAX_MEM_FRACTION", "0.86"))
         if (
             self.disaggregation_mode == "decode"
             and self.mem_fraction_static is not None
-            and self.mem_fraction_static > 0.81
+            and self.mem_fraction_static > max_decode_mem
         ):
             logger.info(
-                "Clamping decode mem_fraction_static from %.3f to 0.810 for runtime XLA/pull headroom",
+                "Clamping decode mem_fraction_static from %.3f to %.3f for runtime XLA/pull headroom",
                 self.mem_fraction_static,
+                max_decode_mem,
             )
-            self.mem_fraction_static = 0.81
+            self.mem_fraction_static = max_decode_mem
         elif (
             self.disaggregation_mode == "prefill"
             and self.context_length is not None
@@ -767,18 +769,22 @@ class ServerArgs:
         option = "--disaggregation-enable-overlap-schedule"
         if self.disaggregation_mode not in ("prefill", "decode"):
             raise ValueError(f"{option} requires --disaggregation-mode prefill or decode")
-        if not self.disaggregation_use_raiden:
-            raise ValueError(f"{option} requires --disaggregation-use-raiden")
+        if self.disaggregation_mode == "prefill" and not self.disaggregation_use_raiden:
+            raise ValueError(f"{option} with prefill mode requires --disaggregation-use-raiden")
         if not self.disable_radix_cache:
             raise ValueError(f"{option} requires --disable-radix-cache")
-        if self.nnodes != 1:
-            raise ValueError(f"{option} requires --nnodes=1 per serving instance")
+        if self.disaggregation_mode == "prefill" and self.nnodes != 1:
+            raise ValueError(f"{option} with prefill mode requires --nnodes=1 per serving instance")
         if self.pd_disaggregation:
             raise ValueError(f"{option} does not support --pd-disaggregation (Pathways)")
         if self.disable_overlap_schedule:
             raise ValueError(f"{option} conflicts with --disable-overlap-schedule")
-        if self.speculative_algorithm and self.speculative_algorithm.strip():
-            raise ValueError(f"{option} does not support --speculative-algorithm")
+        if (
+            self.disaggregation_mode == "prefill"
+            and self.speculative_algorithm
+            and self.speculative_algorithm.strip()
+        ):
+            raise ValueError(f"{option} with prefill mode does not support --speculative-algorithm")
         if self.enable_lora or self.enable_static_lora or self.lora_paths:
             raise ValueError(f"{option} does not support LoRA")
         if self.hicache_storage != "disable":
