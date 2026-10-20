@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+import numpy as np
 
 from sgl_jax.srt.disaggregation.base.kv_manager import (
     KVPoll,
@@ -640,9 +641,12 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         try:
             if "spec_meta" in results:
                 with suppress(Exception):
-                    self.first_output_id = int(
-                        np.asarray(results["spec_meta"]).reshape(-1)[0]
-                    )
+                    spec_meta_arr = results["spec_meta"]
+                    shards = getattr(spec_meta_arr, "addressable_shards", None)
+                    if shards:
+                        self.first_output_id = int(np.asarray(shards[0].data).reshape(-1)[0])
+                    else:
+                        self.first_output_id = int(np.asarray(spec_meta_arr).reshape(-1)[0])
             if "indexer_kv" in results:
                 install((results["kv"], results["indexer_kv"]))
             else:

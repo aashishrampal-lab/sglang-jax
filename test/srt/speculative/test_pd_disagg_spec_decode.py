@@ -1456,6 +1456,103 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             self.assertEqual(int(np.asarray(updated.new_seq_lens)[0, 1]), 17)
             self.assertEqual(int(np.asarray(updated.new_seq_lens)[1, 2]), 33)
 
+            # Also verify _admit_pd_direct_decode_reqs end-to-end with draft_worker.spec_relay_buffers
+            class _DummyReqPool:
+                def __init__(self):
+                    self.req_to_token = np.zeros((4, 32), dtype=np.int32)
+                    self._next = [0, 0]
+
+                def available_size(self, dp_rank=0):
+                    return 4 - self._next[dp_rank]
+
+                def alloc(self, n, dp_rank=0):
+                    idx = self._next[dp_rank]
+                    self._next[dp_rank] += n
+                    return [idx]
+
+                def write(self, key, val):
+                    row, sl = key
+                    self.req_to_token[row, sl] = val
+
+            req0 = Req(
+                rid="r0",
+                origin_input_text="",
+                origin_input_ids=list(range(10, 26)),
+                sampling_params=SamplingParams(max_new_tokens=8, temperature=0.0),
+            )
+            req0.dp_rank = 0
+            req0._pd_direct_decode_ready = True
+            req0._pd_first_output_id = 101
+            req0._pd_prealloc_kv_indices = np.arange(16, dtype=np.int32)
+
+            req1 = Req(
+                rid="r1",
+                origin_input_text="",
+                origin_input_ids=list(range(30, 46)),
+                sampling_params=SamplingParams(max_new_tokens=8, temperature=0.0),
+            )
+            req1.dp_rank = 1
+            req1._pd_direct_decode_ready = True
+            req1._pd_first_output_id = 202
+            req1._pd_prealloc_kv_indices = np.arange(16, 32, dtype=np.int32)
+
+            req_pool = _DummyReqPool()
+            empty_running = ScheduleBatch.init_new(
+                [[], []],
+                req_pool,
+                SimpleNamespace(page_size=64),
+                SimpleNamespace(),
+                SimpleNamespace(hidden_size=4),
+                True,
+                2,
+                spec_algorithm=SpeculativeAlgorithm.NEXTN,
+                mesh=mesh,
+            )
+            draft_worker = SimpleNamespace(spec_relay_buffers=updated)
+            sched = SimpleNamespace(
+                waiting_queue=[req0, req1],
+                running_batch=empty_running,
+                max_total_num_tokens=1024,
+                dp_size=2,
+                server_args=SimpleNamespace(
+                    max_running_requests=16,
+                    speculative_eagle_topk=1,
+                    speculative_num_steps=1,
+                ),
+                req_to_token_pool=req_pool,
+                token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+                tree_cache=SimpleNamespace(cache_finished_req=lambda r: None),
+                model_config=SimpleNamespace(hidden_size=4),
+                enable_overlap=True,
+                spec_algorithm=SpeculativeAlgorithm.NEXTN,
+                mesh=mesh,
+                draft_worker=draft_worker,
+                tp_worker=SimpleNamespace(spec_relay_buffers=None),
+                _is_spec_decode_enabled=lambda: True,
+                _pd_chunk_cache_finished_req=lambda r: None,
+                stream_output=lambda reqs, ret_logprob: None,
+            )
+            n_admitted = SchedulerDecodeMixin._admit_pd_direct_decode_reqs(sched)
+            self.assertEqual(n_admitted, 2)
+            self.assertEqual(len(sched.waiting_queue), 0)
+            self.assertEqual(sched.running_batch.batch_size(), 2)
+            self.assertEqual(list(sched.running_batch.reqs_info[0].output_ids), [101])
+            self.assertEqual(list(sched.running_batch.reqs_info[1].output_ids), [202])
+            self.assertIsNone(sched.running_batch.reqs_info[0].spec_info.topk_index)
+            self.assertIsNotNone(sched.running_batch.reqs_info[0].spec_info.future_indices)
+            self.assertEqual(
+                int(np.asarray(draft_worker.spec_relay_buffers.verified_id)[0, 0]), 101
+            )
+            self.assertEqual(
+                int(np.asarray(draft_worker.spec_relay_buffers.verified_id)[1, 0]), 202
+            )
+            self.assertEqual(
+                int(np.asarray(draft_worker.spec_relay_buffers.new_seq_lens)[0, 0]), 17
+            )
+            self.assertEqual(
+                int(np.asarray(draft_worker.spec_relay_buffers.new_seq_lens)[1, 0]), 17
+            )
+
     def test_patch_tarball_contains_all_modified_files(self):
         """Verify /tmp/patch.tar.xz contains all modified files in python/sgl_jax/srt byte-for-byte."""
         import subprocess

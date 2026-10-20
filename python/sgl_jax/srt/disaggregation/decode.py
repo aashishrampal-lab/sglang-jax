@@ -1649,6 +1649,8 @@ class SchedulerDisaggregationDecodeMixin:
             return 0
         from jax.sharding import NamedSharding, PartitionSpec
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+        from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
         from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
         from sgl_jax.srt.speculative.relay_buffer import update_spec_relay_buffers_admit
 
@@ -1688,6 +1690,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue = remaining_waiting
         is_spec = self._is_spec_decode_enabled()
         topk = int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1)
+        num_steps = int(getattr(self.server_args, "speculative_num_steps", 1) or 1)
 
         admitted_reqs: list[Req] = []
         for req in ready_reqs:
@@ -1699,13 +1702,15 @@ class SchedulerDisaggregationDecodeMixin:
             req.req_pool_idx = req_pool_indices[0]
             pos_off = int(getattr(req, "_pd_seq_pos_offset", 0) or 0)
             seqlen = len(req.origin_input_ids) - pos_off
-            prealloc = np.asarray(req._decode_prealloc_tokens, dtype=np.int32)
+            raw_prealloc = getattr(req, "_pd_prealloc_kv_indices", None)
+            if raw_prealloc is None:
+                raw_prealloc = getattr(req, "_decode_prealloc_tokens", None)
+            prealloc = np.asarray(raw_prealloc if raw_prealloc is not None else [], dtype=np.int32)
             write_len = min(seqlen, len(prealloc))
-            self.req_to_token_pool.write((req.req_pool_idx, slice(0, write_len)), prealloc[:write_len])
-            if len(prealloc) > seqlen:
-                req._decode_prealloc_tokens = prealloc[seqlen:]
-            else:
-                req._decode_prealloc_tokens = np.empty((0,), dtype=np.int32)
+            if write_len > 0:
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, write_len)), prealloc[:write_len]
+                )
             req.kv_committed_len = seqlen
             req.kv_allocated_len = seqlen
             req.fill_ids = list(req.origin_input_ids)
@@ -1717,7 +1722,6 @@ class SchedulerDisaggregationDecodeMixin:
             if req.finished():
                 self._pd_chunk_cache_finished_req(req)
                 self.tree_cache.cache_finished_req(req)
-                req._decode_prealloc_tokens = None
             req._pd_direct_decode_ready = False
             admitted_reqs.append(req)
 
@@ -1729,24 +1733,39 @@ class SchedulerDisaggregationDecodeMixin:
         if not active_reqs:
             return len(admitted_reqs)
 
+        reqs_per_dp: list[list[Req]] = [[] for _ in range(self.dp_size)]
+        for r in active_reqs:
+            reqs_per_dp[_request_dp_rank(r, self.dp_size)].append(r)
+
         admit_batch = ScheduleBatch.init_new(
-            active_reqs,
+            reqs_per_dp,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            self.spec_algorithm,
-            self.server_args.chunked_prefill_size,
-            self.mesh,
-            self.server_args.precompile_bs_paddings,
+            self.dp_size,
+            spec_algorithm=self.spec_algorithm,
+            mesh=self.mesh,
+            embedding_pool=getattr(self, "embedding_pool", None),
         )
+        relay_owner = (
+            getattr(self, "draft_worker", None)
+            if getattr(getattr(self, "draft_worker", None), "spec_relay_buffers", None) is not None
+            else getattr(self, "tp_worker", None)
+        )
+        relay_buffers = (
+            getattr(relay_owner, "spec_relay_buffers", None) if relay_owner is not None else None
+        )
+        hidden_size = int(getattr(self.model_config, "hidden_size", 1) or 1)
+        topk_width = num_steps if num_steps > 1 and topk == 1 else topk
+
         for dp_rank, info in enumerate(admit_batch.reqs_info):
             if not info.reqs:
                 continue
-            info.req_pool_indices = [r.req_pool_idx for r in info.reqs]
+            info.req_pool_indices = np.asarray([r.req_pool_idx for r in info.reqs], dtype=np.int32)
             if is_spec:
-                info.seq_lens = [
+                seq_lens_list = [
                     len(r.origin_input_ids)
                     - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
                     + len(r.output_ids)
@@ -1756,7 +1775,7 @@ class SchedulerDisaggregationDecodeMixin:
                     len(r.origin_input_ids) + len(r.output_ids) for r in info.reqs
                 ]
             else:
-                info.seq_lens = [
+                seq_lens_list = [
                     len(r.origin_input_ids)
                     - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
                     + max(0, len(r.output_ids) - 1)
@@ -1766,73 +1785,83 @@ class SchedulerDisaggregationDecodeMixin:
                     len(r.origin_input_ids) + max(0, len(r.output_ids) - 1)
                     for r in info.reqs
                 ]
+            info.seq_lens = np.asarray(seq_lens_list, dtype=np.int32)
+            info.seq_lens_sum = int(info.seq_lens.sum())
             info.extend_lens = [1] * len(info.reqs)
             info.prefix_lens = [
                 len(r.origin_input_ids) - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
                 for r in info.reqs
             ]
-            info.positions = list(info.seq_lens)
-            info.output_ids = [int(r.output_ids[-1]) for r in info.reqs]
+            info.positions = list(seq_lens_list)
+            info.output_ids = np.asarray([int(r.output_ids[-1]) for r in info.reqs], dtype=np.int32)
+            if self.model_config is not None and hasattr(self.model_config, "vocab_size"):
+                info.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                    info,
+                    self.model_config.vocab_size,
+                    batch=admit_batch,
+                )
+            if is_spec:
+                n_dp = len(info.reqs)
+                first_toks_dp = info.output_ids
+                if relay_buffers is not None:
+                    info.spec_info = EagleDraftInput(
+                        future_indices=info.req_pool_indices,
+                        allocate_lens=info.seq_lens.copy(),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                    )
+                else:
+                    info.spec_info = EagleDraftInput(
+                        topk_p=np.ones((n_dp, topk_width), dtype=np.float32),
+                        topk_index=np.repeat(first_toks_dp[:, None], topk_width, axis=1),
+                        hidden_states=np.zeros((n_dp, hidden_size), dtype=np.float32),
+                        verified_id=first_toks_dp.copy(),
+                        accept_length=np.zeros((n_dp,), dtype=np.int32),
+                        allocate_lens=info.seq_lens.copy(),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                    )
 
-        if is_spec:
-            n_active = len(active_reqs)
-            first_toks = np.asarray([int(r.output_ids[-1]) for r in active_reqs], dtype=np.int32)
-            req_indices_np = np.asarray([r.req_pool_idx for r in active_reqs], dtype=np.int32)
-            alloc_lens_np = np.asarray(
-                [
+        if is_spec and relay_buffers is not None:
+            dp_size = int(self.dp_size)
+            per_dp_cap = max(len(r_list) for r_list in reqs_per_dp)
+            per_dp_cap = max(1, per_dp_cap)
+            total_slots = dp_size * per_dp_cap
+            fut_idx_np = np.zeros((total_slots,), dtype=np.int32)
+            val_mask_np = np.zeros((total_slots,), dtype=np.bool_)
+            relay_num_steps = int(relay_buffers.topk_index.shape[-1])
+            topk_idx_np = np.zeros((total_slots, relay_num_steps), dtype=np.int32)
+            ver_id_np = np.zeros((total_slots,), dtype=np.int32)
+            new_seq_np = np.zeros((total_slots,), dtype=np.int32)
+            dp_cursors = [0] * dp_size
+            for r in active_reqs:
+                d = _request_dp_rank(r, dp_size)
+                slot = d * per_dp_cap + dp_cursors[d]
+                dp_cursors[d] += 1
+                fut_idx_np[slot] = int(r.req_pool_idx)
+                val_mask_np[slot] = True
+                t0 = int(r.output_ids[-1])
+                topk_idx_np[slot, :] = t0
+                ver_id_np[slot] = t0
+                new_seq_np[slot] = (
                     len(r.origin_input_ids)
                     - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
                     + len(r.output_ids)
-                    for r in active_reqs
-                ],
-                dtype=np.int32,
-            )
-            hidden_size = int(self.model_config.hidden_size)
-            admit_batch.spec_info = EagleDraftInput(
-                topk_p=np.ones((n_active, topk), dtype=np.float32),
-                topk_index=np.repeat(first_toks[:, None], topk, axis=1),
-                hidden_states=np.zeros((n_active, hidden_size), dtype=np.float32),
-                verified_id=first_toks,
-                accept_length=np.zeros((n_active,), dtype=np.int32),
-                allocate_lens=alloc_lens_np,
-                future_indices=req_indices_np,
-            )
-            relay_buffers = getattr(self.tp_worker, "spec_relay_buffers", None)
-            if relay_buffers is not None:
-                dp_size = int(self.dp_size)
-                per_dp_cap = max(
-                    sum(1 for r in active_reqs if _request_dp_rank(r, dp_size) == d)
-                    for d in range(dp_size)
                 )
-                per_dp_cap = max(1, per_dp_cap)
-                total_slots = dp_size * per_dp_cap
-                fut_idx_np = np.zeros((total_slots,), dtype=np.int32)
-                val_mask_np = np.zeros((total_slots,), dtype=np.bool_)
-                topk_idx_np = np.zeros((total_slots, topk), dtype=np.int32)
-                ver_id_np = np.zeros((total_slots,), dtype=np.int32)
-                new_seq_np = np.zeros((total_slots,), dtype=np.int32)
-                dp_cursors = [0] * dp_size
-                for r in active_reqs:
-                    d = _request_dp_rank(r, dp_size)
-                    slot = d * per_dp_cap + dp_cursors[d]
-                    dp_cursors[d] += 1
-                    fut_idx_np[slot] = int(r.req_pool_idx)
-                    val_mask_np[slot] = True
-                    t0 = int(r.output_ids[-1])
-                    topk_idx_np[slot, :] = t0
-                    ver_id_np[slot] = t0
-                    new_seq_np[slot] = len(r.origin_input_ids) + len(r.output_ids)
-                sh_1d = NamedSharding(self.mesh, PartitionSpec("data"))
-                sh_2d = NamedSharding(self.mesh, PartitionSpec("data", None))
-                self.tp_worker.spec_relay_buffers = update_spec_relay_buffers_admit(
-                    relay_buffers,
-                    jax.device_put(fut_idx_np, sh_1d),
-                    jax.device_put(val_mask_np, sh_1d),
-                    jax.device_put(topk_idx_np, sh_2d),
-                    jax.device_put(ver_id_np, sh_1d),
-                    jax.device_put(new_seq_np, sh_1d),
-                    dp_size=dp_size,
-                )
+            sh_1d = NamedSharding(self.mesh, PartitionSpec("data"))
+            sh_2d = NamedSharding(self.mesh, PartitionSpec("data", None))
+            updated_relay = update_spec_relay_buffers_admit(
+                relay_buffers,
+                jax.device_put(fut_idx_np, sh_1d),
+                jax.device_put(val_mask_np, sh_1d),
+                jax.device_put(topk_idx_np, sh_2d),
+                jax.device_put(ver_id_np, sh_1d),
+                jax.device_put(new_seq_np, sh_1d),
+                dp_size=dp_size,
+            )
+            relay_owner.spec_relay_buffers = updated_relay
 
         if self.running_batch.is_empty():
             self.running_batch = admit_batch
