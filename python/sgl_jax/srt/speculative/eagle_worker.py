@@ -295,24 +295,47 @@ class EAGLEWorker(BaseSpecWorker):
 
                 greedy_modes = (True, False) if bs == shapes[0][0] else (False,)
                 for is_greedy in greedy_modes:
-                    model_worker_batch = _make_decode_batch()
-                    model_worker_batch.sampling_info.is_all_greedy = is_greedy
-                    if self.spec_relay_buffers is not None:
-                        spec_info = _make_relay_spec_info(model_worker_batch)
-                    else:
+                    top_p_modes = (False,) if is_greedy else (True, False) if bs == shapes[0][0] else (True,)
+                    for use_top_p in top_p_modes:
+                        model_worker_batch = _make_decode_batch()
+                        model_worker_batch.sampling_info.is_all_greedy = is_greedy
+                        if not is_greedy and use_top_p:
+                            model_worker_batch.sampling_info.top_ps = np.full(
+                                (bs,), 0.95, dtype=np.float32
+                            )
                         spec_info = _make_non_relay_spec_info(model_worker_batch)
-                    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-                    model_worker_batch.spec_info_padded = spec_info
-                    model_worker_batch.speculative_eagle_topk = self.topk
-                    model_worker_batch.speculative_num_draft_tokens = (
-                        self.speculative_num_draft_tokens
-                    )
-                    model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                    if self.spec_relay_buffers is not None:
-                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
-                        jax.block_until_ready(self.spec_relay_buffers)
-                    else:
-                        self.forward_batch_speculative_generation(model_worker_batch)
+                        if self.spec_relay_buffers is not None:
+                            if bs == shapes[0][0] and use_top_p == top_p_modes[0]:
+                                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                                model_worker_batch.spec_info_padded = spec_info
+                                model_worker_batch.speculative_eagle_topk = self.topk
+                                model_worker_batch.speculative_num_draft_tokens = (
+                                    self.speculative_num_draft_tokens
+                                )
+                                model_worker_batch.speculative_num_steps = (
+                                    self.speculative_num_steps
+                                )
+                                self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                                jax.block_until_ready(self.spec_relay_buffers)
+                                model_worker_batch = _make_decode_batch()
+                                model_worker_batch.sampling_info.is_all_greedy = is_greedy
+                                if not is_greedy and use_top_p:
+                                    model_worker_batch.sampling_info.top_ps = np.full(
+                                        (bs,), 0.95, dtype=np.float32
+                                    )
+                            spec_info = _make_relay_spec_info(model_worker_batch)
+                        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                        model_worker_batch.spec_info_padded = spec_info
+                        model_worker_batch.speculative_eagle_topk = self.topk
+                        model_worker_batch.speculative_num_draft_tokens = (
+                            self.speculative_num_draft_tokens
+                        )
+                        model_worker_batch.speculative_num_steps = self.speculative_num_steps
+                        if self.spec_relay_buffers is not None:
+                            self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                            jax.block_until_ready(self.spec_relay_buffers)
+                        else:
+                            self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
