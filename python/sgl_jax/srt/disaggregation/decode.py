@@ -2106,7 +2106,7 @@ class SchedulerDisaggregationDecodeMixin:
             kv_cursor = 0
             idx_cursor = 0
             use_fused_scatter = (
-                os.environ.get("SGL_FUSED_KV_SCATTER", "1") == "1" and padded_pages <= 256
+                os.environ.get("SGL_FUSED_KV_SCATTER", "0") == "1" and padded_pages <= 256
             )
             for pool in all_pools:
                 n_layers = pool.layer_num
