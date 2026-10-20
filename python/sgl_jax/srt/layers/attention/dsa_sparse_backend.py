@@ -937,6 +937,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             )
             out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
+            tpages_width = int(topk_pages.shape[-1]) if has_pages else 0
+
             def _run_cached(
                 ql_, qpe_, kvc_, kpe_, cache_, seq_lens_, pi_, sp_kv_len_, sp_pi_, sp_cuq_, sp_cukv_, sp_dist_
             ):
@@ -949,8 +951,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                         if exact_page_budget
                         else min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1
                     )
-                elif has_pages and topk_pages.shape[-1] < 512:
-                    k_pages_max = min(topk_pages.shape[-1] + 1, pages_per_seq + 1)
+                elif has_pages and tpages_width < 512:
+                    k_pages_max = min(tpages_width + 1, pages_per_seq + 1)
                 else:
                     k_pages_max = 512
                 k_pages_max = min(k_pages_max, max_k_pages_smem)
@@ -961,7 +963,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     kpe_,
                     cache_,
                     seq_lens_,
-                    topk[:1],
+                    jnp.zeros((1, 1), dtype=jnp.int32),
                     pi_,
                     sp_cuq_,
                     sp_cukv_,
