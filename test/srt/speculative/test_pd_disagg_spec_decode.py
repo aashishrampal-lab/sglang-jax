@@ -1106,8 +1106,8 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             def_mod.spec_decode_verify = orig_spec_decode_verify
             def_mod.draft_extend_for_decode = orig_fused_de
 
-        self.assertEqual(spec_decode_greedy_flags, [True, False])
-        self.assertEqual(fused_draft_extend_calls, [True, False])
+        self.assertEqual(spec_decode_greedy_flags, [True, False, False])
+        self.assertEqual(fused_draft_extend_calls, [True, False, False])
 
     def test_non_overlap_restore_draft_extend_and_merge_with_extend_ranks(self):
         """Verify non-overlap restore_draft_extend_result + _split_spec_info_per_rank + _concat_spec_info_per_rank across mixed DECODE and EXTEND DP ranks."""
