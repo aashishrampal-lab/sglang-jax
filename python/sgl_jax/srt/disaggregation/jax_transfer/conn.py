@@ -600,6 +600,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._state_lock = threading.Lock()
         self._holds_pull_sem = False
         self.first_output_id: int = -1
+        self.initial_draft_ids: list[int] | None = None
 
     def _release_pull_sem(self) -> None:
         with self._state_lock:
@@ -644,18 +645,23 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     spec_meta_arr = results["spec_meta"]
                     shards = getattr(spec_meta_arr, "addressable_shards", None)
                     if shards:
-                        self.first_output_id = int(np.asarray(shards[0].data).reshape(-1)[0])
+                        meta_host = np.asarray(shards[0].data)
                     else:
-                        self.first_output_id = int(np.asarray(spec_meta_arr).reshape(-1)[0])
+                        meta_host = np.asarray(spec_meta_arr)
+                    row0 = meta_host[0] if meta_host.ndim >= 2 else meta_host.reshape(-1)
+                    self.first_output_id = int(row0[0])
+                    drafts = [int(x) for x in row0[1:] if int(x) >= 0]
+                    self.initial_draft_ids = drafts if drafts else None
             if "indexer_kv" in results:
                 install((results["kv"], results["indexer_kv"]))
             else:
                 install(results["kv"])
         finally:
-            for _r in results.values():
-                for _leaf in jax.tree.leaves(_r):
+            if "spec_meta" in results:
+                for _leaf in jax.tree.leaves(results["spec_meta"]):
                     with suppress(Exception):
                         _leaf.delete()
+            results.clear()
             self._release_pull_sem()
 
     def abort(self) -> None:

@@ -2942,7 +2942,9 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     is_intermediate_chunk = bool(
         np.any(valid_mask) and np.all(extend_next_token_ids[valid_mask] >= 0)
     )
-    use_kv_only = is_disagg_prefill or is_intermediate_chunk
+    use_kv_only = is_intermediate_chunk or (
+        is_disagg_prefill and os.environ.get("SGL_PD_DIRECT_DECODE", "1") != "1"
+    )
     prefill_num_layers = (
         len(all_memory_pools) if use_kv_only else draft_worker.speculative_num_steps
     )
@@ -3000,6 +3002,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         cache_miss_count = count()
     prefill_output_token_ids = None
+    prefill_topk_index = None
     if update_relay:
         prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
             draft_worker,
@@ -3007,6 +3010,13 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         if hasattr(prefill_output_token_ids, "copy_to_host_async"):
             prefill_output_token_ids.copy_to_host_async()
+        if is_disagg_prefill and not use_kv_only:
+            prefill_topk_index = _prepare_spec_prefill_output_token_ids(
+                draft_worker,
+                topk_index_stacked,
+            )
+            if hasattr(prefill_topk_index, "copy_to_host_async"):
+                prefill_topk_index.copy_to_host_async()
 
     if launch_done is not None:
         launch_done.set()
@@ -3029,6 +3039,8 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
             num_tokens_per_batch=np.asarray(1, dtype=np.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
         )
+        if prefill_topk_index is not None:
+            model_worker_batch.spec_info_padded._pd_prefill_topk_index = prefill_topk_index
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=prefill_output_token_ids,

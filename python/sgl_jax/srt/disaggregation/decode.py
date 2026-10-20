@@ -897,6 +897,9 @@ class SchedulerDisaggregationDecodeMixin:
                         full_kv_indices = np.asarray(entry.kv_indices)
                     first_output_id = int(getattr(entry.receiver, "first_output_id", -1))
                     entry.req._pd_first_output_id = first_output_id
+                    entry.req._pd_initial_draft_ids = getattr(
+                        entry.receiver, "initial_draft_ids", None
+                    )
                     use_direct_decode = (
                         os.environ.get("SGL_PD_DIRECT_DECODE", "1") == "1"
                         and first_output_id >= 0
@@ -1814,9 +1817,17 @@ class SchedulerDisaggregationDecodeMixin:
                         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
                     )
                 else:
+                    topk_idx_dp = np.repeat(first_toks_dp[:, None], topk_width, axis=1)
+                    for req_i, r in enumerate(info.reqs):
+                        draft_ids = getattr(r, "_pd_initial_draft_ids", None)
+                        if draft_ids:
+                            take_k = min(topk_width, len(draft_ids))
+                            topk_idx_dp[req_i, :take_k] = np.asarray(
+                                draft_ids[:take_k], dtype=np.int32
+                            )
                     info.spec_info = EagleDraftInput(
                         topk_p=np.ones((n_dp, topk_width), dtype=np.float32),
-                        topk_index=np.repeat(first_toks_dp[:, None], topk_width, axis=1),
+                        topk_index=topk_idx_dp,
                         hidden_states=np.zeros((n_dp, hidden_size), dtype=np.float32),
                         verified_id=first_toks_dp.copy(),
                         accept_length=np.zeros((n_dp,), dtype=np.int32),
@@ -1850,6 +1861,12 @@ class SchedulerDisaggregationDecodeMixin:
                 val_mask_np[slot] = True
                 t0 = int(r.output_ids[-1])
                 topk_idx_np[slot, :] = t0
+                draft_ids = getattr(r, "_pd_initial_draft_ids", None)
+                if draft_ids:
+                    take_k = min(relay_num_steps, len(draft_ids))
+                    topk_idx_np[slot, :take_k] = np.asarray(
+                        draft_ids[:take_k], dtype=np.int32
+                    )
                 ver_id_np[slot] = t0
                 new_seq_np[slot] = (
                     len(r.origin_input_ids)
@@ -2097,18 +2114,12 @@ class SchedulerDisaggregationDecodeMixin:
                         )
                         idx_cursor += 1
             last_pool = all_pools[-1]
-            if indexer_kv is not None and getattr(last_pool, "indexer_key_buffer", None):
-                jax.block_until_ready(last_pool.indexer_key_buffer[-1])
-            else:
-                jax.block_until_ready(last_pool.kv_buffer[-1])
-            self._maybe_verify_decode_writeback_debug(req, kv_pool, page_ids_padded, kv)
-            with suppress(Exception):
-                page_indices.delete()
-            with suppress(Exception):
-                kv.delete()
-            if indexer_kv is not None:
-                with suppress(Exception):
-                    indexer_kv.delete()
+            if kv_debug_enabled(req.rid):
+                if indexer_kv is not None and getattr(last_pool, "indexer_key_buffer", None):
+                    jax.block_until_ready(last_pool.indexer_key_buffer[-1])
+                else:
+                    jax.block_until_ready(last_pool.kv_buffer[-1])
+                self._maybe_verify_decode_writeback_debug(req, kv_pool, page_ids_padded, kv)
             return
 
         # Write via the in-place Pallas kernel (``update_fused_kv_cache_vectorized``

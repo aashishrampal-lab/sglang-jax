@@ -130,7 +130,7 @@ class EAGLEWorker(BaseSpecWorker):
                     self.forward_batch_speculative_generation(model_worker_batch)
                 chunk_size = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0)
                 if (
-                    getattr(self.server_args, "disaggregation_mode", "null") == "null"
+                    getattr(self.server_args, "disaggregation_mode", "null") in ("null", "prefill")
                     and chunk_size > 0
                     and num_tokens >= chunk_size
                 ):

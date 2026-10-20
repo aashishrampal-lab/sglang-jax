@@ -1006,6 +1006,32 @@ class SchedulerDisaggregationPrefillMixin:
         reqs_info = getattr(batch, "reqs_info", None)
         if not reqs_info:
             return
+        dp_size = max(1, int(getattr(batch, "dp_size", len(reqs_info)) or 1))
+        per_dp_bs = int(getattr(batch, "per_dp_bs_size", 0) or 0)
+        next_draft_input = getattr(result, "next_draft_input", None) if result is not None else None
+        raw_topk = getattr(next_draft_input, "_pd_prefill_topk_index", None)
+        if raw_topk is None:
+            raw_topk = getattr(next_draft_input, "topk_index", None)
+        if raw_topk is not None:
+            if hasattr(raw_topk, "copy_to_host_async"):
+                raw_topk.copy_to_host_async()
+            topk_arr = np.asarray(raw_topk, dtype=np.int32)
+            if topk_arr.ndim == 3 and topk_arr.shape[-1] == 1:
+                topk_arr = topk_arr[:, :, 0]
+            if topk_arr.ndim == 2 and topk_arr.shape[0] > 0:
+                eff_per_dp_bs = per_dp_bs if per_dp_bs > 0 else max(1, topk_arr.shape[0] // dp_size)
+                total_reqs = sum(len(getattr(info, "reqs", None) or ()) for info in reqs_info)
+                use_padded_idx = (
+                    topk_arr.shape[0] == dp_size * eff_per_dp_bs
+                    and total_reqs != topk_arr.shape[0]
+                )
+                flat_cursor = 0
+                for dp_rank, info in enumerate(reqs_info):
+                    for i, r in enumerate(getattr(info, "reqs", None) or ()):
+                        row_idx = (dp_rank * eff_per_dp_bs + i) if use_padded_idx else flat_cursor
+                        flat_cursor += 1
+                        if row_idx < topk_arr.shape[0]:
+                            r._pd_initial_draft_ids = [int(x) for x in topk_arr[row_idx].tolist()]
         for info in reqs_info:
             out_ids = getattr(info, "output_ids", None)
             if out_ids is not None and len(out_ids) > 0:
@@ -1020,8 +1046,6 @@ class SchedulerDisaggregationPrefillMixin:
         if hasattr(raw_nt, "copy_to_host_async"):
             raw_nt.copy_to_host_async()
         nt_flat = np.asarray(raw_nt, dtype=np.int32).reshape(-1)
-        dp_size = max(1, int(getattr(batch, "dp_size", len(reqs_info)) or 1))
-        per_dp_bs = int(getattr(batch, "per_dp_bs_size", 0) or 0)
         if per_dp_bs <= 0:
             per_dp_bs = max(1, len(nt_flat) // dp_size)
         for dp_rank, info in enumerate(reqs_info):
@@ -1045,6 +1069,11 @@ class SchedulerDisaggregationPrefillMixin:
             meta_shape, meta_sharding = local_spec_meta_sharding()
             meta_np = np.full(meta_shape, -1, dtype=np.int32)
             meta_np[:, 0] = first_tok
+            draft_ids = getattr(req, "_pd_initial_draft_ids", None)
+            if draft_ids:
+                max_drafts = max(0, int(meta_shape[1]) - 1)
+                for j, d_tok in enumerate(draft_ids[:max_drafts]):
+                    meta_np[:, j + 1] = int(d_tok)
             payload["spec_meta"] = jax.device_put(meta_np, meta_sharding)
         return payload
 

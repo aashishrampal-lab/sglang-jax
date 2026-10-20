@@ -1481,6 +1481,7 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             req0.dp_rank = 0
             req0._pd_direct_decode_ready = True
             req0._pd_first_output_id = 101
+            req0._pd_initial_draft_ids = [301]
             req0._pd_prealloc_kv_indices = kv_alloc.alloc(16, dp_rank=0)
 
             req1 = Req(
@@ -1492,6 +1493,7 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             req1.dp_rank = 1
             req1._pd_direct_decode_ready = True
             req1._pd_first_output_id = 202
+            req1._pd_initial_draft_ids = [402]
             req1._pd_prealloc_kv_indices = kv_alloc.alloc(16, dp_rank=1)
 
             empty_running = ScheduleBatch.init_new(
@@ -1542,6 +1544,12 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
             )
             self.assertEqual(
                 int(np.asarray(draft_worker.spec_relay_buffers.verified_id)[1, 1]), 202
+            )
+            self.assertEqual(
+                int(np.asarray(draft_worker.spec_relay_buffers.topk_index)[0, 0, 0]), 301
+            )
+            self.assertEqual(
+                int(np.asarray(draft_worker.spec_relay_buffers.topk_index)[1, 1, 0]), 402
             )
             self.assertEqual(
                 int(np.asarray(draft_worker.spec_relay_buffers.new_seq_lens)[0, 0]), 17

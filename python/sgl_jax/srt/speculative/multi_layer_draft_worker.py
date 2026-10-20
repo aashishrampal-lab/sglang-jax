@@ -79,10 +79,10 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             self.topk == 1
         ), f"MultiLayerDraftWorker fused decode requires topk=1, got {self.topk}"
         cfg_mtp = getattr(target_worker.model_config.hf_config, "num_nextn_predict_layers", None)
-        # MiMo-style configs omit num_nextn_predict_layers; only enforce equality
-        # when the field exists (scheduler routes here iff n_mtp>1 either way).
-        assert cfg_mtp is None or cfg_mtp == self.num_mtp_layers, (
-            f"--speculative-num-steps={self.speculative_num_steps} must equal the "
+        # MiMo-style configs omit num_nextn_predict_layers; allow using a prefix
+        # of the checkpoint's MTP layers when tuning speculative_num_steps.
+        assert cfg_mtp is None or self.num_mtp_layers <= cfg_mtp, (
+            f"--speculative-num-steps={self.speculative_num_steps} must not exceed the "
             f"model's num_nextn_predict_layers={cfg_mtp} (one runner per MTP layer)"
         )
         req_to_token_pool, _ = target_worker.get_memory_pool()
