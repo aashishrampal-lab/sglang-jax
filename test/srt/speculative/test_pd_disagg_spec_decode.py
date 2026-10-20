@@ -1526,7 +1526,7 @@ class TestPDDisaggSpecDecode(unittest.TestCase):
                 tp_worker=SimpleNamespace(spec_relay_buffers=None),
                 _is_spec_decode_enabled=lambda: True,
                 _pd_chunk_cache_finished_req=lambda r: None,
-                stream_output=lambda reqs, ret_logprob: None,
+                stream_output=lambda reqs, ret_logprob, ret_output_logprob_only: None,
             )
             n_admitted = SchedulerDecodeMixin._admit_pd_direct_decode_reqs(sched)
             self.assertEqual(n_admitted, 2)

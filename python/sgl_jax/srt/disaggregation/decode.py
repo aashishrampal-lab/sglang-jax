@@ -1730,7 +1730,7 @@ class SchedulerDisaggregationDecodeMixin:
         if not admitted_reqs:
             return 0
 
-        self.stream_output(admitted_reqs, False)
+        self.stream_output(admitted_reqs, False, False)
         active_reqs = [r for r in admitted_reqs if not r.finished()]
         if not active_reqs:
             return len(admitted_reqs)
@@ -1828,8 +1828,12 @@ class SchedulerDisaggregationDecodeMixin:
 
         if is_spec and relay_buffers is not None:
             dp_size = int(self.dp_size)
-            per_dp_cap = max(len(r_list) for r_list in reqs_per_dp)
-            per_dp_cap = max(1, per_dp_cap)
+            max_running = int(getattr(self.server_args, "max_running_requests", 256) or 256)
+            per_dp_cap = max(
+                1,
+                max_running // max(1, dp_size),
+                max(len(r_list) for r_list in reqs_per_dp),
+            )
             total_slots = dp_size * per_dp_cap
             fut_idx_np = np.zeros((total_slots,), dtype=np.int32)
             val_mask_np = np.zeros((total_slots,), dtype=np.bool_)
