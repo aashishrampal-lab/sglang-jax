@@ -150,22 +150,28 @@ def update_spec_relay_buffers_admit(
     topk_index = topk_index.reshape((dp_size, per_dp_bs) + topk_index.shape[1:])
     verified_id = verified_id.reshape((dp_size, per_dp_bs))
     new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
+    state_sharding = jax.typeof(buffers.topk_index).sharding
+    if not isinstance(state_sharding, NamedSharding):
+        state_sharding = RELAY_STATE_SPEC
+    id_sharding = jax.typeof(buffers.verified_id).sharding
+    if not isinstance(id_sharding, NamedSharding):
+        id_sharding = RELAY_ID_SPEC
     return SpecRelayBuffers(
         topk_index=buffers.topk_index.at[dp_indices, scatter_indices].set(
             topk_index,
             mode="drop",
-            out_sharding=RELAY_STATE_SPEC,
+            out_sharding=state_sharding,
         ),
         hidden_states=buffers.hidden_states,
         verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
             verified_id,
             mode="drop",
-            out_sharding=RELAY_ID_SPEC,
+            out_sharding=id_sharding,
         ),
         new_seq_lens=buffers.new_seq_lens.at[dp_indices, scatter_indices].set(
             new_seq_lens,
             mode="drop",
-            out_sharding=RELAY_ID_SPEC,
+            out_sharding=id_sharding,
         ),
     )
 

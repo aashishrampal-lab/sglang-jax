@@ -182,6 +182,33 @@ class EAGLEWorker(BaseSpecWorker):
             _SPEC_CACHE_LOC_FIT,
             shapes,
         )
+        if self.spec_relay_buffers is not None:
+            from sgl_jax.srt.speculative.relay_buffer import update_spec_relay_buffers_admit
+
+            max_running = int(getattr(self.server_args, "max_running_requests", 256) or 256)
+            per_dp_cap = max(1, max_running // max(1, dp_size))
+            total_slots = dp_size * per_dp_cap
+            relay_cap = int(self.spec_relay_buffers.verified_id.shape[1])
+            relay_steps = int(self.spec_relay_buffers.topk_index.shape[-1])
+            fut_idx_np = np.arange(total_slots, dtype=np.int32) % max(1, relay_cap)
+            val_mask_np = np.ones((total_slots,), dtype=np.bool_)
+            topk_idx_np = np.ones((total_slots, relay_steps), dtype=np.int32)
+            ver_id_np = np.ones((total_slots,), dtype=np.int32)
+            new_seq_np = np.full((total_slots,), 16, dtype=np.int32)
+            sh_1d = NamedSharding(self.mesh, P("data"))
+            sh_2d = NamedSharding(self.mesh, P("data", None))
+            with jax.set_mesh(self.mesh):
+                self.spec_relay_buffers = update_spec_relay_buffers_admit(
+                    self.spec_relay_buffers,
+                    jax.device_put(fut_idx_np, sh_1d),
+                    jax.device_put(val_mask_np, sh_1d),
+                    jax.device_put(topk_idx_np, sh_2d),
+                    jax.device_put(ver_id_np, sh_1d),
+                    jax.device_put(new_seq_np, sh_1d),
+                    dp_size=dp_size,
+                )
+            jax.block_until_ready(self.spec_relay_buffers)
+
         with tqdm(shapes, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
             for bs, aligned_cache_loc_size in pbar:
                 pbar.set_postfix(bs=bs, cache_loc=aligned_cache_loc_size, dp_size=dp_size)
@@ -270,21 +297,10 @@ class EAGLEWorker(BaseSpecWorker):
                 for is_greedy in greedy_modes:
                     model_worker_batch = _make_decode_batch()
                     model_worker_batch.sampling_info.is_all_greedy = is_greedy
-                    spec_info = _make_non_relay_spec_info(model_worker_batch)
                     if self.spec_relay_buffers is not None:
-                        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-                        model_worker_batch.spec_info_padded = spec_info
-                        model_worker_batch.speculative_eagle_topk = self.topk
-                        model_worker_batch.speculative_num_draft_tokens = (
-                            self.speculative_num_draft_tokens
-                        )
-                        model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
-                        jax.block_until_ready(self.spec_relay_buffers)
-
-                        model_worker_batch = _make_decode_batch()
-                        model_worker_batch.sampling_info.is_all_greedy = is_greedy
                         spec_info = _make_relay_spec_info(model_worker_batch)
+                    else:
+                        spec_info = _make_non_relay_spec_info(model_worker_batch)
                     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                     model_worker_batch.spec_info_padded = spec_info
                     model_worker_batch.speculative_eagle_topk = self.topk

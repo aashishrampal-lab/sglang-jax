@@ -1858,15 +1858,16 @@ class SchedulerDisaggregationDecodeMixin:
                 )
             sh_1d = NamedSharding(self.mesh, PartitionSpec("data"))
             sh_2d = NamedSharding(self.mesh, PartitionSpec("data", None))
-            updated_relay = update_spec_relay_buffers_admit(
-                relay_buffers,
-                jax.device_put(fut_idx_np, sh_1d),
-                jax.device_put(val_mask_np, sh_1d),
-                jax.device_put(topk_idx_np, sh_2d),
-                jax.device_put(ver_id_np, sh_1d),
-                jax.device_put(new_seq_np, sh_1d),
-                dp_size=dp_size,
-            )
+            with jax.set_mesh(self.mesh):
+                updated_relay = update_spec_relay_buffers_admit(
+                    relay_buffers,
+                    jax.device_put(fut_idx_np, sh_1d),
+                    jax.device_put(val_mask_np, sh_1d),
+                    jax.device_put(topk_idx_np, sh_2d),
+                    jax.device_put(ver_id_np, sh_1d),
+                    jax.device_put(new_seq_np, sh_1d),
+                    dp_size=dp_size,
+                )
             relay_owner.spec_relay_buffers = updated_relay
 
         if self.running_batch.is_empty():
