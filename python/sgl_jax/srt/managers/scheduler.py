@@ -2220,6 +2220,12 @@ class Scheduler(
             force_eagle3_bootstrap_decode
             or skip_prefill
             or (self.pd and self._pd_pending_migrate is not None)
+            or (
+                getattr(getattr(self, "server_args", None), "disaggregation_mode", "null")
+                == "decode"
+                and len(self.waiting_queue) > 0
+                and all(getattr(r, "_pd_direct_decode_ready", False) for r in self.waiting_queue)
+            )
         ):
             new_batch = None
         elif self.pd:
@@ -2927,6 +2933,8 @@ class Scheduler(
                                 s if active_wave_dpseq is None else min(active_wave_dpseq, s)
                             )
         for req in () if skip_waiting_queue else self.waiting_queue:
+            if getattr(req, "_pd_direct_decode_ready", False):
+                continue
             # Get DP rank for this request
             dp_rank = req.dp_rank
             assert (
