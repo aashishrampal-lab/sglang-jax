@@ -141,7 +141,7 @@ def _use_verify_qgroup(is_verify: bool, draft_group: int | None, num_tokens: int
 # [S, pages_per_seq*page_size, D] keys; the kernel only DMAs up to kv_len).
 # Default OFF.
 _IDX_VERIFY_BATCHED = os.environ.get("DSA_IDX_VERIFY_BATCHED", "0") == "1"
-_IDX_VERIFY_BATCHED_MIN_BS = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MIN_BS", "1"))
+_IDX_VERIFY_BATCHED_MIN_BS = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MIN_BS", "64"))
 _IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV", "131072"))
 
 
@@ -712,21 +712,35 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # page score; token-level topk is not materialized (sparse MLA
                 # attends whole pages via topk_pages, so it never reads it).
                 topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
-                topk_pages = streamindex_page_topk_ref(
-                    q_,
-                    w_,
-                    cache3d,
-                    seq_lens_,
-                    pi_,
-                    cuq_,
-                    cukv_,
-                    dist_,
-                    k_pages=min(_PAGE_TOPK_BUDGET, pages_per_seq),
-                    pages_per_seq=pages_per_seq,
-                    # compute_topk is decode-only: T == num_seqs, token i
-                    # belongs to seq i — enables the O(S * max_kv) fast path.
-                    one_token_per_seq=True,
-                )
+                k_eff = min(_PAGE_TOPK_BUDGET, pages_per_seq)
+                if _INDEXER_KERNEL_PREFILL or _INDEXER_KERNEL:
+                    topk_pages = streamindex_page_topk(
+                        q_,
+                        w_,
+                        cache3d.reshape(cache_.shape),
+                        seq_lens_,
+                        _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+                        cuq_,
+                        dist_[2],
+                        k_pages=k_eff,
+                        num_queries_per_block=1,
+                    )
+                else:
+                    topk_pages = streamindex_page_topk_ref(
+                        q_,
+                        w_,
+                        cache3d,
+                        seq_lens_,
+                        pi_,
+                        cuq_,
+                        cukv_,
+                        dist_,
+                        k_pages=k_eff,
+                        pages_per_seq=pages_per_seq,
+                        # compute_topk is decode-only: T == num_seqs, token i
+                        # belongs to seq i — enables the O(S * max_kv) fast path.
+                        one_token_per_seq=True,
+                    )
                 return cache3d.reshape(cache_.shape), topk, topk_pages
             if compute_topk and _INDEXER_KERNEL:
                 topk = streamindex_topk(
@@ -1113,6 +1127,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # not T one-query decode passes -- the ref decode loop cost ~9 ms/step at
         # T=4 (dpa40nap). Only the query block shrinks (512 -> _SPEC_INDEXER_QB).
         draft_group = _spec_draft_group(forward_batch, num_tokens)
+        is_verify = forward_batch.forward_mode.is_target_verify()
         if readonly and reuse:
             topk_pages = None
         else:
@@ -1126,7 +1141,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 compute_pages=not reuse,
                 num_queries_per_block=_SPEC_INDEXER_QB,
-                q_group=draft_group,
+                q_group=draft_group if is_verify else None,
             )
         topk = None
         if not is_full or reuse:
@@ -1140,10 +1155,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages_use = topk_pages
         if topk_use is None:
             topk_use = _placeholder_topk_like(topk_pages_use)
-        is_verify = forward_batch.forward_mode.is_target_verify()
+        is_grouped_draft = forward_batch.forward_mode.is_draft_extend() and reuse
         page_share_group = _SPEC_VERIFY_PAGE_SHARE if is_verify else 1
         group_queries = False
-        if _use_verify_qgroup(is_verify, draft_group, num_tokens):
+        if _use_verify_qgroup(is_verify or is_grouped_draft, draft_group, num_tokens):
             page_share_group = draft_group
             group_queries = True
         o, kv_cache = self._run_sparse(
@@ -1438,13 +1453,21 @@ def _gather_cache_rows(cache: jax.Array, loc: jax.Array, page_size: int) -> jax.
 
 
 def _spec_draft_group(forward_batch, num_tokens: int) -> int | None:
-    """Draft tokens per request (G) on a decode-form TARGET_VERIFY batch whose
-    token count is a whole number of requests; ``None`` otherwise."""
-    if not forward_batch.forward_mode.is_target_verify():
+    """Draft tokens per request (G) on a decode-form TARGET_VERIFY or DRAFT_EXTEND
+    batch whose token count is a whole number of requests; ``None`` otherwise."""
+    if forward_batch is None:
         return None
-    dtn = getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", None)
-    if dtn and int(dtn) > 1 and num_tokens % int(dtn) == 0:
-        return int(dtn)
+    if forward_batch.forward_mode.is_target_verify():
+        dtn = getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", None)
+        if dtn and int(dtn) > 1 and num_tokens % int(dtn) == 0:
+            return int(dtn)
+        return None
+    if forward_batch.forward_mode.is_draft_extend():
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is not None and seq_lens.shape[0] > 0 and num_tokens % seq_lens.shape[0] == 0:
+            g = num_tokens // seq_lens.shape[0]
+            if g > 1:
+                return int(g)
     return None
 
 

@@ -45,6 +45,15 @@ def _jit_scatter_one_layer(buf, page_indices, layer_kv, out_sharding):
     return buf.at[page_indices].set(layer_kv, out_sharding=out_sharding)
 
 
+@partial(jax.jit, static_argnames=("out_sharding",), donate_argnums=(0,))
+def _jit_scatter_all_layers(bufs, page_indices, stacked_kv, out_sharding):
+    """Scatter ``stacked_kv`` (shape ``[num_layers, num_pages, ...]``) into ``bufs`` in one fused XLA program."""
+    return [
+        buf.at[page_indices].set(stacked_kv[i], out_sharding=out_sharding)
+        for i, buf in enumerate(bufs)
+    ]
+
+
 @partial(jax.jit, static_argnames=("out_sharding", "dp_size"), donate_argnums=(0,))
 def _jit_broadcast_prefix_one_layer(
     buf, src_page_indices, dst_page_indices, out_sharding, dp_size: int
@@ -2093,26 +2102,68 @@ class SchedulerDisaggregationDecodeMixin:
                 global_page_ids,
                 NamedSharding(kv_pool.mesh, PartitionSpec(None)),
             )
+            t_scatter0 = time.perf_counter()
             kv_cursor = 0
             idx_cursor = 0
+            use_fused_scatter = os.environ.get("SGL_FUSED_KV_SCATTER", "1") == "1"
             for pool in all_pools:
-                for layer_idx in range(pool.layer_num):
-                    pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
-                        pool.kv_buffer[layer_idx],
+                n_layers = pool.layer_num
+                if use_fused_scatter and n_layers > 1:
+                    kv_slice = (
+                        kv
+                        if (kv_cursor == 0 and n_layers == kv.shape[0])
+                        else kv[kv_cursor : kv_cursor + n_layers]
+                    )
+                    pool.kv_buffer = _jit_scatter_all_layers(
+                        pool.kv_buffer,
                         page_indices,
-                        kv[kv_cursor],
+                        kv_slice,
                         pool.kv_sharding,
                     )
-                    kv_cursor += 1
-                if indexer_kv is not None and getattr(pool, "indexer_key_buffer", None):
-                    for slot_idx in range(len(pool.indexer_key_buffer)):
-                        pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
-                            pool.indexer_key_buffer[slot_idx],
+                else:
+                    for layer_idx in range(n_layers):
+                        pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
+                            pool.kv_buffer[layer_idx],
                             page_indices,
-                            indexer_kv[idx_cursor],
+                            kv[kv_cursor + layer_idx],
                             pool.kv_sharding,
                         )
-                        idx_cursor += 1
+                kv_cursor += n_layers
+                if indexer_kv is not None and getattr(pool, "indexer_key_buffer", None):
+                    n_idx = len(pool.indexer_key_buffer)
+                    if use_fused_scatter and n_idx > 1:
+                        idx_slice = (
+                            indexer_kv
+                            if (idx_cursor == 0 and n_idx == indexer_kv.shape[0])
+                            else indexer_kv[idx_cursor : idx_cursor + n_idx]
+                        )
+                        pool.indexer_key_buffer = _jit_scatter_all_layers(
+                            pool.indexer_key_buffer,
+                            page_indices,
+                            idx_slice,
+                            pool.kv_sharding,
+                        )
+                    else:
+                        for slot_idx in range(n_idx):
+                            pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
+                                pool.indexer_key_buffer[slot_idx],
+                                page_indices,
+                                indexer_kv[idx_cursor + slot_idx],
+                                pool.kv_sharding,
+                            )
+                    idx_cursor += n_idx
+            if os.environ.get("SGL_DEBUG_STEP_TIMING", "0") == "1":
+                scatter_Count = getattr(self, "_pd_scatter_log_count", 0) + 1
+                self._pd_scatter_log_count = scatter_Count
+                if scatter_Count <= 10 or scatter_Count % 25 == 0:
+                    logger.info(
+                        "[PD-SCATTER-TIMING] req_id=%s pages=%d/%d fused=%s dispatch_ms=%.2f",
+                        req.rid,
+                        num_pages,
+                        padded_pages,
+                        use_fused_scatter,
+                        (time.perf_counter() - t_scatter0) * 1000.0,
+                    )
             last_pool = all_pools[-1]
             if kv_debug_enabled(req.rid):
                 if indexer_kv is not None and getattr(last_pool, "indexer_key_buffer", None):

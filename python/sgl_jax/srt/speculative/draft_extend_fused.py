@@ -923,13 +923,14 @@ def mtp_index_share_enabled(hf_config, topk: int) -> bool:
     """Whether draft steps reuse the step-0 indexer selection (IndexShare).
 
     Default follows the checkpoint's ``index_share_for_mtp_iteration`` (GLM-5.2
-    sets it); ``SGLANG_JAX_MTP_INDEX_SHARE=0/1`` forces it for A/B runs. Only the
+    sets it, defaulting True for single-block MTP when hf_config omits it);
+    ``SGLANG_JAX_MTP_INDEX_SHARE=0/1`` forces it for A/B runs. Only the
     topk=1 chain is supported (rows are not reordered between steps).
     """
-    forced = os.environ.get("SGLANG_JAX_MTP_INDEX_SHARE")
+    forced = os.environ.get("SGLANG_JAX_MTP_INDEX_SHARE", "1")
     if forced is not None:
         return forced.strip() not in ("", "0", "false", "False") and topk == 1
-    return bool(getattr(hf_config, "index_share_for_mtp_iteration", False)) and topk == 1
+    return bool(getattr(hf_config, "index_share_for_mtp_iteration", True)) and topk == 1
 
 
 def _build_draft_extend(
@@ -3403,7 +3404,18 @@ def spec_decode_eagle3_overlap(spec_worker, model_worker_batch, cur_allocate_len
 
 def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     """Launch decode verify and draft-extend without restoring draft results inline."""
+    import time as _time
+
+    _debug_timing = os.environ.get("SGL_DEBUG_STEP_TIMING", "0") == "1"
+    _t0 = _time.perf_counter() if _debug_timing else 0.0
     batch_output = spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens)
+    if _debug_timing:
+        _cnt = getattr(spec_worker, "_spec_timing_step_count", 0) + 1
+        spec_worker._spec_timing_step_count = _cnt
+        _do_sync_time = (_cnt <= 5) or (_cnt % 25 == 0)
+        if _do_sync_time:
+            jax.block_until_ready(batch_output.logits_output.hidden_states)
+            _t_verify = _time.perf_counter()
     sel = np.asarray(model_worker_batch.logits_indices_selector)
     batch_output.next_draft_input.future_indices = np.asarray(model_worker_batch.req_pool_indices)[
         sel
@@ -3423,6 +3435,8 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
         np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
         0,
     )
+    if _debug_timing and _do_sync_time:
+        _t_draft0 = _time.perf_counter()
     pending_result = launch_fused_draft_extend_for_decode(
         spec_worker.draft_worker,
         model_worker_batch,
@@ -3433,5 +3447,17 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     )
     if pending_result is not None:
         spec_worker.spec_relay_buffers = pending_result.updated_relay_buffers
+    if _debug_timing and _do_sync_time and pending_result is not None:
+        jax.block_until_ready(pending_result.topk_index_stacked)
+        _t_draft1 = _time.perf_counter()
+        logger.info(
+            "[SPEC-STEP-TIMING] step=%d real_bs=%d padded_bs=%d verify_ms=%.2f draft_4steps_ms=%.2f total_step_ms=%.2f",
+            _cnt,
+            int(getattr(model_worker_batch, "real_bs", 0)),
+            int(model_worker_batch.seq_lens.shape[0]),
+            (_t_verify - _t0) * 1000.0,
+            (_t_draft1 - _t_draft0) * 1000.0,
+            (_t_draft1 - _t0) * 1000.0,
+        )
     batch_output.next_draft_input.new_seq_lens = None
     return batch_output, published_new_seq_lens
