@@ -1524,11 +1524,7 @@ class SchedulerDisaggregationDecodeMixin:
                 )
             elif can_bcast_from_leader and leader_entry is not None:
                 while len(slot_list) >= max_prefix_slots and slot_list:
-                    ev_victim = next(
-                        (e for e in slot_list if int(e.get("ref_count", 0)) <= 0),
-                        slot_list[0],
-                    )
-                    slot_list.remove(ev_victim)
+                    ev_victim = slot_list.pop(0)
                     _evict_prefix_entry(ev_victim)
                 new_cache_entry = {
                     "prefix_ids": list(entry.req.origin_input_ids[: target_prefix_len + 1]),
@@ -1553,11 +1549,7 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 if cap_len >= 4096 and (shard_prefix_len == 0 or seqlen >= target_prefix_len + page_size):
                     while len(slot_list) >= max_prefix_slots and slot_list:
-                        ev_victim = next(
-                            (e for e in slot_list if int(e.get("ref_count", 0)) <= 0),
-                            slot_list[0],
-                        )
-                        slot_list.remove(ev_victim)
+                        ev_victim = slot_list.pop(0)
                         _evict_prefix_entry(ev_victim)
                     kv_indices_np = np.asarray(kv_indices)
                     store_kv_len = eff_prefix_len if shard_prefix_len > 0 else cap_len

@@ -641,17 +641,16 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._results = None
         try:
             if "spec_meta" in results:
-                with suppress(Exception):
-                    spec_meta_arr = results["spec_meta"]
-                    shards = getattr(spec_meta_arr, "addressable_shards", None)
-                    if shards:
-                        meta_host = np.asarray(shards[0].data)
-                    else:
-                        meta_host = np.asarray(spec_meta_arr)
-                    row0 = meta_host[0] if meta_host.ndim >= 2 else meta_host.reshape(-1)
-                    self.first_output_id = int(row0[0])
-                    drafts = [int(x) for x in row0[1:] if int(x) >= 0]
-                    self.initial_draft_ids = drafts if drafts else None
+                spec_meta_arr = results["spec_meta"]
+                shards = getattr(spec_meta_arr, "addressable_shards", None)
+                if shards:
+                    meta_host = np.asarray(shards[0].data)
+                else:
+                    meta_host = np.asarray(spec_meta_arr)
+                row0 = meta_host[0] if meta_host.ndim >= 2 else meta_host.reshape(-1)
+                self.first_output_id = int(row0[0])
+                drafts = [int(x) for x in row0[1:] if int(x) >= 0]
+                self.initial_draft_ids = drafts if drafts else None
             if "indexer_kv" in results:
                 install((results["kv"], results["indexer_kv"]))
             else:
