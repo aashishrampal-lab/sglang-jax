@@ -254,6 +254,18 @@ def sparse_mla_page_level(
         sp_cu_q = jnp.arange(T + 1, dtype=jnp.int32)
         sp_cu_kv = jnp.arange(T + 1, dtype=jnp.int32) * (k_pages_max * page_size)
         sp_dist = jnp.array([T, T, T], dtype=jnp.int32)
+    elif num_kv_pages_per_block is None and k_pages_max <= 32:
+        # Hardware-tuned bkv_p for grouped verify/draft-extend on TPU v7x (k_pages_max=17):
+        if T <= 8:
+            num_kv_pages_per_block = 4
+        elif T <= 24:
+            num_kv_pages_per_block = 16
+        elif T <= 48:
+            num_kv_pages_per_block = 8
+        elif T <= 128:
+            num_kv_pages_per_block = 16
+        else:
+            num_kv_pages_per_block = 32
 
     o, cache_out = mla_ragged_paged_attention(
         ql_nope,
