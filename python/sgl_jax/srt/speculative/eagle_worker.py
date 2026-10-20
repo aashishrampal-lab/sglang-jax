@@ -299,10 +299,17 @@ class EAGLEWorker(BaseSpecWorker):
                     for use_top_p in top_p_modes:
                         model_worker_batch = _make_decode_batch()
                         model_worker_batch.sampling_info.is_all_greedy = is_greedy
-                        if not is_greedy and use_top_p:
-                            model_worker_batch.sampling_info.top_ps = np.full(
-                                (bs,), 0.95, dtype=np.float32
+                        if not is_greedy:
+                            model_worker_batch.sampling_info.temperatures = np.full(
+                                (bs, 1), 1.0, dtype=np.float32
                             )
+                            model_worker_batch.sampling_info.top_ks = np.full(
+                                (bs,), -1, dtype=np.int32
+                            )
+                            if use_top_p:
+                                model_worker_batch.sampling_info.top_ps = np.full(
+                                    (bs,), 0.95, dtype=np.float32
+                                )
                         spec_info = _make_non_relay_spec_info(model_worker_batch)
                         if self.spec_relay_buffers is not None:
                             if bs == shapes[0][0] and use_top_p == top_p_modes[0]:
@@ -319,10 +326,17 @@ class EAGLEWorker(BaseSpecWorker):
                                 jax.block_until_ready(self.spec_relay_buffers)
                                 model_worker_batch = _make_decode_batch()
                                 model_worker_batch.sampling_info.is_all_greedy = is_greedy
-                                if not is_greedy and use_top_p:
-                                    model_worker_batch.sampling_info.top_ps = np.full(
-                                        (bs,), 0.95, dtype=np.float32
+                                if not is_greedy:
+                                    model_worker_batch.sampling_info.temperatures = np.full(
+                                        (bs, 1), 1.0, dtype=np.float32
                                     )
+                                    model_worker_batch.sampling_info.top_ks = np.full(
+                                        (bs,), -1, dtype=np.int32
+                                    )
+                                    if use_top_p:
+                                        model_worker_batch.sampling_info.top_ps = np.full(
+                                            (bs,), 0.95, dtype=np.float32
+                                        )
                             spec_info = _make_relay_spec_info(model_worker_batch)
                         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                         model_worker_batch.spec_info_padded = spec_info
