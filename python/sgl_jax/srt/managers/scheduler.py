@@ -3122,6 +3122,10 @@ class Scheduler(
                             if _SHARDED_PREFIX_PAGES > 0
                             else int(os.environ.get("SGL_PD_MAX_PREFIX_SLOTS", "8"))
                         )
+                        pin_prefix_slots = (
+                            _SHARDED_PREFIX_PAGES == 0
+                            and os.environ.get("SGL_PD_PIN_PREFIX_SLOTS", "0") == "1"
+                        )
                         raw_slots = last_prefix_map.get(dp_rank)
                         if not raw_slots:
                             slot_list: list[list[int]] = []
@@ -3176,7 +3180,8 @@ class Scheduler(
                         if skip_tokens > 0 and matched_idx >= 0:
                             matched_ids = slot_list.pop(matched_idx)
                             if (
-                                matched_lcp_tokens == matched_cmp_len
+                                not pin_prefix_slots
+                                and matched_lcp_tokens == matched_cmp_len
                                 and os.environ.get("SGL_PD_MULTI_TURN_PREFIX_EXTEND", "1") == "1"
                             ):
                                 cap_len = min(
@@ -3192,10 +3197,11 @@ class Scheduler(
                                 ((seqlen - self.page_size) // self.page_size) * self.page_size,
                             )
                             if cap_len >= min_prefix_skip:
-                                while len(slot_list) >= max_prefix_slots and slot_list:
-                                    slot_list.pop(0)
-                                slot_list.append(list(req.origin_input_ids[: cap_len + 1]))
-                            elif max_prefix_slots <= 1:
+                                if not (pin_prefix_slots and len(slot_list) >= max_prefix_slots):
+                                    while len(slot_list) >= max_prefix_slots and slot_list:
+                                        slot_list.pop(0)
+                                    slot_list.append(list(req.origin_input_ids[: cap_len + 1]))
+                            elif max_prefix_slots <= 1 and not pin_prefix_slots:
                                 last_prefix_map.pop(dp_rank, None)
 
             if res != AddReqResult.CONTINUE:

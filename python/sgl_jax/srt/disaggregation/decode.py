@@ -1248,6 +1248,10 @@ class SchedulerDisaggregationDecodeMixin:
                 if _SHARDED_PREFIX_PAGES > 0
                 else int(os.environ.get("SGL_PD_MAX_PREFIX_SLOTS", "8"))
             )
+            pin_prefix_slots = (
+                _SHARDED_PREFIX_PAGES == 0
+                and os.environ.get("SGL_PD_PIN_PREFIX_SLOTS", "0") == "1"
+            )
             raw_slots = prefix_cache.get(decode_dp_rank)
             if raw_slots is None:
                 slot_list: list[dict] = []
@@ -1324,7 +1328,9 @@ class SchedulerDisaggregationDecodeMixin:
                             reuse_lcp_tokens = lcp_tokens
                             reuse_cmp_len = cmp_len
             can_reuse_prefix = reuse_skip_tokens > 0 and cached_entry is not None
-            if not can_reuse_prefix and (force_pfull or max_prefix_slots <= 1):
+            if not can_reuse_prefix and (
+                force_pfull or (max_prefix_slots <= 1 and not pin_prefix_slots)
+            ):
                 for ev_e in list(slot_list):
                     if int(ev_e.get("ref_count", 0)) <= 0:
                         _evict_prefix_entry(ev_e)
@@ -1411,6 +1417,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             if (
                 not can_reuse_prefix
+                and not pin_prefix_slots
                 and slot_list
                 and alloc_tokens + reserved + extra_wave_reserve
                 > allocator.available_size(decode_dp_rank)
@@ -1511,7 +1518,8 @@ class SchedulerDisaggregationDecodeMixin:
                 entry.req._pd_shared_prefix_entry = cached_entry
                 prefix_len = skip_tokens if shard_prefix_len == 0 else eff_prefix_len
                 if (
-                    shard_prefix_len == 0
+                    not pin_prefix_slots
+                    and shard_prefix_len == 0
                     and skip_tokens > 0
                     and os.environ.get("SGL_PD_MULTI_TURN_PREFIX_EXTEND", "1") == "1"
                 ):
@@ -1561,39 +1569,44 @@ class SchedulerDisaggregationDecodeMixin:
                     ((seqlen - page_size) // page_size) * page_size,
                 )
                 if cap_len >= min_prefix_skip and (shard_prefix_len == 0 or seqlen >= target_prefix_len + page_size):
-                    while len(slot_list) >= max_prefix_slots and slot_list:
-                        ev_victim = slot_list.pop(0)
-                        _evict_prefix_entry(ev_victim)
-                    kv_indices_np = np.asarray(kv_indices)
-                    store_kv_len = eff_prefix_len if shard_prefix_len > 0 else cap_len
-                    new_cache_entry = {
-                        "prefix_ids": list(entry.req.origin_input_ids[: cap_len + 1]),
-                        "kv_indices": kv_indices_np[:store_kv_len].copy(),
-                        "scatter_kv_indices": (
-                            kv_indices_np[:target_prefix_len].copy()
-                            if shard_prefix_len > 0
-                            else None
-                        ),
-                        "scatter_kv_extra": (
-                            kv_indices_np[eff_prefix_len:target_prefix_len].copy()
-                            if shard_prefix_len > 0
-                            else None
-                        ),
-                        "ref_count": 1,
-                        "evict_on_zero": False,
-                        "populated": False,
-                        "source_leader_entry": None,
-                        "dp_rank": decode_dp_rank,
-                    }
-                    slot_list.append(new_cache_entry)
-                    self._pd_latest_leader_prefix = new_cache_entry
-                    entry.req._pd_shared_prefix_entry = new_cache_entry
-                    entry.req._pd_shared_prefix_len = store_kv_len
-                    entry.req._pd_seq_pos_offset = (
-                        target_prefix_len - eff_prefix_len if shard_prefix_len > 0 else 0
-                    )
+                    if pin_prefix_slots and len(slot_list) >= max_prefix_slots:
+                        entry.req._pd_shared_prefix_entry = None
+                        entry.req._pd_shared_prefix_len = 0
+                        entry.req._pd_seq_pos_offset = 0
+                    else:
+                        while len(slot_list) >= max_prefix_slots and slot_list:
+                            ev_victim = slot_list.pop(0)
+                            _evict_prefix_entry(ev_victim)
+                        kv_indices_np = np.asarray(kv_indices)
+                        store_kv_len = eff_prefix_len if shard_prefix_len > 0 else cap_len
+                        new_cache_entry = {
+                            "prefix_ids": list(entry.req.origin_input_ids[: cap_len + 1]),
+                            "kv_indices": kv_indices_np[:store_kv_len].copy(),
+                            "scatter_kv_indices": (
+                                kv_indices_np[:target_prefix_len].copy()
+                                if shard_prefix_len > 0
+                                else None
+                            ),
+                            "scatter_kv_extra": (
+                                kv_indices_np[eff_prefix_len:target_prefix_len].copy()
+                                if shard_prefix_len > 0
+                                else None
+                            ),
+                            "ref_count": 1,
+                            "evict_on_zero": False,
+                            "populated": False,
+                            "source_leader_entry": None,
+                            "dp_rank": decode_dp_rank,
+                        }
+                        slot_list.append(new_cache_entry)
+                        self._pd_latest_leader_prefix = new_cache_entry
+                        entry.req._pd_shared_prefix_entry = new_cache_entry
+                        entry.req._pd_shared_prefix_len = store_kv_len
+                        entry.req._pd_seq_pos_offset = (
+                            target_prefix_len - eff_prefix_len if shard_prefix_len > 0 else 0
+                        )
                 else:
-                    if max_prefix_slots <= 1:
+                    if max_prefix_slots <= 1 and not pin_prefix_slots:
                         for ev_e in list(slot_list):
                             _evict_prefix_entry(ev_e)
                         slot_list.clear()

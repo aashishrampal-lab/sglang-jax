@@ -475,3 +475,177 @@ def test_fast_4d_idx_scatter_and_skip_verify_prewrite_parity():
                     forward_batch=fb_draft,
                 )
             assert len(prewrite_calls) == 1, "DRAFT_EXTEND step 0 (reuse=False) must still prewrite"
+
+
+def test_pd_pin_prefix_slots_prevents_eviction_on_decode_and_prefill():
+    from sgl_jax.srt.disaggregation.base.transfer import AdmissionState
+    from sgl_jax.srt.disaggregation.decode import (
+        DecodeBookkeeping,
+        DecodePreallocQueue,
+        DecodeTransferQueue,
+        SchedulerDisaggregationDecodeMixin,
+    )
+
+    page_size = 128
+
+    class _FakeAllocator:
+        def __init__(self, total_tokens: int):
+            self.page_size = page_size
+            self._free = list(range(total_tokens))
+
+        def available_size(self, dp_rank: int = 0) -> int:
+            return len(self._free)
+
+        def alloc(self, n: int, dp_rank: int = 0):
+            if n > len(self._free):
+                return None
+            out = np.asarray(self._free[:n], dtype=np.int32)
+            self._free = self._free[n:]
+            return out
+
+        def release(self, arr):
+            self._free.extend(int(x) for x in np.asarray(arr).tolist())
+
+    class _FakeDecodeSched(SchedulerDisaggregationDecodeMixin):
+        def __init__(self, total_tokens: int):
+            self.token_to_kv_pool_allocator = _FakeAllocator(total_tokens)
+            self.server_args = SimpleNamespace(
+                disaggregation_num_reserved_decode_tokens=128,
+                disaggregation_max_inflight_transfers=32,
+                disaggregation_pull_timeout_seconds=3600.0,
+            )
+            self.dp_size = 1
+            self.disagg_prealloc_queue = DecodePreallocQueue()
+            self.disagg_transfer_queue = DecodeTransferQueue()
+            self.waiting_queue = []
+            self.running_batch = None
+            self.per_dp_max_running_requests = 256
+            self.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+            self.enable_overlap = False
+            self._pd_decode_prefix_cache = {}
+            self.disagg_kv_manager = SimpleNamespace(
+                poll_decode_metadata=lambda ctx: True,
+                try_start_decode=lambda ctx: SimpleNamespace(
+                    state=AdmissionState.ADMITTED, receiver=SimpleNamespace()
+                ),
+            )
+
+        def _release_decode_kv_indices(self, indices, dp_rank=0):
+            self.token_to_kv_pool_allocator.release(indices)
+
+        def _build_kv_spec_for_req(self, req):
+            return None
+
+        def _commit_direct_received_kv(self, req, indices, expected):
+            return None
+
+        def _pd_mark_time(self, req, stage):
+            return None
+
+        def _req_pull_bytes_per_device(self, req):
+            return 0
+
+        def _inflight_pull_bytes_per_device(self):
+            return 0
+
+        def _pull_budget_bytes_per_device(self):
+            return 1 << 60
+
+    def _make_req(rid: str, trunk_id: int, suffix_seed: int, total_len: int = 4096, prefix_len: int = 3200):
+        prefix = [1000 + trunk_id] * prefix_len
+        suffix = [50000 + suffix_seed + (i % 97) for i in range(total_len - prefix_len)]
+        return SimpleNamespace(
+            rid=rid,
+            origin_input_ids=prefix + suffix,
+            dp_rank=0,
+            disagg_prefill_dp_rank=0,
+            disagg_transfer_id=rid,
+            bootstrap_room=1,
+            cached_tokens=0,
+            sampling_params=SimpleNamespace(max_new_tokens=128, ignore_eos=False),
+            output_ids=[],
+        )
+
+    def _prefill_compute_skip(slot_list: list[list[int]], req, max_slots: int, pin: bool) -> int:
+        seqlen = len(req.origin_input_ids)
+        target_prefix_len = 262144
+        min_prefix_skip = 2048
+        skip_tokens = 0
+        matched_idx = -1
+        cap_cmp = min(target_prefix_len, ((seqlen - page_size) // page_size) * page_size)
+        for s_idx in range(len(slot_list) - 1, -1, -1):
+            prev_prefix_ids = slot_list[s_idx]
+            cmp_len = min(len(prev_prefix_ids), cap_cmp + 1)
+            if cmp_len >= min_prefix_skip:
+                arr_cur = np.asarray(req.origin_input_ids[:cmp_len], dtype=np.int32)
+                arr_prev = np.asarray(prev_prefix_ids[:cmp_len], dtype=np.int32)
+                diff = np.nonzero(arr_cur != arr_prev)[0]
+                lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
+                usable_lcp = max(0, lcp_tokens - 1) if lcp_tokens < cmp_len else min(lcp_tokens, cap_cmp)
+                cand_skip = (usable_lcp // page_size) * page_size
+                if cand_skip >= min_prefix_skip and seqlen >= cand_skip + page_size and cand_skip > skip_tokens:
+                    skip_tokens = cand_skip
+                    matched_idx = s_idx
+        if skip_tokens > 0 and matched_idx >= 0:
+            matched_ids = slot_list.pop(matched_idx)
+            slot_list.append(matched_ids)
+        elif skip_tokens == 0:
+            cap_len = min(target_prefix_len, ((seqlen - page_size) // page_size) * page_size)
+            if cap_len >= min_prefix_skip and not (pin and len(slot_list) >= max_slots):
+                while len(slot_list) >= max_slots and slot_list:
+                    slot_list.pop(0)
+                slot_list.append(list(req.origin_input_ids[: cap_len + 1]))
+        return skip_tokens
+
+    sched = _FakeDecodeSched(total_tokens=32768)
+    prefill_slots: list[list[int]] = []
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "SGL_PD_MAX_PREFIX_SLOTS": "4",
+            "SGL_PD_PIN_PREFIX_SLOTS": "1",
+            "SGL_PD_MIN_PREFIX_SKIP_TOKENS": "2048",
+        },
+    ):
+        # Stage 1 warmup: pin trunks 0..3 (even if prefill and decode see reversed order within 0..3!)
+        for k in [0, 1, 2, 3]:
+            r_p = _make_req(f"w_p_{k}", trunk_id=k, suffix_seed=1)
+            assert _prefill_compute_skip(prefill_slots, r_p, max_slots=4, pin=True) == 0
+        for k in [3, 1, 2, 0]:
+            r_d = _make_req(f"w_d_{k}", trunk_id=k, suffix_seed=1)
+            bk = DecodeBookkeeping(req_id=r_d.rid, req=r_d, p_info={})
+            sched.disagg_prealloc_queue.add(bk)
+            sched._admit_decode_prealloc()
+            sched.disagg_transfer_queue.abort_matching(r_d.rid, False)
+            assert r_d._pd_transfer_skip_tokens == 0
+            # Simulate warmup request finishing (ref_count drops to 0, prefix stays pinned)
+            r_d._pd_shared_prefix_entry["ref_count"] -= 1
+            sched.token_to_kv_pool_allocator.release(bk.kv_indices[r_d._pd_shared_prefix_len :])
+
+        assert len(prefill_slots) == 4
+        assert len(sched._pd_decode_prefix_cache[0]) == 4
+
+        # Stage 2 warmup & Phase 1: send unpinned trunks 4..9 and interleaved pinned trunks 0..3
+        # Verify 100% skip_tokens agreement between prefill and decode, and zero eviction of 0..3!
+        for turn, k in enumerate([4, 5, 0, 6, 2, 7, 3, 1, 8, 0]):
+            r_p = _make_req(f"t_{turn}_p", trunk_id=k, suffix_seed=100 + turn)
+            r_d = _make_req(f"t_{turn}_d", trunk_id=k, suffix_seed=100 + turn)
+            skip_p = _prefill_compute_skip(prefill_slots, r_p, max_slots=4, pin=True)
+            bk = DecodeBookkeeping(req_id=r_d.rid, req=r_d, p_info={})
+            sched.disagg_prealloc_queue.add(bk)
+            sched._admit_decode_prealloc()
+            sched.disagg_transfer_queue.abort_matching(r_d.rid, False)
+            skip_d = r_d._pd_transfer_skip_tokens
+
+            expected_skip = 3072 if k < 4 else 0
+            assert skip_p == expected_skip, f"Prefill skip mismatch for trunk {k}: {skip_p}"
+            assert skip_d == expected_skip, f"Decode skip mismatch for trunk {k}: {skip_d}"
+            if r_d._pd_shared_prefix_entry is not None:
+                r_d._pd_shared_prefix_entry["ref_count"] -= 1
+                sched.token_to_kv_pool_allocator.release(bk.kv_indices)
+            else:
+                sched.token_to_kv_pool_allocator.release(bk.kv_indices)
+
+        assert len(sched._pd_decode_prefix_cache[0]) == 4
+
