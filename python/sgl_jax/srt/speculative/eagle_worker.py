@@ -295,7 +295,7 @@ class EAGLEWorker(BaseSpecWorker):
 
                 greedy_modes = (True, False) if bs == shapes[0][0] else (False,)
                 for is_greedy in greedy_modes:
-                    top_p_modes = (False,) if is_greedy else (True, False) if bs == shapes[0][0] else (True,)
+                    top_p_modes = (False,) if is_greedy else (True, False) if bs == shapes[0][0] else (False,)
                     for use_top_p in top_p_modes:
                         model_worker_batch = _make_decode_batch()
                         model_worker_batch.sampling_info.is_all_greedy = is_greedy
