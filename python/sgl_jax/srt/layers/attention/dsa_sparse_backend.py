@@ -1754,9 +1754,10 @@ def _run_streamindex_page_topk_tp(
     S = seq_lens_.shape[0]
     T_q = q_.shape[0]
     fixed_pi = _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq)
+    min_tp_shard_seqs = int(os.environ.get("DSA_TP_SHARD_MIN_SEQS", "8"))
     if (
         tp_size > 1
-        and S >= 2
+        and S >= min_tp_shard_seqs
         and uniform_q_per_seq
         and T_q % S == 0
         and os.environ.get("DSA_TP_SHARD_PAGE_TOPK", "1") == "1"

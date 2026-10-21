@@ -2897,7 +2897,8 @@ class ScheduleBatch:
         if use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm):
             target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
         else:
-            target_per_rank_ocl = max(per_dp_bs * draft_token_num * 2, max_chunk_len)
+            target_per_rank_ocl = per_dp_bs * draft_token_num * 2
+            ocl_chunks = [c[:target_per_rank_ocl] for c in ocl_chunks]
         out_cache_loc = (
             np.concatenate(
                 [

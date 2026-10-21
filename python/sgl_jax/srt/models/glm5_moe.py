@@ -1064,7 +1064,7 @@ class Glm5DecoderLayer(nnx.Module):
             self.is_moe_layer
             and self.moe_backend == MoEBackend.FUSED_V2
             and self.shared_experts is None
-            and os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER", "1") == "1"
+            and os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER", "0") == "1"
         ):
             mesh = self.mlp.mesh
             mesh_ep_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)

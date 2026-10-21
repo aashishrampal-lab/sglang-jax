@@ -1111,11 +1111,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
-        # Prefill schedules at most 1 request per DP rank per wave, so cap
-        # Decode transfer admission to 1 per DP rank (dp_size total) per wave.
+        inflight_per_dp = int(os.environ.get("SGL_PD_MAX_INFLIGHT_PER_DP", "8"))
         max_inflight = min(
             int(self.server_args.disaggregation_max_inflight_transfers or self.dp_size),
-            int(self.dp_size),
+            max(int(self.dp_size), inflight_per_dp * int(self.dp_size)),
         )
         per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
