@@ -17,7 +17,11 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase, prepad_replicated_quantized_linears
+from sgl_jax.srt.layers.linear import (
+    LinearBase,
+    QuantizedLinear,
+    prepad_replicated_quantized_linears,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -170,6 +174,7 @@ class GlmDsaIndexer(nnx.Module):
         rotary_emb: Any,
         *,
         q_group: int = 1,
+        precomputed_wk: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Indexer projections only (query, key, per-head weights); no top-k.
 
@@ -185,7 +190,10 @@ class GlmDsaIndexer(nnx.Module):
         query, _ = self.wq_b(qr_q)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
-        key, _ = self.wk(hidden_states)
+        if precomputed_wk is not None:
+            key = precomputed_wk
+        else:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         rope_dim = 64
@@ -213,10 +221,18 @@ class GlmDsaIndexer(nnx.Module):
         return query, key, weights
 
     def project_key_only(
-        self, hidden_states: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        *,
+        precomputed_wk: jax.Array | None = None,
     ) -> jax.Array:
         """Indexer key projection only (for KV-only draft prefill on 1P)."""
-        key, _ = self.wk(hidden_states)
+        if precomputed_wk is not None:
+            key = precomputed_wk
+        else:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         rope_dim = 64
@@ -232,13 +248,22 @@ class GlmDsaIndexer(nnx.Module):
         return key
 
     def __call__(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        *,
+        precomputed_wk: jax.Array | None = None,
     ) -> jax.Array:
         # 1. Project Query and Key
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
-        key, _ = self.wk(hidden_states)
+        if precomputed_wk is not None:
+            key = precomputed_wk
+        else:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         # Apply RoPE
@@ -447,6 +472,122 @@ class Glm5Attention(nnx.Module):
             v_head_dim=self.qk_head_dim,
             layer_id=layer_id,
         )
+        self.qkv_a_proj = nnx.data(None) if hasattr(nnx, "data") else None
+        self._qkv_a_has_wk = False
+        self._qkv_a_offsets = None
+
+    def fuse_qkv_a_proj(self, fuse_wk: bool = True, drop_originals: bool = True) -> bool:
+        """Fuse replicated block-quant `q_a_proj` + `kv_a_proj_with_mqa` (+ `indexer.wk`) into one `QuantizedLinear`."""
+        if os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") == "0" or self.qkv_a_proj is not None:
+            return False
+        if not (
+            isinstance(self.q_a_proj, QuantizedLinear)
+            and isinstance(self.kv_a_proj_with_mqa, QuantizedLinear)
+        ):
+            return False
+        if (
+            self.q_a_proj.kernel_axes != (None, None)
+            or self.kv_a_proj_with_mqa.kernel_axes != (None, None)
+            or self.q_a_proj.bias is not None
+            or self.kv_a_proj_with_mqa.bias is not None
+        ):
+            return False
+        w_qa = self.q_a_proj.weight_q.value
+        s_qa = self.q_a_proj.weight_scale.value
+        w_kva = self.kv_a_proj_with_mqa.weight_q.value
+        s_kva = self.kv_a_proj_with_mqa.weight_scale.value
+        if (
+            not isinstance(w_qa, jax.Array)
+            or not isinstance(s_qa, jax.Array)
+            or not isinstance(w_kva, jax.Array)
+            or not isinstance(s_kva, jax.Array)
+            or isinstance(w_qa, jax.ShapeDtypeStruct)
+            or isinstance(s_qa, jax.ShapeDtypeStruct)
+            or isinstance(w_kva, jax.ShapeDtypeStruct)
+            or isinstance(s_kva, jax.ShapeDtypeStruct)
+        ):
+            return False
+        if getattr(s_qa, "ndim", 0) != 3 or getattr(s_kva, "ndim", 0) != 3:
+            return False
+        self.q_a_proj.pad_out_rows(256)
+        self.kv_a_proj_with_mqa.pad_out_rows(256)
+        w_qa = self.q_a_proj.weight_q.value
+        s_qa = self.q_a_proj.weight_scale.value
+        w_kva = self.kv_a_proj_with_mqa.weight_q.value
+        s_kva = self.kv_a_proj_with_mqa.weight_scale.value
+        qa_valid = self.q_a_proj.n_out_valid or int(w_qa.shape[0])
+        kva_valid = self.kv_a_proj_with_mqa.n_out_valid or int(w_kva.shape[0])
+        qa_pad = int(w_qa.shape[0])
+        kva_pad = int(w_kva.shape[0])
+
+        has_wk = (
+            fuse_wk
+            and self.indexer is not None
+            and isinstance(self.indexer.wk, QuantizedLinear)
+            and self.indexer.wk.kernel_axes == (None, None)
+            and self.indexer.wk.bias is None
+            and isinstance(self.indexer.wk.weight_q.value, jax.Array)
+            and isinstance(self.indexer.wk.weight_scale.value, jax.Array)
+            and not isinstance(self.indexer.wk.weight_q.value, jax.ShapeDtypeStruct)
+            and not isinstance(self.indexer.wk.weight_scale.value, jax.ShapeDtypeStruct)
+            and getattr(self.indexer.wk.weight_scale.value, "ndim", 0) == 3
+        )
+        if has_wk:
+            self.indexer.wk.pad_out_rows(256)
+            w_wk = self.indexer.wk.weight_q.value
+            s_wk = self.indexer.wk.weight_scale.value
+            wk_valid = self.indexer.wk.n_out_valid or int(w_wk.shape[0])
+            w_fused = jnp.concatenate([w_qa, w_kva, w_wk], axis=0)
+            s_fused = jnp.concatenate([s_qa, s_kva, s_wk], axis=2)
+            self._qkv_a_has_wk = True
+            self._qkv_a_offsets = (
+                qa_valid,
+                qa_pad,
+                qa_pad + kva_valid,
+                qa_pad + kva_pad,
+                qa_pad + kva_pad + wk_valid,
+            )
+        else:
+            w_fused = jnp.concatenate([w_qa, w_kva], axis=0)
+            s_fused = jnp.concatenate([s_qa, s_kva], axis=2)
+            self._qkv_a_has_wk = False
+            self._qkv_a_offsets = (
+                qa_valid,
+                qa_pad,
+                qa_pad + kva_valid,
+                0,
+                0,
+            )
+
+        # Pad total output rows to a multiple of 1024 (e.g. 2816 -> 3072) so
+        # out_block_size = 1024 divides n_out without any runtime jnp.pad.
+        rem_1024 = int(w_fused.shape[0]) % 1024
+        if rem_1024 != 0:
+            pad_rows = 1024 - rem_1024
+            w_fused = jnp.pad(w_fused, ((0, pad_rows), (0, 0)))
+            s_fused = jnp.pad(s_fused, ((0, 0), (0, 0), (0, pad_rows)))
+
+        fused_proj = QuantizedLinear(
+            weight_q=w_fused,
+            weight_scale=s_fused,
+            bias=None,
+            activation_dtype=self.q_a_proj.activation_dtype,
+            mesh=self.mesh,
+            kernel_axes=(None, None),
+            skip_bias_add=False,
+            params_dtype=self.q_a_proj.params_dtype,
+            compute_dtype=self.q_a_proj.compute_dtype,
+            weight_block_size=self.q_a_proj.weight_block_size,
+            allow_narrow_n_blockwise=self.q_a_proj.allow_narrow_n_blockwise,
+            scope_name="quantized_qkv_a_proj",
+        )
+        self.qkv_a_proj = nnx.data(fused_proj) if hasattr(nnx, "data") else fused_proj
+        if drop_originals:
+            self.q_a_proj = nnx.data(None) if hasattr(nnx, "data") else None
+            self.kv_a_proj_with_mqa = nnx.data(None) if hasattr(nnx, "data") else None
+            if has_wk:
+                self.indexer.wk = nnx.data(None) if hasattr(nnx, "data") else None
+        return True
 
     def prepare_weight_loading(self, loader, mappings, prefix):
         from sgl_jax.srt.layers.weight_loading import prepare_absorbed_mla
@@ -536,7 +677,16 @@ class Glm5Attention(nnx.Module):
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
-        q_compressed, _ = self.q_a_proj(hidden_states)
+        if self.qkv_a_proj is not None:
+            qkv_out, _ = self.qkv_a_proj(hidden_states)
+            qa_end, kva_start, kva_end, wk_start, wk_end = self._qkv_a_offsets
+            q_compressed = qkv_out[:, :qa_end]
+            latent_cache = qkv_out[:, kva_start:kva_end]
+            precomputed_wk = qkv_out[:, wk_start:wk_end] if self._qkv_a_has_wk else None
+        else:
+            q_compressed, _ = self.q_a_proj(hidden_states)
+            latent_cache = None
+            precomputed_wk = None
         q_compressed = self.q_a_layernorm(q_compressed)
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
@@ -587,17 +737,25 @@ class Glm5Attention(nnx.Module):
                         positions,
                         self.rotary_emb,
                         q_group=q_group,
+                        precomputed_wk=precomputed_wk,
                     )
                     dsa_kwargs["q_idx"] = q_idx
                     dsa_kwargs["k_idx"] = k_idx
                     dsa_kwargs["idx_weights"] = idx_w
         elif self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+            _ = self.indexer(
+                hidden_states,
+                q_compressed,
+                positions,
+                self.rotary_emb,
+                precomputed_wk=precomputed_wk,
+            )
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
 
-        latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
+        if latent_cache is None:
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
@@ -624,15 +782,26 @@ class Glm5Attention(nnx.Module):
         token_to_kv_pool: KVCache,
     ) -> jax.Array:
         """KV-only prefill write-back: projects and writes only c_kv, k_rope, and k_idx."""
+        if self.kv_a_proj_with_mqa is not None:
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
+            precomputed_wk = None
+        else:
+            qkv_out, _ = self.qkv_a_proj(hidden_states)
+            _, kva_start, kva_end, wk_start, wk_end = self._qkv_a_offsets
+            latent_cache = qkv_out[:, kva_start:kva_end]
+            precomputed_wk = qkv_out[:, wk_start:wk_end] if self._qkv_a_has_wk else None
+
         dsa_kwargs = {}
         if self.use_dsa_sparse:
             dsa_kwargs["indexer_type"] = self.indexer_type
             if self.indexer is not None:
                 dsa_kwargs["k_idx"] = self.indexer.project_key_only(
-                    hidden_states, positions, self.rotary_emb
+                    hidden_states,
+                    positions,
+                    self.rotary_emb,
+                    precomputed_wk=precomputed_wk,
                 )
 
-        latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
@@ -648,6 +817,30 @@ class Glm5Attention(nnx.Module):
             token_to_kv_pool,
             **dsa_kwargs,
         )
+
+
+def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
+    """Fuse replicated block-quant `q_a_proj` + `kv_a_proj_with_mqa` (+ `indexer.wk`) across all `Glm5Attention` layers."""
+    if os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") == "0":
+        return 0
+    fused_with_wk = 0
+    fused_no_wk = 0
+    for _, sub in module.iter_modules():
+        if isinstance(sub, Glm5Attention) and sub.fuse_qkv_a_proj():
+            if sub._qkv_a_has_wk:
+                fused_with_wk += 1
+            else:
+                fused_no_wk += 1
+    total = fused_with_wk + fused_no_wk
+    if total:
+        logger.info(
+            "Fused %d Glm5Attention input projections into (3072, 6144) QuantizedLinear "
+            "(with_wk=%d, shared_no_wk=%d)",
+            total,
+            fused_with_wk,
+            fused_no_wk,
+        )
+    return total
 
 
 class Glm5MLP(nnx.Module):
@@ -1392,6 +1585,7 @@ class Glm5ForCausalLM(nnx.Module):
                 gc.collect()
         else:
             loader.load(weight_mappings)
+        fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
 
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
@@ -1888,6 +2082,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         # MLA absorption and fused-MLP packing run inside loader.load via the
         # modules' prepare_weight_loading hooks (#1716); no post-load pass.
         self.loader.load(mappings)
+        fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
 
     def get_shared_weight_paths(self):
