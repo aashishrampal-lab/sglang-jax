@@ -1,5 +1,6 @@
 import itertools
 import logging
+import os
 import time
 
 import jax
@@ -312,7 +313,13 @@ class EAGLEWorker(BaseSpecWorker):
                                 )
                         spec_info = _make_non_relay_spec_info(model_worker_batch)
                         if self.spec_relay_buffers is not None:
-                            if bs == shapes[0][0]:
+                            max_non_relay_bs = int(
+                                os.environ.get(
+                                    "SGLANG_JAX_SPEC_NON_RELAY_PRECOMPILE_MAX_BS",
+                                    "64",
+                                )
+                            )
+                            if bs == shapes[0][0] or bs <= max_non_relay_bs:
                                 model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                                 model_worker_batch.spec_info_padded = spec_info
                                 model_worker_batch.speculative_eagle_topk = self.topk
