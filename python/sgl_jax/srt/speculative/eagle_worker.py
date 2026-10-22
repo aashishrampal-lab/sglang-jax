@@ -293,9 +293,9 @@ class EAGLEWorker(BaseSpecWorker):
                         allocate_lens=batch.seq_lens + max(3 * EagleDraftInput.ALLOC_LEN_PER_DECODE, 2 * num_steps),
                     )
 
-                greedy_modes = (True, False) if bs == shapes[0][0] else (False,)
+                greedy_modes = (True, False)
                 for is_greedy in greedy_modes:
-                    top_p_modes = (False,) if is_greedy else (True, False) if bs == shapes[0][0] else (True,)
+                    top_p_modes = (False,) if is_greedy else (True, False)
                     for use_top_p in top_p_modes:
                         model_worker_batch = _make_decode_batch()
                         model_worker_batch.sampling_info.is_all_greedy = is_greedy
@@ -312,7 +312,7 @@ class EAGLEWorker(BaseSpecWorker):
                                 )
                         spec_info = _make_non_relay_spec_info(model_worker_batch)
                         if self.spec_relay_buffers is not None:
-                            if bs == shapes[0][0] and use_top_p == top_p_modes[0]:
+                            if bs == shapes[0][0]:
                                 model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                                 model_worker_batch.spec_info_padded = spec_info
                                 model_worker_batch.speculative_eagle_topk = self.topk
