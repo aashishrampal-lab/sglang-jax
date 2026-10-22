@@ -449,7 +449,12 @@ for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
             _k256 = _tk[:6] + (256, _tk[7])
             _dst.setdefault(_k256, (max(1, _tv[0] // 2),) + _tv[1:])
     _dst[("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 2)] = (4, 2)
+    for _mnt in (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        _dst.setdefault(("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, _mnt), (16, 16))
+    for _mnt in (16, 32, 64, 128):
+        _dst.setdefault(("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, _mnt), (16, 1, 2))
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 256)] = (8, 1, 2)
+    _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 512)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1024)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2048)] = (8, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4096)] = (8, 1, 2)

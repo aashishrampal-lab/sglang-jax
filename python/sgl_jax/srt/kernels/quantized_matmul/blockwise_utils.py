@@ -199,15 +199,16 @@ def _iter_blockwise_tuned_candidates(
 
         # Soft ranking: tuple comparison gives lexicographic priority to
         # (1) exact activation dtype match, then (2) closest n_in, then
-        # (3) closest n_batch, then (4) closest n_out.
+        # (3) closest n_out (so a missing n_batch never borrows an
+        # out_block_size from a different layer's n_out), then (4) closest n_batch.
         score = (
             compatible_x_dtype_names.index(key.x_q_dtype),
             key.n_in != n_in,
             abs(key.n_in - n_in),
-            key.n_batch != n_batch,
-            abs(key.n_batch - n_batch),
             key.n_out != n_out,
             abs(key.n_out - n_out),
+            key.n_batch != n_batch,
+            abs(key.n_batch - n_batch),
         )
         candidates.append((score, value))
 

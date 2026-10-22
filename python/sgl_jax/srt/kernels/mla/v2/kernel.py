@@ -1402,6 +1402,7 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "decode_batch_size",
         "mixed_static_q_len",
+        "static_dist",
         "debug_mode",
     ),
     donate_argnames=("cache_kv",),
@@ -1440,6 +1441,7 @@ def mla_ragged_paged_attention(
     # Ignored (tuned block kept) when the resulting block is not in the
     # validated sub-tile family for the shard's head count.
     mixed_static_q_len: int | None = None,
+    static_dist: tuple[int, int, int] | None = None,
     # Debug params.
     debug_mode: bool = False,
 ) -> tuple[
@@ -1778,66 +1780,80 @@ def mla_ragged_paged_attention(
             cache_kv,
         )
 
-    batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
-    # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        cache_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=batch_distribution,
-        static_q_len=1,
-        batch_size=decode_batch_size,
-        case=MlaCase.BATCHED_DECODE,
-    )
+    run_bd = True
+    run_d = True
+    run_m = True
+    if static_dist is not None:
+        d0, d1, d2 = static_dist
+        batch_d0 = (d0 // decode_batch_size) * decode_batch_size
+        run_bd = batch_d0 > 0
+        run_d = d0 > batch_d0
+        run_m = d2 > d1
 
-    # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        case=MlaCase.DECODE,
-    )
+    batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+    updated_kv = cache_kv
+    if run_bd:
+        # Batched decode
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            case=MlaCase.BATCHED_DECODE,
+        )
+
+    if run_d:
+        # Decode-only
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.DECODE,
+        )
     # TODO: evaluate if chunk-prefill-only branch is needed
 
-    # Mixed
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        static_q_len=mixed_static_q_len,
-        case=MlaCase.MIXED,
-    )
+    if run_m:
+        # Mixed
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=mixed_static_q_len,
+            case=MlaCase.MIXED,
+        )
     output = prepare_outputs(
         ql_nope, actual_num_q_heads, actual_lkv_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]

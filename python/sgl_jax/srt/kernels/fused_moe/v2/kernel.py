@@ -405,7 +405,7 @@ def _fused_ep_moe_kernel(
         t_dtype = jnp.float8_e4m3fn
         t_packing = get_dtype_packing(t_dtype)
         h_per_t = hidden_size // t_packing
-        pq_chunk = min(32, local_num_tokens)
+        pq_chunk = math.gcd(32, local_num_tokens)
         assert local_num_tokens % pq_chunk == 0, (
             f"act_quant prequant requires local_num_tokens "
             f"({local_num_tokens}) divisible by pq_chunk ({pq_chunk})"

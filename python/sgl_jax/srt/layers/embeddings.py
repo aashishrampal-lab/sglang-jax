@@ -248,15 +248,19 @@ class RotaryEmbedding:
         positions: jax.Array,
         query: jax.Array,
         key: jax.Array,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        positions = positions.flatten()  # [num_tokens]
-
-        cos, sin = self._compute_cos_sin(positions)
-        cos = cos.astype(self.dtype)
-        sin = sin.astype(self.dtype)
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            num_tokens = cos.shape[0]
+        else:
+            positions = positions.flatten()  # [num_tokens]
+            num_tokens = positions.shape[0]
+            cos, sin = self._compute_cos_sin(positions)
+            cos = cos.astype(self.dtype)
+            sin = sin.astype(self.dtype)
 
         query_shape = query.shape
-        num_tokens = positions.shape[0]
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
@@ -277,6 +281,11 @@ class RotaryEmbedding:
             key = key_rot.reshape(key_shape)
 
         return query, key
+
+    def compute_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Precompute (cos, sin) in model dtype for sharing across layers."""
+        cos, sin = self._compute_cos_sin(positions.flatten())
+        return cos.astype(self.dtype), sin.astype(self.dtype)
 
     def _compute_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Compute RoPE phases in float32 before casting to the model dtype."""

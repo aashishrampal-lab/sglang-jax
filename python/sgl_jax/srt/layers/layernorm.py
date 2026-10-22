@@ -74,6 +74,27 @@ class RMSNorm(nnx.Module):
 
     @named_scope
     def __call__(self, x, mask: jax.Array | None = None):
+        if self.axis_name is None and mask is None:
+            out_dtype = dtypes.canonicalize_dtype(
+                *([x, self.scale.value] if self.scale is not None else [x]),
+                dtype=self.dtype,
+            )
+            compute_dtype = jnp.promote_types(
+                self.dtype if self.dtype is not None else jnp.result_type(x),
+                jnp.float32,
+            )
+            x_f32 = jnp.asarray(x, compute_dtype)
+            axes = _canonicalize_axes(x.ndim, self.reduction_axes)
+            var = jnp.mean(lax.square(x_f32), axis=axes, keepdims=True)
+            normed = jnp.asarray(x_f32 * lax.rsqrt(var + self.epsilon), out_dtype)
+            if self.scale is not None:
+                feature_axes = _canonicalize_axes(x.ndim, self.feature_axes)
+                feature_shape = [1] * x.ndim
+                for ax in feature_axes:
+                    feature_shape[ax] = x.shape[ax]
+                normed = normed * jnp.asarray(self.scale.value.reshape(feature_shape), out_dtype)
+            return normed
+
         mean, var = _compute_stats(
             x,
             self.reduction_axes,

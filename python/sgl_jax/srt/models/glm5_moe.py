@@ -95,10 +95,13 @@ class GlmNorm(nnx.Module):
         self.bias = nnx.Param(jnp.zeros((dim,), dtype=dtype))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        variance = jnp.var(x, axis=-1, keepdims=True)
+        orig_dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        mean = jnp.mean(x_f32, axis=-1, keepdims=True)
+        diff = x_f32 - mean
+        variance = jnp.mean(jax.lax.square(diff), axis=-1, keepdims=True)
         eps = 1e-5
-        normalized = (x - mean) / jnp.sqrt(variance + eps)
+        normalized = (diff * jax.lax.rsqrt(variance + eps)).astype(orig_dtype)
         return normalized * self.weight.value + self.bias.value
 
 
@@ -112,12 +115,12 @@ def _build_hadamard_np(n: int) -> np.ndarray:
 _HADAMARD_128_SCALED_NP = _build_hadamard_np(128) * (128**-0.5)
 
 
-def get_hadamard_matrix(n):
+def get_hadamard_matrix(n, dtype: jnp.dtype = jnp.bfloat16):
     if n == 128:
-        return jnp.asarray(_build_hadamard_np(128))
+        return jnp.asarray(_build_hadamard_np(128), dtype=dtype)
     if n == 1:
-        return jnp.array([[1.0]])
-    h = get_hadamard_matrix(n // 2)
+        return jnp.array([[1.0]], dtype=dtype)
+    h = get_hadamard_matrix(n // 2, dtype=dtype)
     return jnp.block([[h, h], [h, -h]])
 
 
@@ -175,6 +178,7 @@ class GlmDsaIndexer(nnx.Module):
         *,
         q_group: int = 1,
         precomputed_wk: jax.Array | None = None,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Indexer projections only (query, key, per-head weights); no top-k.
 
@@ -200,10 +204,15 @@ class GlmDsaIndexer(nnx.Module):
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim][:, None, :]
         if use_q_slice:
-            q_rope, _ = rotary_emb(pos_q, q_rope, q_rope[:, :1, :])
-            _, k_rope = rotary_emb(positions, k_rope, k_rope)
+            cos_sin_q = (
+                (cos_sin[0][q_group - 1 :: q_group], cos_sin[1][q_group - 1 :: q_group])
+                if cos_sin is not None
+                else None
+            )
+            q_rope, _ = rotary_emb(pos_q, q_rope, q_rope[:, :1, :], cos_sin=cos_sin_q)
+            _, k_rope = rotary_emb(positions, k_rope, k_rope, cos_sin=cos_sin)
         else:
-            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope, cos_sin=cos_sin)
         if _INDEXER_ROPE_CONCAT:
             # concat instead of at[].set: avoids a read-modify-write of the
             # full [T, n_head, head_dim] tensor (values are identical).
@@ -213,9 +222,13 @@ class GlmDsaIndexer(nnx.Module):
             query = query.at[:, :, :rope_dim].set(q_rope)
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP)
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP, dtype=query.dtype)
+        query = jnp.einsum(
+            "thd,de->the", query, h_matrix, preferred_element_type=jnp.float32
+        ).astype(query.dtype)
+        key = jnp.einsum(
+            "td,de->te", key, h_matrix, preferred_element_type=jnp.float32
+        ).astype(key.dtype)
 
         weights, _ = self.weights_proj(hs_q)
         return query, key, weights
@@ -227,6 +240,7 @@ class GlmDsaIndexer(nnx.Module):
         rotary_emb: Any,
         *,
         precomputed_wk: jax.Array | None = None,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> jax.Array:
         """Indexer key projection only (for KV-only draft prefill on 1P)."""
         if precomputed_wk is not None:
@@ -237,14 +251,16 @@ class GlmDsaIndexer(nnx.Module):
 
         rope_dim = 64
         k_rope = key[:, :rope_dim][:, None, :]
-        _, k_rope = rotary_emb(positions, k_rope, k_rope)
+        _, k_rope = rotary_emb(positions, k_rope, k_rope, cos_sin=cos_sin)
         if _INDEXER_ROPE_CONCAT:
             key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
         else:
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP, dtype=key.dtype)
+        key = jnp.einsum(
+            "td,de->te", key, h_matrix, preferred_element_type=jnp.float32
+        ).astype(key.dtype)
         return key
 
     def __call__(
@@ -255,6 +271,7 @@ class GlmDsaIndexer(nnx.Module):
         rotary_emb: Any,
         *,
         precomputed_wk: jax.Array | None = None,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> jax.Array:
         # 1. Project Query and Key
         query, _ = self.wq_b(qr)
@@ -272,7 +289,7 @@ class GlmDsaIndexer(nnx.Module):
         k_rope = key[:, :rope_dim]
         k_rope = k_rope[:, None, :]  # Add head dim for RoPE
 
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope, cos_sin=cos_sin)
         k_rope = k_rope.squeeze(1)  # Remove head dim
 
         if _INDEXER_ROPE_CONCAT:
@@ -283,11 +300,14 @@ class GlmDsaIndexer(nnx.Module):
             key = key.at[:, :rope_dim].set(k_rope)
 
         # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
+        h_matrix = jnp.asarray(_HADAMARD_128_SCALED_NP, dtype=query.dtype)
 
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        query = jnp.einsum(
+            "thd,de->the", query, h_matrix, preferred_element_type=jnp.float32
+        ).astype(query.dtype)
+        key = jnp.einsum(
+            "td,de->te", key, h_matrix, preferred_element_type=jnp.float32
+        ).astype(key.dtype)
 
         # 2. Compute Logits (simplified dense dot product)
         key_replicated = jax.sharding.reshard(
@@ -676,6 +696,7 @@ class Glm5Attention(nnx.Module):
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if self.qkv_a_proj is not None:
             qkv_out, _ = self.qkv_a_proj(hidden_states)
@@ -738,6 +759,7 @@ class Glm5Attention(nnx.Module):
                         self.rotary_emb,
                         q_group=q_group,
                         precomputed_wk=precomputed_wk,
+                        cos_sin=cos_sin,
                     )
                     dsa_kwargs["q_idx"] = q_idx
                     dsa_kwargs["k_idx"] = k_idx
@@ -749,6 +771,7 @@ class Glm5Attention(nnx.Module):
                 positions,
                 self.rotary_emb,
                 precomputed_wk=precomputed_wk,
+                cos_sin=cos_sin,
             )
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
@@ -760,7 +783,7 @@ class Glm5Attention(nnx.Module):
         compressed = self.kv_a_layernorm(compressed)
 
         k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope, cos_sin=cos_sin)
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
@@ -780,6 +803,7 @@ class Glm5Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> jax.Array:
         """KV-only prefill write-back: projects and writes only c_kv, k_rope, and k_idx."""
         if self.kv_a_proj_with_mqa is not None:
@@ -800,13 +824,14 @@ class Glm5Attention(nnx.Module):
                     positions,
                     self.rotary_emb,
                     precomputed_wk=precomputed_wk,
+                    cos_sin=cos_sin,
                 )
 
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
         k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        _, k_rope = self.rotary_emb(positions, k_rope, k_rope, cos_sin=cos_sin)
 
         c_kv_3d = compressed[:, None, :]
         return forward_batch.attn_backend.forward_kv_only(
@@ -1232,6 +1257,7 @@ class Glm5DecoderLayer(nnx.Module):
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
@@ -1249,6 +1275,7 @@ class Glm5DecoderLayer(nnx.Module):
             dsa_topk_in=dsa_topk_in,
             dsa_topk_pages_in=dsa_topk_pages_in,
             dsa_topk_reuse=dsa_topk_reuse,
+            cos_sin=cos_sin,
         )
         hidden_states += residual
         residual = hidden_states
@@ -1351,6 +1378,7 @@ class Glm5DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> jax.Array:
         """KV-only prefill write-back: skips attention output projection and MoE layer."""
         hidden_states = self.input_layernorm(hidden_states)
@@ -1359,6 +1387,7 @@ class Glm5DecoderLayer(nnx.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            cos_sin=cos_sin,
         )
 
 
@@ -1407,6 +1436,11 @@ class Glm5Model(nnx.Module):
 
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+        cos_sin = (
+            self.layers[0].self_attn.rotary_emb.compute_cos_sin(forward_batch.positions)
+            if len(self.layers) > 0
+            else None
+        )
         residual = None
         layers_kv_fused = []
         layers_idx_fused = []
@@ -1424,6 +1458,7 @@ class Glm5Model(nnx.Module):
                 dispatch_info=forward_batch.expert_location_metadata,
                 dsa_topk_in=dsa_topk,
                 dsa_topk_pages_in=dsa_topk_pages,
+                cos_sin=cos_sin,
             )
             if isinstance(kv_fused, DSAFusedCache):
                 layers_kv_fused.append(kv_fused.kv)
@@ -2010,6 +2045,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             if hasattr(memory_pools, "token_to_kv_pool")
             else memory_pools
         )
+        cos_sin = self.mtp_block.self_attn.rotary_emb.compute_cos_sin(forward_batch.positions)
         hidden_states, residual, kv_fused, _ = self.mtp_block(
             forward_batch.positions,
             hidden_states,
@@ -2021,6 +2057,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             dsa_topk_in=None,
             dsa_topk_pages_in=dsa_topk_pages_in,
             dsa_topk_reuse=dsa_topk_reuse,
+            cos_sin=cos_sin,
         )
 
         if residual is not None:
@@ -2065,11 +2102,13 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             if hasattr(memory_pools, "token_to_kv_pool")
             else memory_pools
         )
+        cos_sin = self.mtp_block.self_attn.rotary_emb.compute_cos_sin(forward_batch.positions)
         kv_fused = self.mtp_block.forward_kv_only(
             forward_batch.positions,
             hidden_states,
             forward_batch,
             token_to_kv_pool,
+            cos_sin=cos_sin,
         )
         is_dsa = isinstance(kv_fused, DSAFusedCache)
         return nextn_pool_updates(kv_fused, is_dsa)
