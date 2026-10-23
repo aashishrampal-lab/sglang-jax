@@ -1,0 +1,785 @@
+# ==============================================================================
+# GLM-5.3 FP8 — PD Disaggregated 1P1D with dp=8, tp=2 + Host DRAM HiCache
+# ==============================================================================
+# Hardware : 2x TPU v7x 2x2x2 slices (1P + 1D) = 16 TPU7x chips (32 devices)
+# Sharding : --tp-size 16 --dp-size 8 --ep-size 16 (data=8, tensor=2: 1 chip/DP)
+# HiCache  : UnifiedRadixCache + write-through pinned host DRAM KV pool on 1P
+# Cost     : $86.40/hr ($43.20/hr 1P + $43.20/hr 1D at $5.40/chip-hr 3-Yr CUD)
+# Repo     : https://github.com/aashishrampal-lab/sglang-jax.git
+# Branch   : glm52-rec2-coop-radix-split (commit 1cef18b)
+# Deploy   : kubectl apply -f glm53_pdb_dp8_tp2_hicache.yaml
+# ==============================================================================
+# 1. Headless Services (1P & 1D Multi-Host TPU Worker Discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm53-pdb-dp8-prefill
+  namespace: ubench-regression-tests
+  labels:
+    app: glm53-pdb-dp8-prefill
+    role: prefill
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: glm53-pdb-dp8-prefill
+  ports:
+  - name: http
+    port: 30271
+    targetPort: 30271
+  - name: router
+    port: 8000
+    targetPort: 8000
+  - name: bootstrap
+    port: 8998
+    targetPort: 8998
+  - name: transfer
+    port: 19000
+    targetPort: 19000
+  - name: sidechannel
+    port: 20000
+    targetPort: 20000
+  - name: dist-init
+    port: 5000
+    targetPort: 5000
+  - name: tpu-process
+    port: 8471
+    targetPort: 8471
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm53-pdb-dp8-decode
+  namespace: ubench-regression-tests
+  labels:
+    app: glm53-pdb-dp8-decode
+    role: decode
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: glm53-pdb-dp8-decode
+  ports:
+  - name: http
+    port: 30271
+    targetPort: 30271
+  - name: transfer
+    port: 19000
+    targetPort: 19000
+  - name: sidechannel
+    port: 20000
+    targetPort: 20000
+  - name: dist-init
+    port: 5000
+    targetPort: 5000
+  - name: tpu-process
+    port: 8471
+    targetPort: 8471
+---
+# 2. ClusterIP Services (Prefill Rank-0, Decode Rank-0 & MiniLB Router)
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm53-pdb-dp8-prefill-svc
+  namespace: ubench-regression-tests
+spec:
+  selector:
+    app: glm53-pdb-dp8-prefill
+    batch.kubernetes.io/job-completion-index: '0'
+  ports:
+  - name: http
+    port: 30271
+    targetPort: 30271
+  - name: bootstrap
+    port: 8998
+    targetPort: 8998
+  - name: transfer
+    port: 19000
+    targetPort: 19000
+  - name: sidechannel
+    port: 20000
+    targetPort: 20000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm53-pdb-dp8-decode-svc
+  namespace: ubench-regression-tests
+spec:
+  selector:
+    app: glm53-pdb-dp8-decode
+    batch.kubernetes.io/job-completion-index: '0'
+  ports:
+  - name: http
+    port: 30271
+    targetPort: 30271
+  - name: transfer
+    port: 19000
+    targetPort: 19000
+  - name: sidechannel
+    port: 20000
+    targetPort: 20000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm53-pdb-dp8-lb-svc
+  namespace: ubench-regression-tests
+spec:
+  selector:
+    app: glm53-pdb-dp8-prefill
+    batch.kubernetes.io/job-completion-index: '0'
+  ports:
+  - name: router
+    port: 8000
+    targetPort: 8000
+---
+# 3. 1P Prefill TPU v7x 2x2x2 Job (dp=8, tp=2, ep=16 + HiCache + MiniLB on Rank 0)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm53-pdb-dp8-prefill-slice-0
+  namespace: ubench-regression-tests
+  labels:
+    app: glm53-pdb-dp8-prefill
+    kueue.x-k8s.io/queue-name: multislice-queue
+    role: prefill
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  template:
+    metadata:
+      annotations:
+        cloud.google.com/gke-tpu-slice-topology: 2x2x2
+        kueue.x-k8s.io/podset-unconstrained-topology: 'true'
+      labels:
+        app: glm53-pdb-dp8-prefill
+        kueue.x-k8s.io/queue-name: multislice-queue
+        role: prefill
+    spec:
+      subdomain: glm53-pdb-dp8-prefill
+      priorityClassName: medium
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/placement-policy-name: tpu7x-16-2x2x2-placement-policy
+        cloud.google.com/reservation-name: cloudtpu-20260710003900-159478293
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: NotIn
+                values:
+                - nap-tpu7x-stand-4t-i37nynsx
+                - nap-tpu7x-stand-4t-1shzp8ot
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      - key: cloud.google.com/reservation-name
+        operator: Equal
+        value: cloudtpu-20260710003900-159478293
+        effect: NoSchedule
+      volumes:
+      - name: tmp-ram
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
+      - name: model
+        persistentVolumeClaim:
+          claimName: glm53-model-rox
+          readOnly: true
+      containers:
+      - name: sglang-jax
+        image: us-central1-docker.pkg.dev/tpu-prod-env-one-vm/ubench-runner/vllm-tpu:glm5_2_dsa
+        imagePullPolicy: Always
+        command:
+        - /bin/bash
+        - -c
+        - |
+          for i in {0..1}; do
+            until getent hosts glm53-pdb-dp8-prefill-slice-0-${i}.glm53-pdb-dp8-prefill >/dev/null 2>&1; do
+              sleep 2
+            done
+          done
+
+          PHYS_ID=$(curl -sf -H "Metadata-Flavor: Google" \
+            http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number \
+            || echo "${JOB_COMPLETION_INDEX}")
+          echo "[TPU-INIT] JOB_COMPLETION_INDEX=${JOB_COMPLETION_INDEX}, Physical GCE agent-worker-number=${PHYS_ID}"
+          export TPU_WORKER_ID="${PHYS_ID}"
+
+          if [ "${JOB_COMPLETION_INDEX}" != "${PHYS_ID}" ]; then
+            export TPU_WORKER_HOSTNAMES="glm53-pdb-dp8-prefill-slice-0-1.glm53-pdb-dp8-prefill,glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill"
+            export TPU_PROCESS_ADDRESSES="glm53-pdb-dp8-prefill-slice-0-1.glm53-pdb-dp8-prefill:8471,glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill:8471"
+          else
+            export TPU_WORKER_HOSTNAMES="glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill,glm53-pdb-dp8-prefill-slice-0-1.glm53-pdb-dp8-prefill"
+            export TPU_PROCESS_ADDRESSES="glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill:8471,glm53-pdb-dp8-prefill-slice-0-1.glm53-pdb-dp8-prefill:8471"
+          fi
+
+          while true; do
+            rm -rf /tmp/sglang-jax-src
+            git clone --single-branch -b glm52-rec2-coop-radix-split \
+              https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
+            git -C /tmp/sglang-jax-src checkout 1cef18b
+            cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
+            rm -rf /tmp/sglang-jax-src
+
+            if [ "${JOB_COMPLETION_INDEX}" = "0" ]; then
+              if [ -f /tmp/mini_lb.pid ]; then
+                kill "$(cat /tmp/mini_lb.pid)" 2>/dev/null || true
+              fi
+              python3 -u -m sgl_jax.srt.disaggregation.launch_router \
+                --pd-disaggregation --mini-lb \
+                --prefill http://glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill:30271 8998 \
+                --decode http://glm53-pdb-dp8-decode-slice-0-0.glm53-pdb-dp8-decode:30271 \
+                --host 0.0.0.0 --port 8000 \
+                --request-timeout-secs 3600 \
+                > /tmp/mini_lb.log 2>&1 &
+              echo $! > /tmp/mini_lb.pid
+            fi
+
+            python3 -u -m sgl_jax.launch_server \
+              --model-path /weights \
+              --tokenizer-path /weights \
+              --trust-remote-code \
+              --dist-init-addr glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill:5000 \
+              --nnodes 2 \
+              --node-rank ${JOB_COMPLETION_INDEX} \
+              --tp-size 16 \
+              --dp-size 8 \
+              --ep-size 16 \
+              --moe-backend fused_v2 \
+              --tool-call-parser glm47 \
+              --reasoning-parser glm45 \
+              --device tpu \
+              --random-seed 3 \
+              --dtype bfloat16 \
+              --kv-cache-dtype fp8_e4m3 \
+              --max-running-requests 256 \
+              --page-size 128 \
+              --chunked-prefill-size 2048 \
+              --max-prefill-tokens 16384 \
+              --mem-fraction-static 0.80 \
+              --context-length 110000 \
+              --attention-backend dsa_sparse \
+              --hicache-storage none \
+              --hicache-ratio 2.0 \
+              --hicache-write-policy write_through \
+              --enable-cache-report \
+              --enable-metrics \
+              --log-level-http warning \
+              --speculative-algorithm NEXTN \
+              --speculative-draft-model-path /weights \
+              --speculative-num-steps 4 \
+              --speculative-eagle-topk 1 \
+              --speculative-num-draft-tokens 5 \
+              --disaggregation-mode prefill \
+              --disaggregation-bootstrap-port 8998 \
+              --disaggregation-bootstrap-url http://glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill:8998 \
+              --disaggregation-transfer-port 19000 \
+              --disaggregation-side-channel-port 20000 \
+              --disaggregation-max-inflight-transfers 32 \
+              --precompile-bs-paddings 16 32 64 128 \
+              --precompile-token-paddings 256 512 1024 2048 4096 8192 16384 \
+              --host 0.0.0.0 \
+              --port 30271 \
+              2>&1 | tee /tmp/server_glm53_dp8_prefill.log
+            sleep 10
+          done
+        ports:
+        - name: http
+          containerPort: 30271
+          protocol: TCP
+        - name: router
+          containerPort: 8000
+          protocol: TCP
+        - name: bootstrap
+          containerPort: 8998
+          protocol: TCP
+        - name: transfer
+          containerPort: 19000
+          protocol: TCP
+        - name: sidechannel
+          containerPort: 20000
+          protocol: TCP
+        - name: dist-init
+          containerPort: 5000
+          protocol: TCP
+        - name: tpu-process
+          containerPort: 8471
+          protocol: TCP
+        resources:
+          requests:
+            google.com/tpu: '4'
+          limits:
+            google.com/tpu: '4'
+        volumeMounts:
+        - name: model
+          mountPath: /weights
+          readOnly: true
+        - name: tmp-ram
+          mountPath: /tmp
+        env:
+        - name: HOME
+          value: /tmp
+        - name: XDG_CACHE_HOME
+          value: /tmp/.cache
+        - name: HF_HOME
+          value: /tmp/hf_cache
+        - name: TPU_NAME
+          value: glm53-pdb-dp8-prefill
+        - name: JAX_COMPILATION_CACHE_DIR
+          value: /tmp/jit_cache
+        - name: SGL_MOE_FUSED_UNPERMUTE
+          value: '1'
+        - name: SGL_MOE_RAGGED_GATHER
+          value: '1'
+        - name: SGL_MOE_FUSED_MIN_TOKENS
+          value: '4096'
+        - name: SGL_MOE_EXPERT_SCATTER
+          value: '1'
+        - name: SGL_MOE_CHUNK_STAGE
+          value: '4'
+        - name: SGL_MLA_KV_PAD_MULTIPLE
+          value: '4096'
+        - name: SGL_MLA_MAX_PREFILL_KV_LEN
+          value: '110592'
+        - name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+          value: '1'
+        - name: DSA_INDEXER_KERNEL
+          value: '1'
+        - name: DSA_PREFILL_SPARSE
+          value: '1'
+        - name: DSA_INDEXER_KERNEL_PREFILL
+          value: '1'
+        - name: DSA_PREFILL_QBLOCK
+          value: '1'
+        - name: DSA_PREFILL_QBLOCK_QB
+          value: '32'
+        - name: DSA_SPEC_AS_DECODE
+          value: '1'
+        - name: DSA_SPEC_VERIFY_QGROUP
+          value: '1'
+        - name: DSA_IDX_VERIFY_BATCHED
+          value: '0'
+        - name: DSA_SPEC_VERIFY_LAST_Q_ONLY
+          value: '1'
+        - name: DSA_PAGE_TOPK
+          value: '16'
+        - name: DSA_TP_SHARD_MIN_SEQS
+          value: '2'
+        - name: SGLANG_JAX_MTP_KVSHARE
+          value: '1'
+        - name: SGLANG_JAX_MTP_INDEX_SHARE
+          value: '1'
+        - name: SGL_FUSED_KV_SCATTER
+          value: '0'
+        - name: SGL_DEBUG_STEP_TIMING
+          value: '1'
+        - name: SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD
+          value: '1'
+        - name: SGLANG_JAX_SPEC_CACHE_LOC_FIT
+          value: '1'
+        - name: SGLANG_JAX_SPEC_PRECOMPILE_FIRST_RUNG_ONLY
+          value: '1'
+        - name: SGLANG_JAX_SPEC_CACHE_LOC_LADDER
+          value: '110592'
+        - name: SGLANG_JAX_SPEC_NON_RELAY_PRECOMPILE_MAX_BS
+          value: '128'
+        - name: SGL_COOP_SINGLE_REQ
+          value: '0'
+        - name: DSA_SHARDED_PREFIX_PAGES
+          value: '0'
+        - name: SGL_ENABLE_RADIX_CACHE
+          value: '1'
+        - name: SGL_MLA_COOP_PREFIX
+          value: '0'
+        - name: DISAGG_LAUNCH_BOOTSTRAP
+          value: '1'
+        - name: SGL_NUM_PREFILL_DP_RANKS
+          value: '8'
+        - name: SGL_PD_SHARED_PREFIX_LEN
+          value: '262144'
+        - name: SGL_PD_MAX_PREFIX_SLOTS
+          value: '16'
+        - name: SGL_PD_PIN_PREFIX_SLOTS
+          value: '1'
+        - name: LIBTPU_INIT_ARGS
+          value: --xla_tpu_dvfs_p_state=7 --xla_tpu_all_gather_collective_matmul_mode=none --xla_tpu_reduce_scatter_collective_matmul_mode=none
+            --xla_jf_spmd_threshold_for_windowed_einsum_mib=100000
+        - name: TPU_PROCESS_PORT
+          value: '8471'
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+        - name: TPU_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+---
+# 4. 1D Decode TPU v7x 2x2x2 Job (dp=8, tp=2, ep=16)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm53-pdb-dp8-decode-slice-0
+  namespace: ubench-regression-tests
+  labels:
+    app: glm53-pdb-dp8-decode
+    kueue.x-k8s.io/queue-name: multislice-queue
+    role: decode
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  template:
+    metadata:
+      annotations:
+        cloud.google.com/gke-tpu-slice-topology: 2x2x2
+        kueue.x-k8s.io/podset-unconstrained-topology: 'true'
+      labels:
+        app: glm53-pdb-dp8-decode
+        kueue.x-k8s.io/queue-name: multislice-queue
+        role: decode
+    spec:
+      subdomain: glm53-pdb-dp8-decode
+      priorityClassName: medium
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/placement-policy-name: tpu7x-16-2x2x2-placement-policy
+        cloud.google.com/reservation-name: cloudtpu-20260710003900-159478293
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: NotIn
+                values:
+                - nap-tpu7x-stand-4t-i37nynsx
+                - nap-tpu7x-stand-4t-1shzp8ot
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      - key: cloud.google.com/reservation-name
+        operator: Equal
+        value: cloudtpu-20260710003900-159478293
+        effect: NoSchedule
+      volumes:
+      - name: tmp-ram
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: model
+        persistentVolumeClaim:
+          claimName: glm53-model-rox
+          readOnly: true
+      containers:
+      - name: sglang-jax
+        image: us-central1-docker.pkg.dev/tpu-prod-env-one-vm/ubench-runner/vllm-tpu:glm5_2_dsa
+        imagePullPolicy: Always
+        command:
+        - /bin/bash
+        - -c
+        - |
+          for i in {0..1}; do
+            until getent hosts glm53-pdb-dp8-decode-slice-0-${i}.glm53-pdb-dp8-decode >/dev/null 2>&1; do
+              sleep 2
+            done
+            until getent hosts glm53-pdb-dp8-prefill-slice-0-${i}.glm53-pdb-dp8-prefill >/dev/null 2>&1; do
+              sleep 2
+            done
+          done
+
+          PHYS_ID=$(curl -sf -H "Metadata-Flavor: Google" \
+            http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number \
+            || echo "${JOB_COMPLETION_INDEX}")
+          echo "[TPU-INIT] JOB_COMPLETION_INDEX=${JOB_COMPLETION_INDEX}, Physical GCE agent-worker-number=${PHYS_ID}"
+          export TPU_WORKER_ID="${PHYS_ID}"
+
+          if [ "${JOB_COMPLETION_INDEX}" != "${PHYS_ID}" ]; then
+            export TPU_WORKER_HOSTNAMES="glm53-pdb-dp8-decode-slice-0-1.glm53-pdb-dp8-decode,glm53-pdb-dp8-decode-slice-0-0.glm53-pdb-dp8-decode"
+            export TPU_PROCESS_ADDRESSES="glm53-pdb-dp8-decode-slice-0-1.glm53-pdb-dp8-decode:8471,glm53-pdb-dp8-decode-slice-0-0.glm53-pdb-dp8-decode:8471"
+          else
+            export TPU_WORKER_HOSTNAMES="glm53-pdb-dp8-decode-slice-0-0.glm53-pdb-dp8-decode,glm53-pdb-dp8-decode-slice-0-1.glm53-pdb-dp8-decode"
+            export TPU_PROCESS_ADDRESSES="glm53-pdb-dp8-decode-slice-0-0.glm53-pdb-dp8-decode:8471,glm53-pdb-dp8-decode-slice-0-1.glm53-pdb-dp8-decode:8471"
+          fi
+
+          while true; do
+            rm -rf /tmp/sglang-jax-src
+            git clone --single-branch -b glm52-rec2-coop-radix-split \
+              https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
+            git -C /tmp/sglang-jax-src checkout 1cef18b
+            cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
+            rm -rf /tmp/sglang-jax-src
+
+            python3 -u -m sgl_jax.launch_server \
+              --model-path /weights \
+              --tokenizer-path /weights \
+              --trust-remote-code \
+              --dist-init-addr glm53-pdb-dp8-decode-slice-0-0.glm53-pdb-dp8-decode:5000 \
+              --nnodes 2 \
+              --node-rank ${JOB_COMPLETION_INDEX} \
+              --tp-size 16 \
+              --dp-size 8 \
+              --ep-size 16 \
+              --moe-backend fused_v2 \
+              --tool-call-parser glm47 \
+              --reasoning-parser glm45 \
+              --device tpu \
+              --random-seed 3 \
+              --dtype bfloat16 \
+              --kv-cache-dtype fp8_e4m3 \
+              --max-running-requests 256 \
+              --page-size 128 \
+              --chunked-prefill-size 2048 \
+              --max-prefill-tokens 2048 \
+              --mem-fraction-static 0.875 \
+              --context-length 110000 \
+              --attention-backend dsa_sparse \
+              --enable-cache-report \
+              --disable-radix-cache \
+              --enable-metrics \
+              --log-level-http warning \
+              --speculative-algorithm NEXTN \
+              --speculative-draft-model-path /weights \
+              --speculative-num-steps 4 \
+              --speculative-eagle-topk 1 \
+              --speculative-num-draft-tokens 5 \
+              --disaggregation-mode decode \
+              --disaggregation-bootstrap-port 8998 \
+              --disaggregation-bootstrap-url http://glm53-pdb-dp8-prefill-slice-0-0.glm53-pdb-dp8-prefill:8998 \
+              --disaggregation-transfer-port 19000 \
+              --disaggregation-side-channel-port 20000 \
+              --disaggregation-max-inflight-transfers 32 \
+              --disaggregation-enable-overlap-schedule \
+              --disaggregation-num-reserved-decode-tokens 512 \
+              --precompile-bs-paddings 16 32 64 128 \
+              --precompile-token-paddings 256 \
+              --host 0.0.0.0 \
+              --port 30271 \
+              2>&1 | tee /tmp/server_glm53_dp8_decode.log
+            sleep 10
+          done
+        ports:
+        - name: http
+          containerPort: 30271
+          protocol: TCP
+        - name: transfer
+          containerPort: 19000
+          protocol: TCP
+        - name: sidechannel
+          containerPort: 20000
+          protocol: TCP
+        - name: dist-init
+          containerPort: 5000
+          protocol: TCP
+        - name: tpu-process
+          containerPort: 8471
+          protocol: TCP
+        resources:
+          requests:
+            google.com/tpu: '4'
+          limits:
+            google.com/tpu: '4'
+        volumeMounts:
+        - name: model
+          mountPath: /weights
+          readOnly: true
+        - name: tmp-ram
+          mountPath: /tmp
+        env:
+        - name: HOME
+          value: /tmp
+        - name: XDG_CACHE_HOME
+          value: /tmp/.cache
+        - name: HF_HOME
+          value: /tmp/hf_cache
+        - name: TPU_NAME
+          value: glm53-pdb-dp8-decode
+        - name: JAX_COMPILATION_CACHE_DIR
+          value: /tmp/jit_cache
+        - name: SGL_MOE_FUSED_UNPERMUTE
+          value: '1'
+        - name: SGL_MOE_RAGGED_GATHER
+          value: '1'
+        - name: SGL_MOE_FUSED_MIN_TOKENS
+          value: '4096'
+        - name: SGL_MOE_EXPERT_SCATTER
+          value: '1'
+        - name: SGL_MOE_CHUNK_STAGE
+          value: '4'
+        - name: SGL_MLA_KV_PAD_MULTIPLE
+          value: '4096'
+        - name: SGL_MLA_MAX_PREFILL_KV_LEN
+          value: '110592'
+        - name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+          value: '1'
+        - name: DSA_INDEXER_KERNEL
+          value: '1'
+        - name: DSA_PREFILL_SPARSE
+          value: '1'
+        - name: DSA_INDEXER_KERNEL_PREFILL
+          value: '1'
+        - name: DSA_PREFILL_QBLOCK
+          value: '1'
+        - name: DSA_PREFILL_QBLOCK_QB
+          value: '32'
+        - name: DSA_SPEC_AS_DECODE
+          value: '1'
+        - name: DSA_SPEC_VERIFY_QGROUP
+          value: '1'
+        - name: DSA_IDX_VERIFY_BATCHED
+          value: '0'
+        - name: DSA_SPEC_VERIFY_LAST_Q_ONLY
+          value: '1'
+        - name: DSA_PAGE_TOPK
+          value: '16'
+        - name: DSA_TP_SHARD_MIN_SEQS
+          value: '2'
+        - name: SGLANG_JAX_MTP_KVSHARE
+          value: '1'
+        - name: SGLANG_JAX_MTP_INDEX_SHARE
+          value: '1'
+        - name: SGL_FUSED_KV_SCATTER
+          value: '0'
+        - name: SGL_DEBUG_STEP_TIMING
+          value: '1'
+        - name: SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD
+          value: '1'
+        - name: SGLANG_JAX_SPEC_CACHE_LOC_FIT
+          value: '1'
+        - name: SGLANG_JAX_SPEC_PRECOMPILE_FIRST_RUNG_ONLY
+          value: '1'
+        - name: SGLANG_JAX_SPEC_CACHE_LOC_LADDER
+          value: '110592'
+        - name: SGLANG_JAX_SPEC_NON_RELAY_PRECOMPILE_MAX_BS
+          value: '128'
+        - name: SGL_COOP_SINGLE_REQ
+          value: '0'
+        - name: DSA_SHARDED_PREFIX_PAGES
+          value: '0'
+        - name: SGL_PD_SHARED_PREFIX_LEN
+          value: '262144'
+        - name: SGL_PD_MAX_PREFIX_SLOTS
+          value: '16'
+        - name: SGL_PD_PIN_PREFIX_SLOTS
+          value: '1'
+        - name: LIBTPU_INIT_ARGS
+          value: --xla_tpu_dvfs_p_state=7 --xla_tpu_all_gather_collective_matmul_mode=none --xla_tpu_reduce_scatter_collective_matmul_mode=none
+            --xla_jf_spmd_threshold_for_windowed_einsum_mib=100000
+        - name: TPU_PROCESS_PORT
+          value: '8471'
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+        - name: TPU_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+---
+# 5. Closed-Loop Empirical ISL Benchmark Client Job (n = 16..128 across 40..128 Trunks)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm53-bench-pdb-dp8-sessions
+  namespace: ubench-regression-tests
+  labels:
+    app: glm53-bench-pdb-dp8-sessions
+    kueue.x-k8s.io/queue-name: default
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: glm53-bench-pdb-dp8-sessions
+        kueue.x-k8s.io/queue-name: default
+    spec:
+      priorityClassName: medium
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: cpu-np
+        workload: cpu-user
+      tolerations:
+      - key: cloud.google.com/gke-nodepool
+        operator: Equal
+        value: cpu-np
+        effect: NoSchedule
+      volumes:
+      - name: data
+        configMap:
+          name: glm52-requests-mocked
+      containers:
+      - name: client
+        image: us-central1-docker.pkg.dev/tpu-prod-env-one-vm/ubench-runner/vllm-tpu:glm5_2_dsa
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: '4'
+            memory: 16Gi
+          limits:
+            cpu: '16'
+            memory: 64Gi
+        volumeMounts:
+        - name: data
+          mountPath: /data
+          readOnly: true
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          LB_URL="http://glm53-pdb-dp8-lb-svc.ubench-regression-tests.svc.cluster.local:8000"
+          PREFILL_URL="http://glm53-pdb-dp8-prefill-svc.ubench-regression-tests.svc.cluster.local:30271"
+          DECODE_URL="http://glm53-pdb-dp8-decode-svc.ubench-regression-tests.svc.cluster.local:30271"
+
+          until curl -sf --max-time 5 "${PREFILL_URL}/health" >/dev/null && \
+                curl -sf --max-time 5 "${DECODE_URL}/health" >/dev/null && \
+                curl -sf --max-time 5 "${LB_URL}/v1/models" >/dev/null; do
+            echo "Waiting for GLM-5.3 PD 1P1D dp=8, tp=2 + HiCache (1P + 1D + MiniLB, commit 1cef18b)..."
+            sleep 10
+          done
+
+          rm -rf /tmp/sglang-jax-src
+          git clone --single-branch -b glm52-rec2-coop-radix-split \
+            https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
+          git -C /tmp/sglang-jax-src checkout 1cef18b
+
+          python3 -u /tmp/sglang-jax-src/benchmark/glm53/bench_empirical_isl_sessions.py \
+            --base-url "${LB_URL}" \
+            --prefill-url "${PREFILL_URL}" \
+            --decode-url "${DECODE_URL}" \
+            --dataset /data/requests_mocked.jsonl.xz \
+            --dp-size 8 \
+            --max-pinned-prefix-slots 16 \
+            --trunks-above-n16 0 \
+            --sessions "16,32,64,128" \
+            --warmup-pass-s 10 \
+            --duration-per-n 210 \
+            --cache-hit-rate 0.80 \
+            --max-tokens 0 \
+            --no-ignore-eos \
+            --flush-each-n \
+            --warmup-concurrency 8 \
+            --output-json /tmp/glm53_pdb_dp8_tp2_hicache_sessions.json
+
+          echo "=== DUMPING FULL JSON SUMMARY (GLM-5.3 PD DP8 TP2 HICACHE EXACT TEMPS) ==="
+          cat /tmp/glm53_pdb_dp8_tp2_hicache_sessions.json
