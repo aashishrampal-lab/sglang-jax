@@ -403,6 +403,9 @@ class SchedulerDisaggregationPrefillMixin:
                 else self.get_next_batch_to_run()
             )
             self.cur_batch = batch
+            self._flush_pending_h2d()
+            if getattr(self.tree_cache, "hicache_enabled", False):
+                self.tree_cache.flush_write_through_acks()
             had_pending = bool(self.result_queue)
             if batch is not None:
                 handoffs = self._snapshot_prefill_handoffs(batch)
@@ -569,6 +572,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            self._flush_pending_h2d()
 
             if batch:
                 batch_reqs = _batch_reqs(batch)
@@ -584,6 +588,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
 
+            if getattr(self.tree_cache, "hicache_enabled", False):
+                self.tree_cache.flush_write_through_acks()
             self.send_kv_chunk()
             # PD reqs and CoopPrefill batches are finished/handled inside
             # process_prefill_chunk; do not merge them into running_batch.

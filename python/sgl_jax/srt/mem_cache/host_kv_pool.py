@@ -460,48 +460,68 @@ def _pack_groups_batched(
     packed_groups: list[jax.Array],
     groups: tuple[_BufferGroup, ...],
     sharding: NamedSharding,
+    shard_axes: Any,
+    shard_size: int,
 ) -> jax.Array:
     """Pack per-group ``(layer_num, n_b, *per_layer_shape)`` arrays into one
-    ``(n_b, total_flat_elems, sharded_dim)`` array with ``sharding`` so each
-    page slot needs only 1 ``pinned_host`` buffer instead of ``len(groups)``.
+    ``(n_b, shard_size, total_flat_per_shard)`` array with ``sharding``
+    ``PartitionSpec(None, shard_axes, None)`` so any layer count (e.g. 78-layer
+    GLM-5.3 + 1-layer NEXTN) packs into 1 ``pinned_host`` buffer per page with
+    zero cross-device communication.
     """
+    mesh = sharding.mesh
+    s_pre = NamedSharding(mesh, PartitionSpec(None, None, shard_axes, None))
     parts = []
     n_b = int(packed_groups[0].shape[1])
-    sharded_dim = int(packed_groups[0].shape[-1])
     for packed, g in zip(packed_groups, groups):
         transposed = jnp.swapaxes(packed, 0, 1)  # (n_b, layer_num, *per_layer_shape)
-        total_elems = int(g.layer_num)
-        for d in g.per_layer_shape:
-            total_elems *= int(d)
-        flat_elems = total_elems // sharded_dim
-        parts.append(jax.lax.reshape(transposed, (n_b, flat_elems, sharded_dim)))
-    return jax.lax.concatenate(parts, dimension=1)
+        d_last = int(g.per_layer_shape[-1])
+        w = d_last // shard_size
+        lead_elems = int(g.layer_num)
+        for d in g.per_layer_shape[:-1]:
+            lead_elems *= int(d)
+        split = jax.lax.reshape(transposed, (n_b, lead_elems, shard_size, w), out_sharding=s_pre)
+        swapped = jnp.swapaxes(split, 1, 2)  # (n_b, shard_size, lead_elems, w)
+        parts.append(
+            jax.lax.reshape(swapped, (n_b, shard_size, lead_elems * w), out_sharding=sharding)
+        )
+    return jax.lax.concatenate(parts, dimension=2)
 
 
 def _unpack_groups_batched(
     combined: jax.Array,
     groups: tuple[_BufferGroup, ...],
+    mesh: Mesh,
+    shard_axes: Any,
+    shard_size: int,
 ) -> list[jax.Array]:
-    """Unpack ``(n_c, total_flat_elems, sharded_dim)`` into per-group
-    ``(n_c, layer_num, *per_layer_shape)`` arrays on device.
+    """Unpack ``(n_c, shard_size, total_flat_per_shard)`` into per-group
+    ``(n_c, layer_num, *per_layer_shape)`` arrays on device with zero cross-device communication.
     """
+    s_unflat = NamedSharding(mesh, PartitionSpec(None, shard_axes, None, None))
     n_c = int(combined.shape[0])
-    sharded_dim = int(combined.shape[-1])
     out = []
     offset = 0
     for g in groups:
-        total_elems = int(g.layer_num)
-        for d in g.per_layer_shape:
-            total_elems *= int(d)
-        flat_elems = total_elems // sharded_dim
-        chunk = jax.lax.slice_in_dim(combined, offset, offset + flat_elems, axis=1)
+        d_last = int(g.per_layer_shape[-1])
+        w = d_last // shard_size
+        lead_elems = int(g.layer_num)
+        for d in g.per_layer_shape[:-1]:
+            lead_elems *= int(d)
+        flat_per_shard = lead_elems * w
+        chunk = jax.lax.slice_in_dim(combined, offset, offset + flat_per_shard, axis=2)
+        unflat = jax.lax.reshape(
+            chunk, (n_c, shard_size, lead_elems, w), out_sharding=s_unflat
+        )
+        swapped = jnp.swapaxes(unflat, 1, 2)  # (n_c, lead_elems, shard_size, w)
         out.append(
             jax.lax.reshape(
-                chunk,
+                swapped,
                 (n_c, int(g.layer_num), *g.per_layer_shape),
+                out_sharding=NamedSharding(mesh, PartitionSpec(None, *tuple(g.slot_spec))),
             )
         )
-        offset += flat_elems
+        offset += flat_per_shard
     return out
 
 
@@ -659,30 +679,35 @@ class LRUHostKVPool(HostKVPool):
         # (cutting VMAs and VFIO IOMMU DMA entries per page 4x from 32 to 8 and
         # issuing 4x fewer jax.device_put calls on D2H and H2D).
         g0 = self._groups[0]
+        _g0_shard_axes = tuple(g0.slot_spec)[-1] if len(tuple(g0.slot_spec)) >= 2 else None
+        _g0_shard_size = 1
+        if _g0_shard_axes is not None:
+            for _ax in (
+                _g0_shard_axes if isinstance(_g0_shard_axes, tuple) else (_g0_shard_axes,)
+            ):
+                _g0_shard_size *= int(mesh.shape[_ax])
+        self._packed_shard_axes = _g0_shard_axes
+        self._packed_shard_size = _g0_shard_size
         self._pack_groups = (
             not self._token_scatter
             and len(self._groups) > 1
+            and _g0_shard_axes is not None
+            and _g0_shard_size > 1
             and all(
                 np.dtype(g.dtype) == np.dtype(g0.dtype)
                 and len(g.per_layer_shape) >= 2
-                and tuple(g.slot_spec)[-1] is not None
-                and tuple(g.slot_spec)[-1] == tuple(g0.slot_spec)[-1]
+                and tuple(g.slot_spec)[-1] == _g0_shard_axes
                 and all(ax is None for ax in tuple(g.slot_spec)[:-1])
-                and (
-                    int(g.layer_num)
-                    * int(np.prod(g.per_layer_shape))
-                    % int(g0.per_layer_shape[-1])
-                    == 0
-                )
+                and (int(g.per_layer_shape[-1]) % _g0_shard_size == 0)
                 for g in self._groups
             )
         )
         if self._pack_groups:
-            packed_slot_spec = PartitionSpec(None, tuple(g0.slot_spec)[-1])
+            packed_slot_spec = PartitionSpec(_g0_shard_axes, None)
             self._packed_host_sharding = _make_host_sharding(mesh, packed_slot_spec)
             self._packed_device_sharding = NamedSharding(mesh, packed_slot_spec)
             self._packed_batched_sharding = NamedSharding(
-                mesh, PartitionSpec(None, None, tuple(g0.slot_spec)[-1])
+                mesh, PartitionSpec(None, _g0_shard_axes, None)
             )
         else:
             self._packed_host_sharding = None
@@ -936,7 +961,11 @@ class LRUHostKVPool(HostKVPool):
             packed_groups.append(jnp.stack(per_layer, axis=0))  # (layer_num, n_b, *shape)
         if self._pack_groups:
             combined = _pack_groups_batched(
-                packed_groups, self._groups, self._packed_batched_sharding
+                packed_groups,
+                self._groups,
+                self._packed_batched_sharding,
+                self._packed_shard_axes,
+                self._packed_shard_size,
             )
             jax.block_until_ready(combined)
             gathered = {
@@ -1253,7 +1282,13 @@ class LRUHostKVPool(HostKVPool):
         sel_dev = jnp.asarray(sel, dtype=jnp.int32)
         if self._pack_groups and len(staged_pages[base_idx[0]]) == 1:
             combined_base = jnp.stack([staged_pages[i][0] for i in base_idx], axis=0)
-            bases_by_group = _unpack_groups_batched(combined_base, self._groups)
+            bases_by_group = _unpack_groups_batched(
+                combined_base,
+                self._groups,
+                dp.mesh,
+                self._packed_shard_axes,
+                self._packed_shard_size,
+            )
         else:
             bases_by_group = [
                 jnp.stack([staged_pages[i][gi] for i in base_idx], axis=0)

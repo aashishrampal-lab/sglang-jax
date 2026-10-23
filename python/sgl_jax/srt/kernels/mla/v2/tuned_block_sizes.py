@@ -463,6 +463,21 @@ for _k, _dst in TUNED_BLOCK_SIZES_MLA.items():
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 1024)] = (4, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 2048)] = (4, 1, 2)
     _dst[("decode", "bfloat16", "bfloat16", 64, 512, 64, 256, 4096)] = (4, 1, 2)
+    # GLM-5.3 dp=8, tp=2 (64 // 2 = 32 local query heads per tensor shard)
+    _dst[("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, 2)] = (4, 2)
+    for _mnt in (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        _dst.setdefault(("mixed", "bfloat16", "bfloat16", 32, 512, 64, 128, _mnt), (16, 32))
+    for _mnt in (1, 2, 4, 8, 16, 32, 64, 128):
+        _dst.setdefault(("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, _mnt), (16, 1, 2))
+    for _mnt in (256, 512, 1024, 2048, 4096):
+        _dst[("decode", "bfloat16", "bfloat16", 32, 512, 64, 128, _mnt)] = (8, 1, 2)
+    _dst[("mixed", "bfloat16", "bfloat16", 32, 512, 64, 256, 2)] = (2, 2)
+    for _mnt in (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        _dst.setdefault(("mixed", "bfloat16", "bfloat16", 32, 512, 64, 256, _mnt), (8, 32))
+    for _mnt in (1, 2, 4, 8, 16, 32, 64, 128):
+        _dst.setdefault(("decode", "bfloat16", "bfloat16", 32, 512, 64, 256, _mnt), (8, 1, 2))
+    for _mnt in (256, 512, 1024, 2048, 4096):
+        _dst[("decode", "bfloat16", "bfloat16", 32, 512, 64, 256, _mnt)] = (4, 1, 2)
     for _tk, _tv in list(_dst.items()):
         if len(_tk) == 8 and _tk[2] == "bfloat16":
             for _fp8_dt in ("float8_e4m3fn", "float8_e5m2"):

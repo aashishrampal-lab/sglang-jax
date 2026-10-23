@@ -763,6 +763,11 @@ class Scheduler(
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+            extra_device_pools=(
+                list(self._get_draft_kv_pools())
+                if hasattr(self, "_get_draft_kv_pools")
+                else None
+            ),
         )
         if isinstance(self.tree_cache, UnifiedRadixCache):
             components = [component.name for component in self.tree_cache.tree_components]

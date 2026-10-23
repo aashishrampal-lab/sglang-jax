@@ -967,6 +967,21 @@ TUNED_BLOCK_SIZES_RAW = {
     # go/keep-sorted end
 }
 
+# GLM-5.3 dp=8, tp=2 (tensor=2) local shapes & prefill per-DP batch buckets (1024, 4096)
+for _b in (1, 2, 4, 5, 8, 10, 16, 20, 32, 40, 64, 80, 128, 160, 256, 512, 1024, 2048, 4096):
+    _bm = 1 if _b == 1 else min(256, ((_b + 7) // 8) * 8)
+    for _nout, _nin in ((8192, 2048), (6144, 8192), (6144, 6144)):
+        TUNED_BLOCK_SIZES_RAW.setdefault(
+            (7, _b, _nout, _nin, "bfloat16", "float8_e4m3fn"),
+            (_bm, 2048, 2048),
+        )
+for (_ver, _b2048, _nout, _nin, _adtype, _wdtype), _val in list(TUNED_BLOCK_SIZES_RAW.items()):
+    if _ver == 7 and _b2048 == 2048:
+        for _b_ext in (1024, 4096):
+            TUNED_BLOCK_SIZES_RAW.setdefault(
+                (7, _b_ext, _nout, _nin, _adtype, _wdtype), _val
+            )
+
 TUNED_BLOCK_SIZES: dict[TunedKey, TunedValue] = {
     TunedKey(*key): TunedValue(*value) for key, value in TUNED_BLOCK_SIZES_RAW.items()
 }
