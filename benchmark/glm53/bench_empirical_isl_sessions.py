@@ -879,6 +879,10 @@ async def run_single_n(
   decode_tps_list = [r["decode_tps"] for r in eval_results if r.get("decode_tps") is not None]
   all_chunk_itls = [itl for r in eval_results for itl in r["itls"]]
 
+  all_ok_ttfts = [r["ttft"] for r in ok_results if r["ttft"] is not None]
+  all_ok_per_tok_itls = [r["per_token_itl"] for r in ok_results if r.get("per_token_itl") is not None]
+  all_ok_decode_tps = [r["decode_tps"] for r in ok_results if r.get("decode_tps") is not None]
+
   total_prompt = sum(r["prompt_tokens"] for r in ok_results)
   total_cached = sum(r["cached_tokens"] for r in ok_results)
   total_uncached = max(0, total_prompt - total_cached)
@@ -904,7 +908,11 @@ async def run_single_n(
         "cache_hit_pct": (100.0 * b_c / b_p) if b_p > 0 else 0.0,
         "median_ttft_s": statistics.median(b_ttfts) if b_ttfts else 0.0,
         "p90_ttft_s": percentile(b_ttfts, 90),
+        "mean_decode_tps": statistics.mean(b_tps) if b_tps else 0.0,
         "median_decode_tps": statistics.median(b_tps) if b_tps else 0.0,
+        "p10_decode_tps": percentile(b_tps, 10),
+        "p90_low_decode_tps": percentile(b_tps, 10),
+        "p90_decode_tps": percentile(b_tps, 90),
     }
 
   for r in results:
@@ -946,18 +954,40 @@ async def run_single_n(
       "client_decode_tps_per_stream": {
           "mean": statistics.mean(decode_tps_list) if decode_tps_list else 0.0,
           "median": statistics.median(decode_tps_list) if decode_tps_list else 0.0,
+          "p10": percentile(decode_tps_list, 10),
+          "p90_low": percentile(decode_tps_list, 10),
           "p90": percentile(decode_tps_list, 90),
+          "p90_high": percentile(decode_tps_list, 90),
+      },
+      "all_ok_client_decode_tps_per_stream": {
+          "mean": statistics.mean(all_ok_decode_tps) if all_ok_decode_tps else 0.0,
+          "median": statistics.median(all_ok_decode_tps) if all_ok_decode_tps else 0.0,
+          "p10": percentile(all_ok_decode_tps, 10),
+          "p90_low": percentile(all_ok_decode_tps, 10),
+          "p90": percentile(all_ok_decode_tps, 90),
+          "p90_high": percentile(all_ok_decode_tps, 90),
       },
       "per_token_itl_ms": {
           "mean": statistics.mean(per_tok_itls) * 1000.0 if per_tok_itls else 0.0,
           "median": statistics.median(per_tok_itls) * 1000.0 if per_tok_itls else 0.0,
           "p90": percentile(per_tok_itls, 90) * 1000.0,
       },
+      "all_ok_per_token_itl_ms": {
+          "mean": statistics.mean(all_ok_per_tok_itls) * 1000.0 if all_ok_per_tok_itls else 0.0,
+          "median": statistics.median(all_ok_per_tok_itls) * 1000.0 if all_ok_per_tok_itls else 0.0,
+          "p90": percentile(all_ok_per_tok_itls, 90) * 1000.0,
+      },
       "ttft_s": {
           "mean": statistics.mean(ttfts) if ttfts else 0.0,
           "median": statistics.median(ttfts) if ttfts else 0.0,
           "p90": percentile(ttfts, 90),
           "p99": percentile(ttfts, 99),
+      },
+      "all_ok_ttft_s": {
+          "mean": statistics.mean(all_ok_ttfts) if all_ok_ttfts else 0.0,
+          "median": statistics.median(all_ok_ttfts) if all_ok_ttfts else 0.0,
+          "p90": percentile(all_ok_ttfts, 90),
+          "p99": percentile(all_ok_ttfts, 99),
       },
       "chunk_itl_ms": {
           "mean": statistics.mean(all_chunk_itls) * 1000.0 if all_chunk_itls else 0.0,
@@ -1019,8 +1049,11 @@ async def run_single_n(
   )
   print(
       f"  Client Decode Speed/Strm : Median={summary['client_decode_tps_per_stream']['median']:.2f} tok/s "
-      f"(Mean={summary['client_decode_tps_per_stream']['mean']:.2f}, P90={summary['client_decode_tps_per_stream']['p90']:.2f}) | "
-      f"Per-Token ITL={summary['per_token_itl_ms']['median']:.2f}ms (StepChunk={summary['chunk_itl_ms']['median']:.2f}ms, Mean={summary['chunk_itl_ms']['mean']:.2f}ms)"
+      f"(Mean={summary['client_decode_tps_per_stream']['mean']:.2f}, "
+      f"P90_low[10th%]={summary['client_decode_tps_per_stream']['p10']:.2f}, "
+      f"P90_high[90th%]={summary['client_decode_tps_per_stream']['p90']:.2f}) | "
+      f"Per-Token ITL={summary['per_token_itl_ms']['median']:.2f}ms "
+      f"(P90={summary['per_token_itl_ms']['p90']:.2f}ms, StepChunk={summary['chunk_itl_ms']['median']:.2f}ms, Mean={summary['chunk_itl_ms']['mean']:.2f}ms)"
   )
   print(
       f"  Latency                  : Median TTFT={summary['ttft_s']['median']:.2f}s (P90={summary['ttft_s']['p90']:.2f}s) | "
@@ -1033,7 +1066,8 @@ async def run_single_n(
         f"    {b_name:8s} (trunks={b_stat['trunks_configured']:2d}): reqs={b_stat['count']:3d} | "
         f"Mean ISL={b_stat['mean_isl']:7,.0f} | Mean OSL={b_stat['mean_osl']:6,.1f} | "
         f"Hit={b_stat['cache_hit_pct']:5.1f}% | Med TTFT={b_stat['median_ttft_s']:6.2f}s | "
-        f"P90 TTFT={b_stat['p90_ttft_s']:6.2f}s | Med TPS/strm={b_stat['median_decode_tps']:5.1f}"
+        f"P90 TTFT={b_stat['p90_ttft_s']:6.2f}s | Med TPS/strm={b_stat['median_decode_tps']:5.1f} "
+        f"(P90_low={b_stat['p10_decode_tps']:5.1f}, P90_high={b_stat['p90_decode_tps']:5.1f})"
     )
   print("=" * 100)
   return summary
@@ -1168,6 +1202,12 @@ async def main_async(args: argparse.Namespace) -> None:
       )
       s["pass"] = "measured_210s_5_or_n_trunks_exact_temps"
       all_summaries.append(s)
+      if args.output_json:
+        out_p = Path(args.output_json)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+          json.dump(all_summaries, f, indent=2)
+        print(f"  [Incremental Save] Updated {out_p} ({len(all_summaries)}/{len(session_list)} session counts completed)")
 
   if args.output_json:
     out_p = Path(args.output_json)
