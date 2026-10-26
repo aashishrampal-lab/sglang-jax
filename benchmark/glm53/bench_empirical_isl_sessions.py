@@ -201,6 +201,7 @@ def build_5_or_n_trunk_specs(
           "trunk_id": global_trunk_id,
           "dp_rank": r,
           "bucket_idx": b_chosen,
+          "bucket_local_idx": assigned[b_chosen] - 1,
           "bucket": ISL_BUCKETS[b_chosen][0],
           "warmup_target_isl_tokens": target_tok,
       }
@@ -227,13 +228,17 @@ def build_trunk_chat_payload(
     ignore_eos: bool,
     is_warmup: bool = False,
     sampling_spec: dict[str, Any] | None = None,
+    bucket_local_idx: int = -1,
 ) -> dict[str, Any]:
   """Builds a structured multi-turn + tools payload for `trunk_id` with 80% shared prefix."""
   total_chars = max(1024, int(target_isl_tokens * CHARS_PER_TOKEN))
   prefix_budget = int(total_chars * cache_hit_ratio)
   suffix_budget = max(256, total_chars - prefix_budget)
 
-  trunk_tag = f"[trunk_key={trunk_namespace}_k{trunk_id:04d}_b{bucket_idx}_dp{dp_rank:02d}] "
+  if trunk_namespace.startswith("shared") and bucket_local_idx >= 0:
+    trunk_tag = f"[trunk_key={trunk_namespace}_k{bucket_local_idx:04d}_b{bucket_idx}_dp{dp_rank:02d}] "
+  else:
+    trunk_tag = f"[trunk_key={trunk_namespace}_k{trunk_id:04d}_b{bucket_idx}_dp{dp_rank:02d}] "
   raw_tools = copy.deepcopy(orig_req.get("tools") or [])
 
   max_tools_chars = max(0, prefix_budget - 1024)
@@ -654,11 +659,16 @@ async def run_single_n(
     flush_before_warmup: bool,
     warmup_concurrency: int = 8,
     trunks_above_n16: int = 0,
+    shared_trunk_namespace: bool = False,
 ) -> dict[str, Any]:
   all_trunks, per_dp_bucket_trunks = build_5_or_n_trunk_specs(
       num_sessions=num_sessions, dp_size=dp_size, trunks_above_n16=trunks_above_n16
   )
-  trunk_namespace = f"n{num_sessions:03d}_tr{len(all_trunks):03d}"
+  trunk_namespace = (
+      f"shared_dp{dp_size:02d}"
+      if shared_trunk_namespace
+      else f"n{num_sessions:03d}_tr{len(all_trunks):03d}"
+  )
 
   if flush_before_warmup:
     await flush_all_caches(
@@ -716,6 +726,7 @@ async def run_single_n(
             bucket_orig_max_tokens=b_max_tok,
             ignore_eos=False,
             is_warmup=True,
+            bucket_local_idx=sp.get("bucket_local_idx", -1),
         )
         res = await send_chat_request(
             http_session,
@@ -812,6 +823,7 @@ async def run_single_n(
           ignore_eos=ignore_eos,
           is_warmup=False,
           sampling_spec=samp_spec,
+          bucket_local_idx=trunk_sp.get("bucket_local_idx", -1),
       )
       try:
         res = await send_chat_request(
@@ -1087,6 +1099,7 @@ async def run_single_n(
         f"P90 TTFT={b_stat['p90_ttft_s']:6.2f}s | Med TPS/strm={b_stat['median_decode_tps']:5.1f} "
         f"(P90_low={b_stat['p10_decode_tps']:5.1f}, P95_low={b_stat['p5_decode_tps']:5.1f}, P90_high={b_stat['p90_decode_tps']:5.1f})"
     )
+  print(f"  Decode TPS Samples (n={len(summary['decode_tps_samples'])}): {summary['decode_tps_samples']}")
   print("=" * 100)
   return summary
 
@@ -1217,6 +1230,7 @@ async def main_async(args: argparse.Namespace) -> None:
           flush_before_warmup=((idx == 0 and not args.no_flush_on_start) or args.flush_each_n),
           warmup_concurrency=args.warmup_concurrency,
           trunks_above_n16=args.trunks_above_n16,
+          shared_trunk_namespace=(not args.flush_each_n),
       )
       s["pass"] = "measured_210s_5_or_n_trunks_exact_temps"
       all_summaries.append(s)
