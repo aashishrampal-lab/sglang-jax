@@ -4,7 +4,7 @@
 # Hardware : 1x TPU v7x 2x2x2 slice = 8 TPU7x chips (16 TensorCore devices)
 # Cost     : $43.20/hr ($5.40/chip-hr 3-Year CUD in us-central1)
 # Repo     : https://github.com/aashishrampal-lab/sglang-jax.git
-# Branch   : glm52-rec2-coop-radix-split (commit 1cef18b)
+# Branch   : glm52-rec2-coop-radix-split (commit 3650deb)
 # Deploy   : kubectl apply -f glm53_coloc_2x2x2.yaml
 # ==============================================================================
 # 1. Headless Service (TPU Multi-Host Worker Discovery)
@@ -129,7 +129,7 @@ spec:
             rm -rf /tmp/sglang-jax-src
             git clone --single-branch -b glm52-rec2-coop-radix-split \
               https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-            git -C /tmp/sglang-jax-src checkout 1cef18b
+            git -C /tmp/sglang-jax-src log -1 --oneline
             cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
             rm -rf /tmp/sglang-jax-src
 
@@ -336,14 +336,14 @@ spec:
 
           BASE_URL="http://glm53-coloc-2x2x2-svc.ubench-regression-tests.svc.cluster.local:30271"
           until curl -sf --max-time 5 "${BASE_URL}/health" >/dev/null; do
-            echo "Waiting for GLM-5.3 Colocated 2x2x2 server (commit 1cef18b)..."
+            echo "Waiting for GLM-5.3 Colocated 2x2x2 server (commit 3650deb)..."
             sleep 10
           done
 
           rm -rf /tmp/sglang-jax-src
           git clone --single-branch -b glm52-rec2-coop-radix-split \
             https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-          git -C /tmp/sglang-jax-src checkout 1cef18b
+          git -C /tmp/sglang-jax-src log -1 --oneline
 
           python3 -u /tmp/sglang-jax-src/benchmark/glm53/bench_empirical_isl_sessions.py \
             --base-url "${BASE_URL}" \

@@ -6,7 +6,7 @@
 # HiCache  : UnifiedRadixCache + write-through pinned host DRAM KV pool on 1P
 # Cost     : $86.40/hr ($43.20/hr 1P + $43.20/hr 1D at $5.40/chip-hr 3-Yr CUD)
 # Repo     : https://github.com/aashishrampal-lab/sglang-jax.git
-# Branch   : glm52-rec2-coop-radix-split (commit 1cef18b)
+# Branch   : glm52-rec2-coop-radix-split (commit 3650deb)
 # Deploy   : kubectl apply -f glm53_pdb_dp8_tp2_hicache.yaml
 # ==============================================================================
 # 1. Headless Services (1P & 1D Multi-Host TPU Worker Discovery)
@@ -228,7 +228,7 @@ spec:
             rm -rf /tmp/sglang-jax-src
             git clone --single-branch -b glm52-rec2-coop-radix-split \
               https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-            git -C /tmp/sglang-jax-src checkout 1cef18b
+            git -C /tmp/sglang-jax-src log -1 --oneline
             cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
             rm -rf /tmp/sglang-jax-src
 
@@ -523,7 +523,7 @@ spec:
             rm -rf /tmp/sglang-jax-src
             git clone --single-branch -b glm52-rec2-coop-radix-split \
               https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-            git -C /tmp/sglang-jax-src checkout 1cef18b
+            git -C /tmp/sglang-jax-src log -1 --oneline
             cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
             rm -rf /tmp/sglang-jax-src
 
@@ -754,14 +754,14 @@ spec:
           until curl -sf --max-time 5 "${PREFILL_URL}/health" >/dev/null && \
                 curl -sf --max-time 5 "${DECODE_URL}/health" >/dev/null && \
                 curl -sf --max-time 5 "${LB_URL}/v1/models" >/dev/null; do
-            echo "Waiting for GLM-5.3 PD 1P1D dp=8, tp=2 + HiCache (1P + 1D + MiniLB, commit 1cef18b)..."
+            echo "Waiting for GLM-5.3 PD 1P1D dp=8, tp=2 + HiCache (1P + 1D + MiniLB, commit 3650deb)..."
             sleep 10
           done
 
           rm -rf /tmp/sglang-jax-src
           git clone --single-branch -b glm52-rec2-coop-radix-split \
             https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-          git -C /tmp/sglang-jax-src checkout 1cef18b
+          git -C /tmp/sglang-jax-src log -1 --oneline
 
           python3 -u /tmp/sglang-jax-src/benchmark/glm53/bench_empirical_isl_sessions.py \
             --base-url "${LB_URL}" \

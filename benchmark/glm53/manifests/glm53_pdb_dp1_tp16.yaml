@@ -4,7 +4,7 @@
 # Hardware : 2x TPU v7x 2x2x2 slices (1P + 1D) = 16 TPU7x chips (32 devices)
 # Cost     : $86.40/hr ($43.20/hr 1P + $43.20/hr 1D at $5.40/chip-hr 3-Yr CUD)
 # Repo     : https://github.com/aashishrampal-lab/sglang-jax.git
-# Branch   : glm52-rec2-coop-radix-split (commit 1cef18b)
+# Branch   : glm52-rec2-coop-radix-split (commit 3650deb)
 # Deploy   : kubectl apply -f glm53_pdb_dp1_tp16.yaml
 # ==============================================================================
 # 1. Headless Services (1P & 1D Multi-Host TPU Worker Discovery)
@@ -216,7 +216,7 @@ spec:
             rm -rf /tmp/sglang-jax-src
             git clone --single-branch -b glm52-rec2-coop-radix-split \
               https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-            git -C /tmp/sglang-jax-src checkout 1cef18b
+            git -C /tmp/sglang-jax-src log -1 --oneline
             cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
             rm -rf /tmp/sglang-jax-src
 
@@ -494,7 +494,7 @@ spec:
             rm -rf /tmp/sglang-jax-src
             git clone --single-branch -b glm52-rec2-coop-radix-split \
               https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-            git -C /tmp/sglang-jax-src checkout 1cef18b
+            git -C /tmp/sglang-jax-src log -1 --oneline
             cp -r /tmp/sglang-jax-src/python/sgl_jax/* /opt/sglang-jax/python/sgl_jax/
             rm -rf /tmp/sglang-jax-src
 
@@ -723,19 +723,18 @@ spec:
           until curl -sf --max-time 5 "${PREFILL_URL}/health" >/dev/null && \
                 curl -sf --max-time 5 "${DECODE_URL}/health" >/dev/null && \
                 curl -sf --max-time 5 "${LB_URL}/v1/models" >/dev/null; do
-            echo "Waiting for GLM-5.3 PD 1P1D dp=1 (1P + 1D + MiniLB, commit 1cef18b)..."
+            echo "Waiting for GLM-5.3 PD 1P1D dp=1 (1P + 1D + MiniLB, commit 3650deb)..."
             sleep 10
           done
 
           rm -rf /tmp/sglang-jax-src
           git clone --single-branch -b glm52-rec2-coop-radix-split \
             https://github.com/aashishrampal-lab/sglang-jax.git /tmp/sglang-jax-src
-          git -C /tmp/sglang-jax-src checkout 1cef18b
+          git -C /tmp/sglang-jax-src log -1 --oneline
 
           STATE_ENV='{"request_id": "set-env-5-or-n-trunks", "state_data": {"override": {"env": {"SGL_PD_MAX_PREFIX_SLOTS": "16", "SGL_PD_PIN_PREFIX_SLOTS": "1"}}}}'
 
-          # Note: --trunks-above-n16 5 runs the eviction-free 5* trunk baseline at n=32,64;
-          # pass --trunks-above-n16 0 to run N=32,64 unpinned trunks.
+          # 1. Run n=1..64 with --trunks-above-n16 5 (covers n=1..16 max(5,n) + n=32*,64* eviction-free 5* trunks)
           python3 -u /tmp/sglang-jax-src/benchmark/glm53/bench_empirical_isl_sessions.py \
             --base-url "${LB_URL}" \
             --prefill-url "${PREFILL_URL}" \
@@ -754,7 +753,31 @@ spec:
             --no-ignore-eos \
             --flush-each-n \
             --warmup-concurrency 8 \
-            --output-json /tmp/glm53_dp1_exact_temps_sessions.json
+            --output-json /tmp/glm53_dp1_exact_temps_5trunks_sessions.json
 
-          echo "=== DUMPING FULL JSON SUMMARY (GLM-5.3 PD DP1 TP16 EXACT TEMPS) ==="
-          cat /tmp/glm53_dp1_exact_temps_sessions.json
+          echo "=== DUMPING FULL JSON SUMMARY (GLM-5.3 PD DP1 TP16 5* TRUNKS EXACT TEMPS) ==="
+          cat /tmp/glm53_dp1_exact_temps_5trunks_sessions.json
+
+          # 2. Also run n=32,64 with --trunks-above-n16 0 (32 & 64 unpinned trunks, HBM RadixCache eviction regime)
+          python3 -u /tmp/sglang-jax-src/benchmark/glm53/bench_empirical_isl_sessions.py \
+            --base-url "${LB_URL}" \
+            --prefill-url "${PREFILL_URL}" \
+            --decode-url "${DECODE_URL}" \
+            --set-prefill-state-json "${STATE_ENV}" \
+            --set-decode-state-json "${STATE_ENV}" \
+            --dataset /data/requests_mocked.jsonl.xz \
+            --dp-size 1 \
+            --max-pinned-prefix-slots 16 \
+            --trunks-above-n16 0 \
+            --sessions "32,64" \
+            --warmup-pass-s 0 \
+            --duration-per-n 210 \
+            --cache-hit-rate 0.80 \
+            --max-tokens 0 \
+            --no-ignore-eos \
+            --flush-each-n \
+            --warmup-concurrency 8 \
+            --output-json /tmp/glm53_dp1_exact_temps_n32_64_ntrunks_sessions.json
+
+          echo "=== DUMPING FULL JSON SUMMARY (GLM-5.3 PD DP1 TP16 N=32,64 UNPINNED TRUNKS) ==="
+          cat /tmp/glm53_dp1_exact_temps_n32_64_ntrunks_sessions.json
