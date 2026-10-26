@@ -676,17 +676,22 @@ async def run_single_n(
     )
 
   # Split trunks per DP rank into Stage 1 (pinned in 1P & 1D slot_list, <= max_pinned_slots)
-  # and Stage 2 (additional RadixCache trunks on 1P when len(all_trunks) > max_pinned_slots).
+  # and Stage 2 (additional RadixCache trunks on 1P when len(all_trunks) > max_pinned_slots),
+  # and interleave by (per_dp_step, dp_rank) so all DP ranks warm up matching-length trunks in lockstep.
   stage1_specs: list[dict[str, Any]] = []
   stage2_specs: list[dict[str, Any]] = []
   per_dp_seen: dict[int, int] = {r: 0 for r in range(dp_size)}
   for sp in all_trunks:
     r = sp["dp_rank"]
+    sp_copy = dict(sp)
+    sp_copy["_dp_step"] = per_dp_seen[r]
     if per_dp_seen[r] < max_pinned_slots:
-      stage1_specs.append(sp)
+      stage1_specs.append(sp_copy)
     else:
-      stage2_specs.append(sp)
+      stage2_specs.append(sp_copy)
     per_dp_seen[r] += 1
+  stage1_specs.sort(key=lambda s: (s["_dp_step"], s["dp_rank"]))
+  stage2_specs.sort(key=lambda s: (s["_dp_step"], s["dp_rank"]))
 
   bucket_trunk_counts = {
       ISL_BUCKETS[b][0]: sum(1 for sp in all_trunks if sp["bucket_idx"] == b)
@@ -702,6 +707,8 @@ async def run_single_n(
   )
   t_w0 = time.perf_counter()
   warmup_sem = asyncio.Semaphore(max(1, min(warmup_concurrency, len(all_trunks))))
+  per_dp_conc = max(1, warmup_concurrency // max(1, dp_size))
+  dp_warmup_sems = {r: asyncio.Semaphore(per_dp_conc) for r in range(dp_size)}
 
   async def _warm_one_trunk(sp: dict[str, Any]) -> dict[str, Any]:
     trunk_id = sp["trunk_id"]
@@ -710,7 +717,7 @@ async def run_single_n(
     target_isl = sp["warmup_target_isl_tokens"]
     orig_req = raw_reqs[(b_idx + dp_rank * 5) % len(raw_reqs)]
     b_max_tok = int(orig_req.get("max_tokens") or 8192)
-    async with warmup_sem:
+    async with dp_warmup_sems[dp_rank], warmup_sem:
       for attempt in range(2):
         w_payload = build_trunk_chat_payload(
             orig_req,
