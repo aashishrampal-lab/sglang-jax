@@ -359,7 +359,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
-        if self.disable:
+        if self.disable or node is None:
             return IncLockRefResult(delta=0)
 
         result = IncLockRefResult()
@@ -371,7 +371,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def dec_lock_ref(self, node: UnifiedTreeNode, params: DecLockRefParams | None = None):
-        if self.disable:
+        if self.disable or node is None:
             return 0
 
         for component in self._components_tuple:

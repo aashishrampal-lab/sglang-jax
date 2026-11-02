@@ -153,6 +153,7 @@ class ServerArgs:
     enable_dp_lm_head: bool = False
     moe_dp_size: int = 1
     dp_schedule_policy: str | None = None
+    coop_prefill_mode: str = "disable"
 
     # Logging
     log_level: str = "info"
@@ -419,6 +420,33 @@ class ServerArgs:
         # Set chunked prefill size
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 4096
+
+        if self.coop_prefill_mode not in ("disable", "shared_prefix", "single_req"):
+            raise ValueError(
+                "coop_prefill_mode must be one of ('disable', 'shared_prefix', 'single_req'), "
+                f"got {self.coop_prefill_mode!r}"
+            )
+
+        if (
+            self.dp_size > 1
+            and self.coop_prefill_mode != "disable"
+            and self.max_prefill_tokens
+            and self.max_prefill_tokens > 0
+            and self.chunked_prefill_size
+            and self.chunked_prefill_size > 0
+        ):
+            max_per_dp_chunk = (
+                (self.max_prefill_tokens // self.dp_size) // self.page_size
+            ) * self.page_size
+            if max_per_dp_chunk > 0 and self.chunked_prefill_size > max_per_dp_chunk:
+                logger.warning(
+                    "chunked_prefill_size (%d) > max_prefill_tokens // dp_size (%d); clamping "
+                    "chunked_prefill_size to %d to fit per-DP prefill slot.",
+                    self.chunked_prefill_size,
+                    max_per_dp_chunk,
+                    max_per_dp_chunk,
+                )
+                self.chunked_prefill_size = max_per_dp_chunk
 
         if 0 < self.max_prefill_tokens < self.chunked_prefill_size:
             clamped_size = self.max_prefill_tokens // self.page_size * self.page_size
@@ -1413,6 +1441,20 @@ class ServerArgs:
                 "'shape_aware' balances input (prefill) and output (decode) "
                 "token load jointly, routing to the replica whose bottleneck "
                 "dimension stays smallest: score = max(sum_input, sum_output)."
+            ),
+        )
+        parser.add_argument(
+            "--coop-prefill-mode",
+            type=str,
+            choices=["disable", "shared_prefix", "single_req"],
+            default=ServerArgs.coop_prefill_mode,
+            help=(
+                "Cooperative prefill mode across data-parallel ranks when --dp-size > 1. "
+                "'disable' (default) turns off cross-DP cooperative prefill. "
+                "'shared_prefix' computes shared system-prompt prefixes jointly across all DP "
+                "ranks and inserts the KV into every DP rank's RadixCache. "
+                "'single_req' accelerates individual long prompts across all DP ranks and "
+                "retains the KV only on the request's assigned DP rank."
             ),
         )
 
