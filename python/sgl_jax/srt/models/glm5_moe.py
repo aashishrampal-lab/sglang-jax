@@ -178,14 +178,21 @@ class GlmDsaIndexer(nnx.Module):
         positions: jax.Array,
         rotary_emb: Any,
         *,
+        q_group: int = 1,
         precomputed_wk: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Indexer projections only (query, key, per-head weights); no top-k.
 
-        Returns query [T, n_head, head_dim], key [T, head_dim], weights [T, n_head]
+        Returns query [T_q, n_head, head_dim], key [T, head_dim], weights [T_q, n_head]
         after RoPE + Hadamard, ready for the DSA backend's streamindex_topk.
+        When ``q_group > 1``, only the last query per group is projected.
         """
-        query, _ = self.wq_b(qr)
+        use_q_slice = q_group > 1 and qr.shape[0] % q_group == 0
+        qr_q = qr[q_group - 1 :: q_group] if use_q_slice else qr
+        hs_q = hidden_states[q_group - 1 :: q_group] if use_q_slice else hidden_states
+        pos_q = positions.flatten()[q_group - 1 :: q_group] if use_q_slice else positions
+
+        query, _ = self.wq_b(qr_q)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
         if precomputed_wk is not None:
@@ -197,7 +204,11 @@ class GlmDsaIndexer(nnx.Module):
         rope_dim = 64
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim][:, None, :]
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+        if use_q_slice:
+            q_rope, _ = rotary_emb(pos_q, q_rope, q_rope[:, :1, :])
+            _, k_rope = rotary_emb(positions, k_rope, k_rope)
+        else:
+            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
         if _INDEXER_ROPE_CONCAT:
             # concat instead of at[].set: avoids a read-modify-write of the
             # full [T, n_head, head_dim] tensor (values are identical).
@@ -211,8 +222,35 @@ class GlmDsaIndexer(nnx.Module):
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
 
-        weights, _ = self.weights_proj(hidden_states)
+        weights, _ = self.weights_proj(hs_q)
         return query, key, weights
+
+    def project_key_only(
+        self,
+        hidden_states: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        *,
+        precomputed_wk: jax.Array | None = None,
+    ) -> jax.Array:
+        """Indexer key projection only (for KV-only draft prefill on 1P)."""
+        if precomputed_wk is not None:
+            key = precomputed_wk
+        else:
+            key, _ = self.wk(hidden_states)
+        key = self.k_norm(key)
+
+        rope_dim = 64
+        k_rope = key[:, :rope_dim][:, None, :]
+        _, k_rope = rotary_emb(positions, k_rope, k_rope)
+        if _INDEXER_ROPE_CONCAT:
+            key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
+        else:
+            key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
+
+        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim))
+        key = jnp.einsum("td,de->te", key, h_matrix)
+        return key
 
     def __call__(
         self,
@@ -666,16 +704,56 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
             dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
-                q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states,
-                    q_compressed,
-                    positions,
-                    self.rotary_emb,
-                    precomputed_wk=precomputed_wk,
+                readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+                reuse = bool(
+                    dsa_topk_reuse and (dsa_topk_in is not None or dsa_topk_pages_in is not None)
                 )
-                dsa_kwargs["q_idx"] = q_idx
-                dsa_kwargs["k_idx"] = k_idx
-                dsa_kwargs["idx_weights"] = idx_w
+                if readonly and reuse:
+                    pass
+                else:
+                    from sgl_jax.srt.layers.attention import (
+                        dsa_sparse_backend as _dsa_mod,
+                    )
+
+                    num_tokens = hidden_states.shape[0]
+                    mode = getattr(forward_batch, "forward_mode", None)
+                    is_verify = bool(mode is not None and mode.is_target_verify())
+                    draft_group = (
+                        _dsa_mod._spec_draft_group(forward_batch, num_tokens)
+                        if (
+                            is_verify
+                            and _dsa_mod._SPEC_AS_DECODE
+                            and _dsa_mod._SPEC_VERIFY_LAST_Q_ONLY
+                        )
+                        else None
+                    )
+                    q_group = (
+                        int(draft_group)
+                        if (
+                            draft_group is not None
+                            and draft_group > 1
+                            and num_tokens % draft_group == 0
+                            and (
+                                _dsa_mod._SPEC_VERIFY_QGROUP
+                                or (
+                                    draft_group <= _dsa_mod._SPEC_VERIFY_PAGE_SHARE
+                                    and (draft_group & (draft_group - 1)) == 0
+                                )
+                            )
+                        )
+                        else 1
+                    )
+                    q_idx, k_idx, idx_w = self.indexer.project(
+                        hidden_states,
+                        q_compressed,
+                        positions,
+                        self.rotary_emb,
+                        q_group=q_group,
+                        precomputed_wk=precomputed_wk,
+                    )
+                    dsa_kwargs["q_idx"] = q_idx
+                    dsa_kwargs["k_idx"] = k_idx
+                    dsa_kwargs["idx_weights"] = idx_w
         elif self.indexer is not None:
             _ = self.indexer(
                 hidden_states,
@@ -707,6 +785,50 @@ class Glm5Attention(nnx.Module):
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
+
+    def forward_kv_only(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> jax.Array:
+        """KV-only prefill write-back: projects and writes only c_kv, k_rope, and k_idx."""
+        if self.kv_a_proj_with_mqa is not None:
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
+            precomputed_wk = None
+        else:
+            qkv_out, _ = self.qkv_a_proj(hidden_states)
+            _, kva_start, kva_end, wk_start, wk_end = self._qkv_a_offsets
+            latent_cache = qkv_out[:, kva_start:kva_end]
+            precomputed_wk = qkv_out[:, wk_start:wk_end] if self._qkv_a_has_wk else None
+
+        dsa_kwargs = {}
+        if self.use_dsa_sparse:
+            dsa_kwargs["indexer_type"] = self.indexer_type
+            if self.indexer is not None:
+                dsa_kwargs["k_idx"] = self.indexer.project_key_only(
+                    hidden_states,
+                    positions,
+                    self.rotary_emb,
+                    precomputed_wk=precomputed_wk,
+                )
+
+        compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
+        compressed = self.kv_a_layernorm(compressed)
+
+        k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
+        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+
+        c_kv_3d = compressed[:, None, :]
+        return forward_batch.attn_backend.forward_kv_only(
+            c_kv_3d,
+            k_rope,
+            self.attn_mqa,
+            forward_batch,
+            token_to_kv_pool,
+            **dsa_kwargs,
+        )
 
 
 def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
@@ -1243,6 +1365,22 @@ class Glm5DecoderLayer(nnx.Module):
             topk_ids = None
 
         return hidden_states, residual, kv_fused, topk_ids
+
+    def forward_kv_only(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> jax.Array:
+        """KV-only prefill write-back: skips attention output projection and MoE layer."""
+        hidden_states = self.input_layernorm(hidden_states)
+        return self.self_attn.forward_kv_only(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+        )
 
 
 class Glm5Model(nnx.Module):
@@ -1916,6 +2054,43 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         if return_dsa_topk_pages:
             return output, kv_cache_list, True, None, (kv_fused.topk_pages if is_dsa else None)
         return output, kv_cache_list, True, None
+
+    def forward_kv_only(
+        self,
+        forward_batch: ForwardBatch,
+        memory_pools,
+    ):
+        """KV-only MTP prefill step for PD Disagg prefill workers (1P).
+
+        Computes only the draft layer's KV + DSA indexer-key projections and
+        writes them to ``memory_pools``, skipping attention, the 256-expert MoE
+        layer, and ``lm_head`` (since 1D recomputes the final prompt token in its
+        1-token post-transfer EXTEND batch).
+        """
+        from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
+
+        embed = self.embed_tokens(forward_batch.input_ids)
+        hidden_in = forward_batch.spec_info.hidden_states
+        emb_sh = jax.typeof(embed).sharding
+        if isinstance(emb_sh, jax.sharding.NamedSharding):
+            hidden_in = jax.sharding.reshard(hidden_in, emb_sh)
+
+        concat_in = jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)
+        hidden_states, _ = self.eh_proj(concat_in)
+
+        token_to_kv_pool = (
+            memory_pools.token_to_kv_pool
+            if hasattr(memory_pools, "token_to_kv_pool")
+            else memory_pools
+        )
+        kv_fused = self.mtp_block.forward_kv_only(
+            forward_batch.positions,
+            hidden_states,
+            forward_batch,
+            token_to_kv_pool,
+        )
+        is_dsa = isinstance(kv_fused, DSAFusedCache)
+        return nextn_pool_updates(kv_fused, is_dsa)
 
     def load_weights(self, model_config: ModelConfig):
         self.loader = WeightLoader(
