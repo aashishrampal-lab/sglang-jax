@@ -551,6 +551,7 @@ def _set_envs_and_config(server_args):
                 pid,
             )
             logger.warning("Child process pid=%s frame=%s", pid, frame)
+            kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 

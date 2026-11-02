@@ -376,6 +376,25 @@ class TokenizerManager:
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
 
+        if (
+            input_ids is not None
+            and self.context_len is not None
+            and self.context_len > 1024
+            and int(os.environ.get("SGL_CAP_CONTEXT_LEN", "0")) != 0
+        ):
+            max_inp = min(
+                int(os.environ.get("SGL_MAX_INPUT_TOKENS", "256000")),
+                self.context_len - 1024,
+            )
+            if len(input_ids) > max_inp:
+                input_ids = input_ids[:max_inp]
+                obj.input_ids = input_ids
+            max_new = obj.sampling_params.get("max_new_tokens")
+            if max_new is not None and (len(input_ids) + max_new) >= self.context_len:
+                obj.sampling_params["max_new_tokens"] = max(
+                    16, self.context_len - len(input_ids) - 16
+                )
+
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
 
@@ -1563,31 +1582,22 @@ class _Communicator[T]:
         self._fan_out = fan_out
         self._result_event: asyncio.Event | None = None
         self._result_values: list[T] | None = None
-        self._ready_queue: deque[asyncio.Future] = deque()
+        self._lock = asyncio.Lock()
 
     async def __call__(self, obj):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
-
-        if obj:
-            self._sender.send_pyobj(obj)
-
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+        async with self._lock:
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            try:
+                if obj:
+                    self._sender.send_pyobj(obj)
+                await self._result_event.wait()
+                return self._result_values
+            finally:
+                self._result_event = self._result_values = None
 
     def handle_recv(self, recv_obj: T):
-        self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
-            self._result_event.set()
+        if self._result_values is not None and self._result_event is not None:
+            self._result_values.append(recv_obj)
+            if len(self._result_values) == self._fan_out:
+                self._result_event.set()
