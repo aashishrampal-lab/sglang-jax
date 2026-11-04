@@ -123,6 +123,7 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
+_SHARDED_PREFIX_PAGES = int(os.environ.get("DSA_SHARDED_PREFIX_PAGES", "0"))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
@@ -479,11 +480,19 @@ class Scheduler(
         # model/runtime initialization. nnodes=1 does not prove one JAX process,
         # and the multimodal launch flag does not identify every model type.
         if server_args.disaggregation_enable_overlap_schedule and (
-            self.is_hybrid or self.model_config.is_multimodal or jax.process_count() != 1
+            self.is_hybrid
+            or self.model_config.is_multimodal
+            or (
+                (
+                    server_args.disaggregation_mode != "decode"
+                    or os.environ.get("SGL_PD_ALLOW_DECODE_OVERLAP", "0") != "1"
+                )
+                and jax.process_count() != 1
+            )
         ):
             raise ValueError(
-                "PD scheduler overlap currently requires a single-process, "
-                "full-attention text model"
+                "PD scheduler overlap currently requires a full-attention text model "
+                "(and single-process for prefill mode)"
             )
         self.sliding_window_size = None
         if self.is_hybrid:
@@ -779,6 +788,41 @@ class Scheduler(
         # blocks until kv_buffer is rebound (donation-safe).
         if self.enable_overlap and getattr(self.tree_cache, "hicache_enabled", False):
             self.tree_cache._donation_barrier = self._wait_donation_safe
+        if isinstance(self.tree_cache, ChunkCache):
+
+            def _pd_chunk_cache_finished_req(req: Req, is_insert: bool = True):
+                committed_kv_len = req.pop_committed_kv_cache()
+                shared_len = int(getattr(req, "_pd_shared_prefix_len", 0) or 0)
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx,
+                    shared_len:committed_kv_len,
+                ]
+                dp_rank = req.dp_rank if req.dp_rank is not None else 0
+                if len(kv_indices) > 0:
+                    self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+                prefix_entry = getattr(req, "_pd_shared_prefix_entry", None)
+                if prefix_entry is not None:
+                    req._pd_shared_prefix_entry = None
+                    prefix_entry["ref_count"] = max(0, int(prefix_entry.get("ref_count", 1)) - 1)
+                    if prefix_entry["ref_count"] == 0 and prefix_entry.get("evict_on_zero", False):
+                        shared_kv = prefix_entry.get("kv_indices")
+                        if shared_kv is not None and len(shared_kv) > 0:
+                            self.token_to_kv_pool_allocator.free(shared_kv, dp_rank)
+                        prefix_entry["kv_indices"] = None
+
+            self.tree_cache.cache_finished_req = _pd_chunk_cache_finished_req
+
+    @staticmethod
+    def _extract_pd_dpseq(req: Req | None) -> int | None:
+        if req is None:
+            return None
+        tid = str(getattr(req, "disagg_transfer_id", "") or "")
+        if "__dpseq_" in tid:
+            try:
+                return int(tid.rsplit("__dpseq_", 1)[1].split("__", 1)[0])
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
     def _get_input_token_len(req: Req | TokenizedGenerateReqInput) -> int:
@@ -1235,6 +1279,23 @@ class Scheduler(
         req.bootstrap_room = recv_req.bootstrap_room
         req.disagg_prefill_dp_rank = getattr(recv_req, "disagg_prefill_dp_rank", None)
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
+        _tid_str = str(req.disagg_transfer_id or "")
+        _target_prefix_len = (
+            int(
+                os.environ.get(
+                    "SGL_PD_SHARED_PREFIX_LEN",
+                    "262144" if _SHARDED_PREFIX_PAGES == 0 else "92160",
+                )
+            )
+            // self.page_size
+        ) * self.page_size
+        if (
+            "__pskip_" in _tid_str
+            and len(req.origin_input_ids) >= _target_prefix_len + self.page_size
+        ):
+            req._pd_transfer_skip_tokens = _target_prefix_len
+        elif "__pfull_" in _tid_str:
+            req._pd_transfer_skip_tokens = 0
         if (
             getattr(self.server_args, "disaggregation_enable_overlap_schedule", False)
             and self.server_args.disaggregation_mode == "prefill"
@@ -1331,7 +1392,23 @@ class Scheduler(
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
                 req.grammar = value
 
-                if not cache_hit:
+                if getattr(req, "bootstrap_room", None) is not None:
+                    if not cache_hit:
+                        try:
+                            value = value.result(timeout=5.0)
+                            self.grammar_backend.set_cache(key, value)
+                        except Exception:
+                            value = INVALID_GRAMMAR_OBJ
+                    if value is INVALID_GRAMMAR_OBJ:
+                        logger.warning(
+                            "Invalid grammar for PD request rid=%s (%s); falling back to unconstrained generation",
+                            getattr(req, "rid", None),
+                            key,
+                        )
+                        req.grammar = None
+                    else:
+                        req.grammar = value
+                elif not cache_hit:
                     req.grammar_key = key
                     add_to_grammar_queue = True
                 else:
@@ -1638,6 +1715,16 @@ class Scheduler(
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
         self.new_token_ratio = self.init_new_token_ratio
+        for attr_name in (
+            "_pd_last_prefix_ids_per_dp",
+            "_pd_decode_prefix_cache",
+            "_pd_next_expected_dpseq",
+            "_pd_dpseq_wait_ticks",
+        ):
+            state_dict = getattr(self, attr_name, None)
+            if isinstance(state_dict, dict):
+                state_dict.clear()
+        self._pd_latest_leader_prefix = None
 
         flushed_items = (
             self.token_to_kv_pool_allocator.available_size()
@@ -2055,6 +2142,13 @@ class Scheduler(
                 if cur_bs < prev_bs_per_dp[dp_rank] or self.running_batch.is_empty():
                     info.batch_is_full = False
 
+        if (
+            self.waiting_queue
+            and hasattr(self, "_admit_pd_direct_decode_reqs")
+            and any(getattr(r, "_pd_direct_decode_ready", False) for r in self.waiting_queue)
+        ):
+            self._admit_pd_direct_decode_reqs()
+
         # decode-first interleave: when enabled, force 1:N decode:prefill ratio
         # to bound Max ITL by ~prefill_chunk_time instead of letting a burst of
         # waiting prefills starve running decodes (observed 110s spike at c64).
@@ -2064,17 +2158,33 @@ class Scheduler(
             self._decode_first_n = df
             self._consec_decode = 0
         has_active_chunked = any(req is not None for req in self.chunked_reqs)
+        disagg_coalesce_decode = (
+            os.environ.get("SGL_PD_COALESCE_DECODE", "0") == "1"
+            and getattr(getattr(self, "server_args", None), "disaggregation_mode", "null")
+            == "decode"
+            and not self.running_batch.is_empty()
+            and not self.running_batch.is_prefill_only
+            and len(getattr(self, "disagg_transfer_queue", ())) > 0
+            and len(self.waiting_queue) < max(1, int(self.dp_size))
+            and self._consec_decode < max(df, 4)
+        )
         skip_prefill = (
             df > 0
             and not has_active_chunked
             and not self.running_batch.is_empty()
             and not self.running_batch.is_prefill_only
             and self._consec_decode < df
-        )
+        ) or disagg_coalesce_decode
         if (
             force_eagle3_bootstrap_decode
             or skip_prefill
             or (self.pd and self._pd_pending_migrate is not None)
+            or (
+                getattr(getattr(self, "server_args", None), "disaggregation_mode", "null")
+                == "decode"
+                and len(self.waiting_queue) > 0
+                and all(getattr(r, "_pd_direct_decode_ready", False) for r in self.waiting_queue)
+            )
         ):
             new_batch = None
         elif self.pd:
@@ -2465,7 +2575,20 @@ class Scheduler(
                 lcp_len = int(diff_idx[0]) if len(diff_idx) > 0 else min_len
             else:
                 ids0 = first_req.origin_input_ids
-                lcp_len = max(0, len(ids0) - coop_chunk)
+                _coop_cfg_len = (
+                    int(
+                        os.environ.get(
+                            "SGL_PD_SHARED_PREFIX_LEN",
+                            "262144" if _SHARDED_PREFIX_PAGES == 0 else "92160",
+                        )
+                    )
+                    // self.page_size
+                ) * self.page_size
+                lcp_len = (
+                    _coop_cfg_len + (1 if is_eagle_cache else 0)
+                    if len(ids0) >= _coop_cfg_len + self.page_size
+                    else max(0, len(ids0) - coop_chunk)
+                )
 
         effective_lcp = max(0, lcp_len - 1) if is_eagle_cache else lcp_len
         coop_target_len = (effective_lcp // self.page_size) * self.page_size
@@ -2683,7 +2806,37 @@ class Scheduler(
             self.chunked_reqs[r] is not None and self._pending_chunked_abort_reqs[r] is None
             for r in range(self.dp_size)
         )
-        skip_waiting_queue = admissions_paused or all_dp_chunked
+        is_pd_prefill_mode = (
+            getattr(getattr(self, "server_args", None), "disaggregation_mode", "null") == "prefill"
+        )
+        skip_waiting_queue = (
+            admissions_paused
+            or all_dp_chunked
+            or (
+                is_pd_prefill_mode
+                and has_chunked_reqs
+                and os.environ.get("SGL_PD_ONE_REQ_PER_DP_WAVE", "0") == "1"
+            )
+        )
+
+        def _pd_req_sort_key(r):
+            k = getattr(r, "_pd_cached_sort_key", None)
+            if k is None:
+                s = self._extract_pd_dpseq(r)
+                k = (
+                    s if s is not None else 10**9,
+                    0 if "__pfull_" in str(getattr(r, "disagg_transfer_id", "") or "") else 1,
+                    int(getattr(r, "dp_rank", 0) or 0),
+                )
+                r._pd_cached_sort_key = k
+            return k
+
+        if (
+            not skip_waiting_queue
+            and len(self.waiting_queue) > 1
+            and any(getattr(r, "bootstrap_room", None) is not None for r in self.waiting_queue)
+        ):
+            self.waiting_queue.sort(key=_pd_req_sort_key)
 
         if not skip_waiting_queue:
             coop_batch = self._maybe_get_coop_prefill_batch()
@@ -2718,6 +2871,10 @@ class Scheduler(
         # Get priority queue
         if not skip_waiting_queue and len(self.waiting_queue) > 0:
             self.policy.calc_priority(self.waiting_queue)
+            if len(self.waiting_queue) > 1 and any(
+                getattr(r, "bootstrap_room", None) is not None for r in self.waiting_queue
+            ):
+                self.waiting_queue.sort(key=_pd_req_sort_key)
 
         adder = PrefillAdder(
             self.page_size,
@@ -2749,6 +2906,7 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         chunk_exhausted_dps = set()
+        dpseq_blocked_dps = set()
         coop_enabled = (
             self.dp_size > 1
             and self.tree_cache is not None
@@ -2759,14 +2917,27 @@ class Scheduler(
         busy_for_coop = coop_enabled and (has_chunked_reqs or not self.running_batch.is_empty())
         is_eagle_cache = bool(getattr(self.tree_cache, "is_eagle", False))
         coop_probe_key_len = 4097 if is_eagle_cache else 4096
+        active_wave_dpseq = None
+        if is_pd_prefill_mode:
+            for creq_List in adder.can_run_list.values():
+                for creq in creq_List:
+                    ctid = str(getattr(creq, "disagg_transfer_id", "") or "")
+                    if "__pskip_" in ctid or "__pfull_" in ctid:
+                        s = self._extract_pd_dpseq(creq)
+                        if s is not None:
+                            active_wave_dpseq = (
+                                s if active_wave_dpseq is None else min(active_wave_dpseq, s)
+                            )
         for req in () if skip_waiting_queue else self.waiting_queue:
+            if getattr(req, "_pd_direct_decode_ready", False):
+                continue
             # Get DP rank for this request
             dp_rank = req.dp_rank
             assert (
                 dp_rank is not None
             ), "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
 
-            if dp_rank in chunk_exhausted_dps:
+            if dp_rank in chunk_exhausted_dps or dp_rank in dpseq_blocked_dps:
                 continue
 
             # Check whether dp is full load before doing any prefix tree lookup
@@ -2775,7 +2946,7 @@ class Scheduler(
                 >= self.per_dp_max_running_requests
             ):
                 chunk_exhausted_dps.add(dp_rank)
-                if len(chunk_exhausted_dps) >= self.dp_size:
+                if len(chunk_exhausted_dps) + len(dpseq_blocked_dps) >= self.dp_size:
                     break
                 continue
 
@@ -2790,9 +2961,14 @@ class Scheduler(
                     getattr(adder, "rem_chunk_tokens_list", None) is not None
                     and adder.rem_chunk_tokens_list[dp_rank] <= 0
                 )
+                or (
+                    is_pd_prefill_mode
+                    and len(adder.can_run_list[dp_rank]) >= 1
+                    and os.environ.get("SGL_PD_ONE_REQ_PER_DP_WAVE", "0") == "1"
+                )
             ):
                 chunk_exhausted_dps.add(dp_rank)
-                if len(chunk_exhausted_dps) >= self.dp_size:
+                if len(chunk_exhausted_dps) + len(dpseq_blocked_dps) >= self.dp_size:
                     break
                 continue
 
@@ -2827,6 +3003,31 @@ class Scheduler(
                     if self.running_batch.batch_is_full:
                         break
                     continue
+
+            req_tid = str(getattr(req, "disagg_transfer_id", "") or "")
+            use_cross_dp_sync = "__pskip_" in req_tid or "__pfull_" in req_tid
+            dpseq = (
+                self._extract_pd_dpseq(req) if (is_pd_prefill_mode and use_cross_dp_sync) else None
+            )
+            if dpseq is not None:
+                if active_wave_dpseq is not None and dpseq != active_wave_dpseq:
+                    dpseq_blocked_dps.add(dp_rank)
+                    continue
+                next_seq_map = getattr(self, "_pd_next_expected_dpseq", None)
+                if next_seq_map is None:
+                    next_seq_map = self._pd_next_expected_dpseq = {}
+                wait_map = getattr(self, "_pd_dpseq_wait_ticks", None)
+                if wait_map is None:
+                    wait_map = self._pd_dpseq_wait_ticks = {}
+                if dpseq == 0 and next_seq_map.get(dp_rank, 0) > 0:
+                    next_seq_map[dp_rank] = 0
+                expected_seq = next_seq_map.get(dp_rank, 0)
+                if dpseq > expected_seq:
+                    wkey = (dp_rank, dpseq)
+                    wait_map[wkey] = wait_map.get(wkey, 0) + 1
+                    if wait_map[wkey] < 200:
+                        dpseq_blocked_dps.add(dp_rank)
+                        continue
 
             # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
             # This is GLOBAL - must be same across all DP ranks
@@ -2873,9 +3074,138 @@ class Scheduler(
 
             # H2D load-back happens inside add_one_req (after NO_TOKEN gate).
             res = adder.add_one_req(req)
+            admitted_this_req = req in adder.can_run_list.get(dp_rank, ())
+
+            if admitted_this_req:
+                if _reserved_bid is not None:
+                    req.disagg_host_buffer_id = _reserved_bid
+                if is_pd_prefill_mode and req.bootstrap_room is not None:
+                    if dpseq is not None:
+                        if active_wave_dpseq is None:
+                            active_wave_dpseq = dpseq
+                        self._pd_next_expected_dpseq[dp_rank] = dpseq + 1
+                    last_prefix_map = getattr(self, "_pd_last_prefix_ids_per_dp", None)
+                    if last_prefix_map is None:
+                        last_prefix_map = self._pd_last_prefix_ids_per_dp = {}
+                    target_prefix_len = (
+                        int(
+                            os.environ.get(
+                                "SGL_PD_SHARED_PREFIX_LEN",
+                                "262144" if _SHARDED_PREFIX_PAGES == 0 else "92160",
+                            )
+                        )
+                        // self.page_size
+                    ) * self.page_size
+                    seqlen = len(req.origin_input_ids)
+                    tid = str(getattr(req, "disagg_transfer_id", "") or "")
+                    is_spec = self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+                    if "__pskip_" in tid and seqlen >= target_prefix_len + self.page_size:
+                        req._pd_transfer_skip_tokens = target_prefix_len
+                        last_prefix_map[dp_rank] = [
+                            list(req.origin_input_ids[: target_prefix_len + 1])
+                        ]
+                    elif "__pfull_" in tid:
+                        req._pd_transfer_skip_tokens = 0
+                        if seqlen >= target_prefix_len + self.page_size:
+                            last_prefix_map[dp_rank] = [
+                                list(req.origin_input_ids[: target_prefix_len + 1])
+                            ]
+                        else:
+                            last_prefix_map.pop(dp_rank, None)
+                    elif (
+                        os.environ.get("SGL_PD_SHARED_PREFIX_SKIP", "0") == "1"
+                        or os.environ.get("SGL_PD_PIN_PREFIX_SLOTS", "0") == "1"
+                        or _SHARDED_PREFIX_PAGES > 0
+                    ):
+                        max_prefix_slots = (
+                            1
+                            if _SHARDED_PREFIX_PAGES > 0
+                            else int(os.environ.get("SGL_PD_MAX_PREFIX_SLOTS", "8"))
+                        )
+                        pin_prefix_slots = (
+                            _SHARDED_PREFIX_PAGES == 0
+                            and os.environ.get("SGL_PD_PIN_PREFIX_SLOTS", "0") == "1"
+                        )
+                        raw_slots = last_prefix_map.get(dp_rank)
+                        if not raw_slots:
+                            slot_list: list[list[int]] = []
+                        elif isinstance(raw_slots[0], int):
+                            slot_list = [raw_slots]
+                        else:
+                            slot_list = list(raw_slots)
+                        last_prefix_map[dp_rank] = slot_list
+                        skip_tokens = 0
+                        matched_idx = -1
+                        matched_lcp_tokens = 0
+                        matched_cmp_len = 0
+                        min_prefix_skip = int(
+                            os.environ.get("SGL_PD_MIN_PREFIX_SKIP_TOKENS", "2048")
+                        )
+                        if slot_list and seqlen >= self.page_size * 2:
+                            cap_cmp = min(
+                                target_prefix_len,
+                                ((seqlen - self.page_size) // self.page_size) * self.page_size,
+                            )
+                            for s_idx in range(len(slot_list) - 1, -1, -1):
+                                prev_prefix_ids = slot_list[s_idx]
+                                cmp_len = min(len(prev_prefix_ids), cap_cmp + 1)
+                                if cmp_len >= min_prefix_skip:
+                                    if req.origin_input_ids[:cmp_len] == prev_prefix_ids[:cmp_len]:
+                                        lcp_tokens = cmp_len
+                                    else:
+                                        arr_cur = np.asarray(
+                                            req.origin_input_ids[:cmp_len], dtype=np.int32
+                                        )
+                                        arr_prev = np.asarray(
+                                            prev_prefix_ids[:cmp_len], dtype=np.int32
+                                        )
+                                        diff = np.nonzero(arr_cur != arr_prev)[0]
+                                        lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
+                                    usable_lcp = (
+                                        max(0, lcp_tokens - 1)
+                                        if (is_spec and lcp_tokens < cmp_len)
+                                        else min(lcp_tokens, cap_cmp)
+                                    )
+                                    cand_skip = (usable_lcp // self.page_size) * self.page_size
+                                    if (
+                                        cand_skip >= min_prefix_skip
+                                        and seqlen >= cand_skip + self.page_size
+                                        and cand_skip > skip_tokens
+                                    ):
+                                        skip_tokens = cand_skip
+                                        matched_idx = s_idx
+                                        matched_lcp_tokens = lcp_tokens
+                                        matched_cmp_len = cmp_len
+                        req._pd_transfer_skip_tokens = skip_tokens
+                        if skip_tokens > 0 and matched_idx >= 0:
+                            matched_ids = slot_list.pop(matched_idx)
+                            if (
+                                not pin_prefix_slots
+                                and matched_lcp_tokens == matched_cmp_len
+                                and os.environ.get("SGL_PD_MULTI_TURN_PREFIX_EXTEND", "1") == "1"
+                            ):
+                                cap_len = min(
+                                    target_prefix_len,
+                                    ((seqlen - self.page_size) // self.page_size) * self.page_size,
+                                )
+                                if cap_len > skip_tokens:
+                                    matched_ids = list(req.origin_input_ids[: cap_len + 1])
+                            slot_list.append(matched_ids)
+                        elif skip_tokens == 0:
+                            cap_len = min(
+                                target_prefix_len,
+                                ((seqlen - self.page_size) // self.page_size) * self.page_size,
+                            )
+                            if cap_len >= min_prefix_skip:
+                                if not (pin_prefix_slots and len(slot_list) >= max_prefix_slots):
+                                    while len(slot_list) >= max_prefix_slots and slot_list:
+                                        slot_list.pop(0)
+                                    slot_list.append(list(req.origin_input_ids[: cap_len + 1]))
+                            elif max_prefix_slots <= 1 and not pin_prefix_slots:
+                                last_prefix_map.pop(dp_rank, None)
 
             if res != AddReqResult.CONTINUE:
-                if _reserved_bid is not None and _host_pool is not None:
+                if not admitted_this_req and _reserved_bid is not None and _host_pool is not None:
                     _host_pool.release(_reserved_bid)
                 if res == AddReqResult.DP_BUDGET_EXHAUSTED:
                     # Stop admission only for this round, without marking KV capacity full.
@@ -2896,8 +3226,6 @@ class Scheduler(
                 else:
                     # OTHER: Global budget exhausted, stop entirely
                     break
-            if _reserved_bid is not None:
-                req.disagg_host_buffer_id = _reserved_bid
 
         # Update waiting queue
         # Collect H2D flush plans from admitted reqs; drained donation-safe later.

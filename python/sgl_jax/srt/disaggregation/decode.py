@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -33,6 +35,50 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+_SHARDED_PREFIX_PAGES = int(os.environ.get("DSA_SHARDED_PREFIX_PAGES", "0"))
+
+
+@partial(jax.jit, static_argnames=("out_sharding",), donate_argnums=(0,))
+def _jit_scatter_one_layer(buf, page_indices, layer_kv, out_sharding):
+    """Scatter ``layer_kv`` into ``buf`` at ``page_indices`` in-place per layer."""
+    return buf.at[page_indices].set(layer_kv, out_sharding=out_sharding)
+
+
+@partial(jax.jit, static_argnames=("out_sharding",), donate_argnums=(0,))
+def _jit_scatter_all_layers(bufs, page_indices, stacked_kv, out_sharding):
+    """Scatter ``stacked_kv`` (shape ``[num_layers, num_pages, ...]``) into ``bufs`` in one fused XLA program."""
+    return [
+        buf.at[page_indices].set(stacked_kv[i], out_sharding=out_sharding)
+        for i, buf in enumerate(bufs)
+    ]
+
+
+@jax.jit
+def _jit_unstack_layers(stacked_kv):
+    """Unstack a 5-D stacked KV array along axis 0 in a single JIT call."""
+    return tuple(stacked_kv[i] for i in range(stacked_kv.shape[0]))
+
+
+@partial(jax.jit, static_argnames=("out_sharding", "dp_size"), donate_argnums=(0,))
+def _jit_broadcast_prefix_one_layer(
+    buf, src_page_indices, dst_page_indices, out_sharding, dp_size: int
+):
+    """Broadcast ``src_page_indices`` from the leader DP rank to ``dst_page_indices`` across all DP ranks."""
+    src_pages = buf.at[src_page_indices].get(
+        out_sharding=NamedSharding(out_sharding.mesh, PartitionSpec(None, *out_sharding.spec[1:]))
+    )
+    tiled_pages = jnp.tile(src_pages, (dp_size,) + (1,) * (src_pages.ndim - 1))
+    return buf.at[dst_page_indices].set(tiled_pages, out_sharding=out_sharding)
+
+
+@partial(jax.jit, static_argnames=("out_sharding",), donate_argnums=(0,))
+def _jit_scatter_prefix_shards_one_layer(buf, src_page_indices, dst_page_indices, out_sharding):
+    """Scatter distinct prefix page shards from the leader DP rank across DP ranks."""
+    src_pages = buf.at[src_page_indices].get(
+        out_sharding=NamedSharding(out_sharding.mesh, PartitionSpec(None, *out_sharding.spec[1:]))
+    )
+    return buf.at[dst_page_indices].set(src_pages, out_sharding=out_sharding)
 
 
 def _batch_req_count(batch) -> int:
@@ -294,6 +340,8 @@ class SchedulerDisaggregationDecodeMixin:
         if self.result_queue:
             self._wait_donation_safe()
             jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
+            for dpool in getattr(self, "_get_draft_kv_pools", lambda: ())():
+                jax.block_until_ready(dpool.kv_buffer)
         while self.result_queue:
             batch, result = self.result_queue.popleft()
             batch.next_batch_sampling_info = None
@@ -310,9 +358,13 @@ class SchedulerDisaggregationDecodeMixin:
         implemented, new native receive admission requires a whole-pool device
         fence. Steady decode and polling existing receives need no such fence.
         """
+        if os.environ.get("SGL_PD_SKIP_DECODE_ADMISSION_FENCE", "0") == "1":
+            return
         with jax.profiler.TraceAnnotation("pd_decode_admission_fence"):
             self._wait_donation_safe()
             jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
+            for dpool in getattr(self, "_get_draft_kv_pools", lambda: ())():
+                jax.block_until_ready(dpool.kv_buffer)
 
     def event_loop_normal_disagg_decode(self: Scheduler) -> None:
         """Decode event loop."""
@@ -321,6 +373,7 @@ class SchedulerDisaggregationDecodeMixin:
         wd.start()
 
         while True:
+            self.cur_batch = None
             wd.beat("recv_requests")
             recv_reqs = (
                 self._comm_backend.recv_requests()
@@ -338,13 +391,18 @@ class SchedulerDisaggregationDecodeMixin:
             wd.beat("process_decode_queue")
             self.process_decode_queue()
 
+            if len(self.disagg_transfer_queue) == 0:
+                self._sync_unpopulated_decode_prefixes()
+
             wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
+                self._sync_unpopulated_decode_prefixes()
                 wd.beat("run_batch")
                 result = self.run_batch(batch)
+                self.cur_batch = None
                 wd.beat("process_batch_result")
                 self.process_batch_result(batch, result)
             else:
@@ -506,8 +564,296 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler) -> None:
         """Drive prealloc -> transfer -> ready transitions."""
 
+        self.cur_batch = None
         self._admit_decode_prealloc()
         self._drain_decode_transfer_terminals()
+        running_batch = getattr(self, "running_batch", None)
+        waiting_queue = getattr(self, "waiting_queue", ())
+        transfer_queue = getattr(self, "disagg_transfer_queue", ())
+        running_empty = running_batch is None or running_batch.is_empty()
+        has_pskip_waiting = any(
+            "__pskip_" in str(getattr(r, "disagg_transfer_id", "") or "") for r in waiting_queue
+        )
+        if (
+            len(waiting_queue) > 0
+            and len(transfer_queue) > 0
+            and (
+                has_pskip_waiting
+                or (running_empty and os.environ.get("SGL_PD_DRAIN_WAVE_TRANSFERS", "0") == "1")
+            )
+        ):
+            import time as _time
+
+            wd = getattr(self, "disagg_decode_watchdog", None)
+            for _ in range(200):
+                if len(transfer_queue) == 0:
+                    break
+                self._drain_decode_transfer_terminals()
+                if len(transfer_queue) > 0:
+                    if wd is not None:
+                        wd.beat("drain_wave_transfers")
+                    _time.sleep(0.002)
+        if len(transfer_queue) == 0:
+            getattr(self, "_sync_unpopulated_decode_prefixes", lambda: None)()
+
+    def _sync_unpopulated_decode_prefixes(self: Scheduler) -> None:
+        prefix_cache = getattr(self, "_pd_decode_prefix_cache", None)
+        if not prefix_cache:
+            return
+        by_leader: dict[int, tuple[dict, list[tuple[int, dict]]]] = {}
+        for dp_rank in sorted(prefix_cache.keys()):
+            val = prefix_cache[dp_rank]
+            entries = val if isinstance(val, list) else ([val] if val is not None else [])
+            for entry in entries:
+                if (
+                    entry is not None
+                    and not entry.get("populated", True)
+                    and entry.get("source_leader_entry") is not None
+                    and entry.get("kv_indices") is not None
+                ):
+                    leader_entry = entry["source_leader_entry"]
+                    if (
+                        leader_entry.get("populated", False)
+                        and leader_entry.get("kv_indices") is not None
+                    ):
+                        lid = id(leader_entry)
+                        if lid not in by_leader:
+                            by_leader[lid] = (leader_entry, [])
+                        by_leader[lid][1].append((dp_rank, entry))
+        if not by_leader:
+            return
+
+        from sgl_jax.srt.disaggregation.prefill import _globalize_rank_local_page_ids
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = int(kv_pool.page_size)
+        dp_size = int(getattr(kv_pool, "dp_size", self.dp_size))
+        total_pages = int(kv_pool.kv_buffer[0].shape[0])
+        pages_per_rank = total_pages // max(1, dp_size)
+
+        for leader_entry, followers in by_leader.values():
+            leader_dp = int(leader_entry.get("dp_rank", 0))
+            scatter_kv = leader_entry.get("scatter_kv_indices")
+            if _SHARDED_PREFIX_PAGES > 0 and scatter_kv is not None:
+                scatter_kv_indices = np.asarray(scatter_kv)
+                shard_pages = int(_SHARDED_PREFIX_PAGES)
+                total_scatter_pages = dp_size * shard_pages
+                if len(scatter_kv_indices) < total_scatter_pages * page_size:
+                    continue
+                src_local_pages = (
+                    scatter_kv_indices[: total_scatter_pages * page_size : page_size] // page_size
+                )
+                src_global_pages = _globalize_rank_local_page_ids(
+                    src_local_pages,
+                    dp_rank=leader_dp,
+                    dp_size=dp_size,
+                    total_pages=total_pages,
+                )
+                follower_map = {r: e for r, e in followers}
+                dst_chunks = []
+                for r in range(dp_size):
+                    if r in follower_map:
+                        f_kv_indices = np.asarray(follower_map[r]["kv_indices"])
+                        f_local_pages = (
+                            f_kv_indices[: shard_pages * page_size : page_size] // page_size
+                        )
+                        f_global_pages = _globalize_rank_local_page_ids(
+                            f_local_pages,
+                            dp_rank=r,
+                            dp_size=dp_size,
+                            total_pages=total_pages,
+                        )
+                        dst_chunks.append(f_global_pages)
+                    else:
+                        dst_chunks.append(
+                            np.full(shard_pages, r * pages_per_rank, dtype=src_global_pages.dtype)
+                        )
+                dst_global_pages = np.concatenate(dst_chunks)
+
+                idx_sharding = NamedSharding(kv_pool.mesh, PartitionSpec(None))
+                src_idx_jax = jax.device_put(src_global_pages, idx_sharding)
+                dst_idx_jax = jax.device_put(dst_global_pages, idx_sharding)
+
+                all_pools = [kv_pool] + list(getattr(self, "_get_draft_kv_pools", lambda: ())())
+                for pool in all_pools:
+                    for layer_idx in range(pool.layer_num):
+                        pool.kv_buffer[layer_idx] = _jit_scatter_prefix_shards_one_layer(
+                            pool.kv_buffer[layer_idx],
+                            src_idx_jax,
+                            dst_idx_jax,
+                            pool.kv_sharding,
+                        )
+                    indexer_buffers = getattr(pool, "indexer_key_buffer", None)
+                    if indexer_buffers:
+                        for slot_idx in range(len(indexer_buffers)):
+                            pool.indexer_key_buffer[slot_idx] = (
+                                _jit_scatter_prefix_shards_one_layer(
+                                    pool.indexer_key_buffer[slot_idx],
+                                    src_idx_jax,
+                                    dst_idx_jax,
+                                    pool.kv_sharding,
+                                )
+                            )
+                last_pool = all_pools[-1]
+                last_indexer = getattr(last_pool, "indexer_key_buffer", None)
+                if last_indexer:
+                    jax.block_until_ready(last_indexer[-1])
+                else:
+                    jax.block_until_ready(last_pool.kv_buffer[-1])
+
+                with suppress(Exception):
+                    src_idx_jax.delete()
+                with suppress(Exception):
+                    dst_idx_jax.delete()
+            else:
+                leader_kv_indices = np.asarray(leader_entry["kv_indices"])
+                num_pages = len(leader_kv_indices) // page_size
+                if num_pages <= 0:
+                    continue
+                src_local_pages = (
+                    leader_kv_indices[: num_pages * page_size : page_size] // page_size
+                )
+                src_global_pages = _globalize_rank_local_page_ids(
+                    src_local_pages,
+                    dp_rank=leader_dp,
+                    dp_size=dp_size,
+                    total_pages=total_pages,
+                )
+
+                follower_map = {r: e for r, e in followers}
+                dst_chunks = []
+                for r in range(dp_size):
+                    if r in follower_map:
+                        f_kv_indices = np.asarray(follower_map[r]["kv_indices"])
+                        f_local_pages = (
+                            f_kv_indices[: num_pages * page_size : page_size] // page_size
+                        )
+                        f_global_pages = _globalize_rank_local_page_ids(
+                            f_local_pages,
+                            dp_rank=r,
+                            dp_size=dp_size,
+                            total_pages=total_pages,
+                        )
+                        dst_chunks.append(f_global_pages)
+                    else:
+                        # Page 0 of each DP rank's local slice is the reserved sentinel page.
+                        dst_chunks.append(
+                            np.full(num_pages, r * pages_per_rank, dtype=src_global_pages.dtype)
+                        )
+                dst_global_pages = np.concatenate(dst_chunks)
+
+                idx_sharding = NamedSharding(kv_pool.mesh, PartitionSpec(None))
+                src_idx_jax = jax.device_put(src_global_pages, idx_sharding)
+                dst_idx_jax = jax.device_put(dst_global_pages, idx_sharding)
+
+                all_pools = [kv_pool] + list(getattr(self, "_get_draft_kv_pools", lambda: ())())
+                for pool in all_pools:
+                    for layer_idx in range(pool.layer_num):
+                        pool.kv_buffer[layer_idx] = _jit_broadcast_prefix_one_layer(
+                            pool.kv_buffer[layer_idx],
+                            src_idx_jax,
+                            dst_idx_jax,
+                            pool.kv_sharding,
+                            dp_size,
+                        )
+                    indexer_buffers = getattr(pool, "indexer_key_buffer", None)
+                    if indexer_buffers:
+                        for slot_idx in range(len(indexer_buffers)):
+                            pool.indexer_key_buffer[slot_idx] = _jit_broadcast_prefix_one_layer(
+                                pool.indexer_key_buffer[slot_idx],
+                                src_idx_jax,
+                                dst_idx_jax,
+                                pool.kv_sharding,
+                                dp_size,
+                            )
+                last_pool = all_pools[-1]
+                last_indexer = getattr(last_pool, "indexer_key_buffer", None)
+                if last_indexer:
+                    jax.block_until_ready(last_indexer[-1])
+                else:
+                    jax.block_until_ready(last_pool.kv_buffer[-1])
+
+                with suppress(Exception):
+                    src_idx_jax.delete()
+                with suppress(Exception):
+                    dst_idx_jax.delete()
+
+            for r, f_entry in followers:
+                f_entry["populated"] = True
+                f_entry["source_leader_entry"] = None
+                leader_entry["ref_count"] = max(0, int(leader_entry.get("ref_count", 1)) - 1)
+            if (
+                _SHARDED_PREFIX_PAGES > 0
+                and leader_entry.get("scatter_kv_extra") is not None
+                and all(
+                    r in prefix_cache
+                    and prefix_cache[r] is not None
+                    and (
+                        any(e.get("populated", False) for e in prefix_cache[r])
+                        if isinstance(prefix_cache[r], list)
+                        else prefix_cache[r].get("populated", False)
+                    )
+                    for r in range(dp_size)
+                )
+            ):
+                self._release_decode_kv_indices(leader_entry["scatter_kv_extra"], leader_dp)
+                leader_entry["scatter_kv_extra"] = None
+                leader_entry["scatter_kv_indices"] = None
+            if leader_entry.get("ref_count", 0) == 0 and leader_entry.get("evict_on_zero", False):
+                if leader_entry.get("scatter_kv_extra") is not None:
+                    self._release_decode_kv_indices(leader_entry["scatter_kv_extra"], leader_dp)
+                    leader_entry["scatter_kv_extra"] = None
+                    leader_entry["scatter_kv_indices"] = None
+                l_kv = leader_entry.get("kv_indices")
+                if l_kv is not None:
+                    self._release_decode_kv_indices(l_kv, leader_dp)
+                    leader_entry["kv_indices"] = None
+
+    def _release_failed_transfer_entry(self: Scheduler, entry: DecodeBookkeeping) -> None:
+        prefix_entry = getattr(entry.req, "_pd_shared_prefix_entry", None)
+        skip_tokens = int(getattr(entry.req, "_pd_transfer_skip_tokens", 0) or 0)
+        if prefix_entry is not None:
+            entry.req._pd_shared_prefix_entry = None
+            src_leader = prefix_entry.get("source_leader_entry")
+            if src_leader is not None:
+                prefix_entry["source_leader_entry"] = None
+                src_leader["ref_count"] = max(0, int(src_leader.get("ref_count", 1)) - 1)
+                if src_leader["ref_count"] == 0 and src_leader.get("evict_on_zero", False):
+                    if src_leader.get("scatter_kv_extra") is not None:
+                        self._release_decode_kv_indices(
+                            src_leader["scatter_kv_extra"], src_leader.get("dp_rank", 0)
+                        )
+                        src_leader["scatter_kv_extra"] = None
+                        src_leader["scatter_kv_indices"] = None
+                    l_kv = src_leader.get("kv_indices")
+                    if l_kv is not None:
+                        self._release_decode_kv_indices(l_kv, src_leader.get("dp_rank", 0))
+                    src_leader["kv_indices"] = None
+            if skip_tokens == 0:
+                prefix_entry["kv_indices"] = None
+                prefix_entry["scatter_kv_extra"] = None
+                prefix_entry["scatter_kv_indices"] = None
+                prefix_entry["ref_count"] = 0
+                prefix_entry["populated"] = False
+            else:
+                prefix_entry["ref_count"] = max(0, int(prefix_entry.get("ref_count", 1)) - 1)
+                if prefix_entry["ref_count"] == 0 and (
+                    prefix_entry.get("evict_on_zero", False)
+                    or not prefix_entry.get("populated", True)
+                ):
+                    if prefix_entry.get("scatter_kv_extra") is not None:
+                        self._release_decode_kv_indices(
+                            prefix_entry["scatter_kv_extra"], entry.req.dp_rank
+                        )
+                        prefix_entry["scatter_kv_extra"] = None
+                        prefix_entry["scatter_kv_indices"] = None
+                    shared_kv = prefix_entry.get("kv_indices")
+                    if shared_kv is not None:
+                        self._release_decode_kv_indices(shared_kv, entry.req.dp_rank)
+                    prefix_entry["kv_indices"] = None
+        if entry.kv_indices is not None:
+            self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+            entry.kv_indices = None
 
     def _drain_decode_transfer_terminals(self: Scheduler) -> None:
         """Finalize terminal receivers without admitting new work."""
@@ -522,8 +868,13 @@ class SchedulerDisaggregationDecodeMixin:
                     logger.exception("receiver.poll() raised for req_id=%s", entry.req_id)
                     state = KVPoll.FAILED
             if entry.cancelled:
-                if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                getattr(
+                    self,
+                    "_release_failed_transfer_entry",
+                    lambda e: SchedulerDisaggregationDecodeMixin._release_failed_transfer_entry(
+                        self, e
+                    ),
+                )(entry)
                 continue
             if state == KVPoll.SUCCESS:
                 try:
@@ -532,16 +883,73 @@ class SchedulerDisaggregationDecodeMixin:
                             self._install_received_kv(req, indices, kv)
                         )
                     )
-                    # D recomputes the last prompt token. If that token alone
-                    # occupies the final received page, the extend allocator
-                    # will allocate a replacement page: no prefix slot retains
-                    # ownership of this one. Transfer is terminal before reuse.
-                    prefix_len = len(entry.req.origin_input_ids) - 1
+                    skip_tokens = int(getattr(entry.req, "_pd_transfer_skip_tokens", 0) or 0)
+                    prefix_entry = getattr(entry.req, "_pd_shared_prefix_entry", None)
                     page_size = self.token_to_kv_pool_allocator.page_size
-                    if prefix_len >= 0 and prefix_len % page_size == 0:
-                        unused_tail = entry.kv_indices[prefix_len:]
-                        entry.kv_indices = entry.kv_indices[:prefix_len]
+                    target_prefix_len = (
+                        int(
+                            os.environ.get(
+                                "SGL_PD_SHARED_PREFIX_LEN",
+                                "262144" if _SHARDED_PREFIX_PAGES == 0 else "92160",
+                            )
+                        )
+                        // page_size
+                    ) * page_size
+                    if skip_tokens == 0 and prefix_entry is not None:
+                        prefix_entry["populated"] = True
+                    if (
+                        skip_tokens > 0
+                        and prefix_entry is not None
+                        and prefix_entry.get("kv_indices") is not None
+                    ):
+                        reuse_kv = (
+                            prefix_entry["kv_indices"][:skip_tokens]
+                            if _SHARDED_PREFIX_PAGES == 0
+                            else prefix_entry["kv_indices"]
+                        )
+                        full_kv_indices = np.concatenate([reuse_kv, np.asarray(entry.kv_indices)])
+                    elif (
+                        skip_tokens == 0
+                        and _SHARDED_PREFIX_PAGES > 0
+                        and prefix_entry is not None
+                        and prefix_entry.get("kv_indices") is not None
+                        and len(entry.kv_indices) >= target_prefix_len
+                    ):
+                        full_kv_indices = np.concatenate(
+                            [
+                                prefix_entry["kv_indices"],
+                                np.asarray(entry.kv_indices[target_prefix_len:]),
+                            ]
+                        )
+                    else:
+                        full_kv_indices = entry.kv_indices
+                    first_output_id = int(getattr(entry.receiver, "first_output_id", -1))
+                    entry.req._pd_first_output_id = first_output_id
+                    entry.req._pd_initial_draft_ids = getattr(
+                        entry.receiver, "initial_draft_ids", None
+                    )
+                    use_direct_decode = (
+                        os.environ.get("SGL_PD_DIRECT_DECODE", "0") == "1"
+                        and first_output_id >= 0
+                        and (
+                            getattr(self, "_is_spec_decode_enabled", lambda: False)()
+                            or not getattr(self, "enable_overlap", False)
+                        )
+                        and not getattr(entry.req, "return_logprob", False)
+                        and not getattr(entry.req, "return_output_logprob_only", False)
+                        and getattr(entry.req, "grammar", None) is None
+                    )
+                    # D recomputes the last prompt token only when falling back to EXTEND.
+                    # With direct-to-decode admission, P already wrote KV for all
+                    # len(origin_input_ids) prompt tokens and transferred t_0.
+                    pos_off = int(getattr(entry.req, "_pd_seq_pos_offset", 0) or 0)
+                    prefix_len = len(entry.req.origin_input_ids) - pos_off - 1
+                    if not use_direct_decode and prefix_len >= 0 and prefix_len % page_size == 0:
+                        unused_tail = full_kv_indices[prefix_len:]
+                        full_kv_indices = full_kv_indices[:prefix_len]
                         self._release_decode_kv_indices(unused_tail, entry.req.dp_rank)
+                    entry.kv_indices = full_kv_indices
+                    entry.req._pd_direct_decode_ready = bool(use_direct_decode)
                     self._set_decode_bookkeeping(entry.req, entry.kv_indices)
                     self._enqueue_for_decode(entry.req)
                     self._pd_mark_time(entry.req, "first_token")
@@ -563,8 +971,13 @@ class SchedulerDisaggregationDecodeMixin:
                         "failed to install KV / enqueue decode for req_id=%s; releasing resources",
                         entry.req_id,
                     )
-                    if entry.kv_indices is not None:
-                        self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                    getattr(
+                        self,
+                        "_release_failed_transfer_entry",
+                        lambda e: SchedulerDisaggregationDecodeMixin._release_failed_transfer_entry(
+                            self, e
+                        ),
+                    )(entry)
                     self._abort_decode_request(
                         entry.req,
                         "kv_writeback",
@@ -577,8 +990,13 @@ class SchedulerDisaggregationDecodeMixin:
                     state.value,
                 )
                 self._record_decode_transfer_failure("receiver_terminal_failed")
-                if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                getattr(
+                    self,
+                    "_release_failed_transfer_entry",
+                    lambda e: SchedulerDisaggregationDecodeMixin._release_failed_transfer_entry(
+                        self, e
+                    ),
+                )(entry)
                 self._abort_decode_request(
                     entry.req,
                     "receiver_terminal_failed",
@@ -652,6 +1070,60 @@ class SchedulerDisaggregationDecodeMixin:
                     out.append(e)
         return out
 
+    def _req_pull_bytes_per_device(self: Scheduler, req: Req | None) -> int:
+        if req is None:
+            return 0
+        seqlen = len(req.origin_input_ids)
+        skip_tokens = int(getattr(req, "_pd_transfer_skip_tokens", 0) or 0)
+        transfer_tokens = max(0, seqlen - skip_tokens)
+        if transfer_tokens <= 0:
+            return 0
+        from sgl_jax.srt.disaggregation.prefill import (
+            _pad_to_page_bucket,
+            _page_transfer_axis_and_multiple,
+        )
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = max(1, int(kv_pool.page_size))
+        num_pages = (transfer_tokens + page_size - 1) // page_size
+        _, _, min_multiple = _page_transfer_axis_and_multiple(kv_pool)
+        padded_pages = _pad_to_page_bucket(num_pages, min_multiple=min_multiple)
+        bytes_per_page_global = 0
+        for pool in [kv_pool] + list(getattr(self, "_get_draft_kv_pools", lambda: ())()):
+            bytes_per_page_global += (
+                int(pool.layer_num)
+                * int(np.prod(pool.kv_buffer[0].shape[1:]))
+                * int(np.dtype(pool.dtype).itemsize)
+            )
+            indexer_buffers = getattr(pool, "indexer_key_buffer", None)
+            if indexer_buffers:
+                bytes_per_page_global += (
+                    int(len(indexer_buffers))
+                    * int(np.prod(indexer_buffers[0].shape[1:]))
+                    * int(np.dtype(indexer_buffers[0].dtype).itemsize)
+                )
+        return (padded_pages * bytes_per_page_global) // max(1, int(self.tp_size))
+
+    def _inflight_pull_bytes_per_device(self: Scheduler) -> int:
+        with self.disagg_transfer_queue._lock:
+            reqs = [e.req for e in self.disagg_transfer_queue._entries.values()]
+        return sum(self._req_pull_bytes_per_device(r) for r in reqs)
+
+    def _pull_budget_bytes_per_device(self: Scheduler) -> int:
+        # Since event_loop_normal_disagg_decode drains all in-flight transfers
+        # in disagg_transfer_queue (which scatters and deletes the temporary
+        # pull buffers) BEFORE launching run_batch(), pull buffers and the
+        # post-transfer EXTEND scratch never coexist in HBM. With cross-DP
+        # prefix deduplication, a 16-request wave pulls only ~0.77 GiB/device.
+        peak_extend_scratch_bytes = int(2.70 * (1024**3))
+        mem_frac = float(getattr(self.server_args, "mem_fraction_static", 0.90) or 0.90)
+        total_hbm_bytes = int(95.73 * (1024**3))
+        free_hbm_bytes = int(max(0.05, 1.0 - mem_frac) * total_hbm_bytes)
+        return min(
+            int(3.20 * (1024**3)),
+            max(int(2.00 * (1024**3)), free_hbm_bytes - peak_extend_scratch_bytes),
+        )
+
     def _admit_decode_prealloc(self: Scheduler) -> None:
         """Admit transfers without consuming non-retractable Decode headroom."""
 
@@ -662,15 +1134,78 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
+        if "SGL_PD_MAX_INFLIGHT_PER_DP" in os.environ:
+            inflight_per_dp = int(os.environ["SGL_PD_MAX_INFLIGHT_PER_DP"])
+            max_inflight = min(
+                int(max_inflight or self.dp_size),
+                max(int(self.dp_size), inflight_per_dp * int(self.dp_size)),
+            )
         per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
+        inflight_pull_bytes = getattr(self, "_inflight_pull_bytes_per_device", lambda: 0)()
+        pull_budget_bytes = getattr(self, "_pull_budget_bytes_per_device", lambda: 1 << 60)()
         transfer_per_dp = self.disagg_transfer_queue.count_by_rank(self.dp_size)
+        waiting_per_dp = [0] * self.dp_size
+        for wreq in getattr(self, "waiting_queue", ()):
+            w_dp = _request_dp_rank(wreq, self.dp_size)
+            if 0 <= w_dp < self.dp_size:
+                waiting_per_dp[w_dp] += 1
         admitted_per_dp = [0] * self.dp_size
         capacity_blocked_ranks: set[int] = set()
         admission_fenced = False
 
-        for entry in self.disagg_prealloc_queue.items_fifo():
+        candidates = self.disagg_prealloc_queue.items_fifo()
+        extract_dpseq = getattr(self, "_extract_pd_dpseq", None)
+        if callable(extract_dpseq) and len(candidates) > 1:
+            candidates.sort(
+                key=lambda e: (
+                    extract_dpseq(e.req) if extract_dpseq(e.req) is not None else 10**9,
+                    0 if "__pfull_" in str(getattr(e.req, "disagg_transfer_id", "") or "") else 1,
+                    _request_dp_rank(e.req, self.dp_size),
+                )
+            )
+
+        active_wave_dpseq = None
+        if callable(extract_dpseq) and n_transfer > 0:
+            with self.disagg_transfer_queue._lock:
+                for te in self.disagg_transfer_queue._entries.values():
+                    ttid = str(getattr(te.req, "disagg_transfer_id", "") or "")
+                    if "__pskip_" in ttid or "__pfull_" in ttid:
+                        s = extract_dpseq(te.req)
+                        if s is not None:
+                            active_wave_dpseq = (
+                                s if active_wave_dpseq is None else min(active_wave_dpseq, s)
+                            )
+        if callable(extract_dpseq) and active_wave_dpseq is None and len(self.waiting_queue) > 0:
+            for wreq in self.waiting_queue:
+                if getattr(wreq, "bootstrap_room", None) is not None:
+                    wtid = str(getattr(wreq, "disagg_transfer_id", "") or "")
+                    if "__pskip_" in wtid or "__pfull_" in wtid:
+                        s = extract_dpseq(wreq)
+                        if s is not None:
+                            active_wave_dpseq = (
+                                s if active_wave_dpseq is None else min(active_wave_dpseq, s)
+                            )
+
+        prefix_cache = getattr(self, "_pd_decode_prefix_cache", None)
+        if prefix_cache is None:
+            prefix_cache = self._pd_decode_prefix_cache = {}
+        target_prefix_len = (
+            int(
+                os.environ.get(
+                    "SGL_PD_SHARED_PREFIX_LEN",
+                    "262144" if _SHARDED_PREFIX_PAGES == 0 else "92160",
+                )
+            )
+            // page_size
+        ) * page_size
+        shard_prefix_len = (
+            int(_SHARDED_PREFIX_PAGES) * page_size if _SHARDED_PREFIX_PAGES > 0 else 0
+        )
+        eff_prefix_len = shard_prefix_len if shard_prefix_len > 0 else target_prefix_len
+
+        for entry in candidates:
             decode_dp_rank = _request_dp_rank(entry.req, self.dp_size)
             prefill_dp_rank = _request_dp_rank(entry.req, self.dp_size, prefill=True)
             # Pulled KV buffers remain outside paged-pool accounting until scatter.
@@ -685,13 +1220,254 @@ class SchedulerDisaggregationDecodeMixin:
                 >= per_rank_inflight
             ):
                 continue
-            seqlen = len(entry.req.origin_input_ids)
-            page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
             n_running = _batch_req_count_for_dp(self.running_batch, decode_dp_rank)
-            reserved = reserved_per * (
-                n_running + transfer_per_dp[decode_dp_rank] + admitted_per_dp[decode_dp_rank]
+            n_active_dp = (
+                n_running
+                + waiting_per_dp[decode_dp_rank]
+                + transfer_per_dp[decode_dp_rank]
+                + admitted_per_dp[decode_dp_rank]
             )
-            if page_aligned + reserved > allocator.available_size(decode_dp_rank):
+            if n_active_dp >= getattr(self, "per_dp_max_running_requests", 1 << 30):
+                capacity_blocked_ranks.add(decode_dp_rank)
+                continue
+
+            entry_tid = str(getattr(entry.req, "disagg_transfer_id", "") or "")
+            use_cross_dp_sync = "__pskip_" in entry_tid or "__pfull_" in entry_tid
+            dpseq = (
+                extract_dpseq(entry.req)
+                if (callable(extract_dpseq) and use_cross_dp_sync)
+                else None
+            )
+            if dpseq is not None:
+                if active_wave_dpseq is not None and dpseq != active_wave_dpseq:
+                    capacity_blocked_ranks.add(decode_dp_rank)
+                    continue
+                next_seq_map = getattr(self, "_pd_next_expected_dpseq", None)
+                if next_seq_map is None:
+                    next_seq_map = self._pd_next_expected_dpseq = {}
+                wait_map = getattr(self, "_pd_dpseq_wait_ticks", None)
+                if wait_map is None:
+                    wait_map = self._pd_dpseq_wait_ticks = {}
+                if dpseq == 0 and next_seq_map.get(decode_dp_rank, 0) > 0:
+                    next_seq_map[decode_dp_rank] = 0
+                expected_seq = next_seq_map.get(decode_dp_rank, 0)
+                if dpseq > expected_seq:
+                    wkey = (decode_dp_rank, dpseq)
+                    wait_map[wkey] = wait_map.get(wkey, 0) + 1
+                    if wait_map[wkey] < 200:
+                        capacity_blocked_ranks.add(decode_dp_rank)
+                        continue
+
+            seqlen = len(entry.req.origin_input_ids)
+            tid = str(getattr(entry.req, "disagg_transfer_id", "") or "")
+            force_pfull = "__pfull_" in tid
+            force_pskip = "__pskip_" in tid and seqlen >= target_prefix_len + page_size
+            enable_pd_prefix_skip = (
+                os.environ.get("SGL_PD_SHARED_PREFIX_SKIP", "0") == "1"
+                or os.environ.get("SGL_PD_PIN_PREFIX_SLOTS", "0") == "1"
+                or _SHARDED_PREFIX_PAGES > 0
+                or force_pfull
+                or force_pskip
+            )
+            is_spec = (
+                getattr(self, "spec_algorithm", None) is not None
+                and not self.spec_algorithm.is_none()
+            )
+
+            max_prefix_slots = (
+                1
+                if _SHARDED_PREFIX_PAGES > 0
+                else int(os.environ.get("SGL_PD_MAX_PREFIX_SLOTS", "8"))
+            )
+            pin_prefix_slots = (
+                _SHARDED_PREFIX_PAGES == 0 and os.environ.get("SGL_PD_PIN_PREFIX_SLOTS", "0") == "1"
+            )
+            raw_slots = prefix_cache.get(decode_dp_rank)
+            if raw_slots is None:
+                slot_list: list[dict] = []
+            elif isinstance(raw_slots, list):
+                slot_list = [
+                    e for e in raw_slots if isinstance(e, dict) and e.get("kv_indices") is not None
+                ]
+            elif isinstance(raw_slots, dict):
+                slot_list = [raw_slots] if raw_slots.get("kv_indices") is not None else []
+            else:
+                slot_list = []
+            prefix_cache[decode_dp_rank] = slot_list
+
+            def _evict_prefix_entry(ev_entry: dict) -> None:
+                if ev_entry.get("kv_indices") is None:
+                    return
+                if int(ev_entry.get("ref_count", 0)) <= 0:
+                    if ev_entry.get("scatter_kv_extra") is not None:
+                        self._release_decode_kv_indices(
+                            ev_entry["scatter_kv_extra"], decode_dp_rank
+                        )
+                        ev_entry["scatter_kv_extra"] = None
+                        ev_entry["scatter_kv_indices"] = None
+                    self._release_decode_kv_indices(ev_entry["kv_indices"], decode_dp_rank)
+                    ev_entry["kv_indices"] = None
+                else:
+                    ev_entry["evict_on_zero"] = True
+
+            min_prefix_skip = int(os.environ.get("SGL_PD_MIN_PREFIX_SKIP_TOKENS", "2048"))
+            cached_entry = None
+            reuse_skip_tokens = 0
+            reuse_lcp_tokens = 0
+            reuse_cmp_len = 0
+            if enable_pd_prefix_skip and not force_pfull and slot_list and seqlen >= page_size * 2:
+                for cand_entry in reversed(slot_list):
+                    if cand_entry.get("kv_indices") is None or cand_entry.get(
+                        "evict_on_zero", False
+                    ):
+                        continue
+                    c_ids = cand_entry.get("prefix_ids", ())
+                    cap_cmp = min(
+                        target_prefix_len,
+                        len(cand_entry["kv_indices"]),
+                        ((seqlen - page_size) // page_size) * page_size,
+                    )
+                    cmp_len = min(len(c_ids), cap_cmp + 1)
+                    if cmp_len >= min_prefix_skip:
+                        if entry.req.origin_input_ids[:cmp_len] == c_ids[:cmp_len]:
+                            lcp_tokens = cmp_len
+                        else:
+                            arr_cur = np.asarray(
+                                entry.req.origin_input_ids[:cmp_len], dtype=np.int32
+                            )
+                            arr_prev = np.asarray(c_ids[:cmp_len], dtype=np.int32)
+                            diff = np.nonzero(arr_cur != arr_prev)[0]
+                            lcp_tokens = int(diff[0]) if len(diff) > 0 else cmp_len
+                        usable_lcp = (
+                            max(0, lcp_tokens - 1)
+                            if (is_spec and lcp_tokens < cmp_len)
+                            else min(lcp_tokens, cap_cmp)
+                        )
+                        cand_skip = (usable_lcp // page_size) * page_size
+                        if (
+                            cand_skip >= min_prefix_skip
+                            and seqlen >= cand_skip + page_size
+                            and (_SHARDED_PREFIX_PAGES == 0 or cand_skip == target_prefix_len)
+                            and cand_skip > reuse_skip_tokens
+                        ):
+                            cached_entry = cand_entry
+                            reuse_skip_tokens = cand_skip
+                            reuse_lcp_tokens = lcp_tokens
+                            reuse_cmp_len = cmp_len
+            can_reuse_prefix = reuse_skip_tokens > 0 and cached_entry is not None
+            if not can_reuse_prefix and (
+                force_pfull or (max_prefix_slots <= 1 and not pin_prefix_slots)
+            ):
+                for ev_e in list(slot_list):
+                    if int(ev_e.get("ref_count", 0)) <= 0:
+                        _evict_prefix_entry(ev_e)
+                        slot_list.remove(ev_e)
+
+            can_bcast_from_leader = False
+            leader_entry = None
+            if force_pskip and not can_reuse_prefix:
+                leader_entry = getattr(self, "_pd_latest_leader_prefix", None)
+                if (
+                    leader_entry is not None
+                    and leader_entry.get("kv_indices") is not None
+                    and not leader_entry.get("evict_on_zero", False)
+                    and seqlen >= target_prefix_len + page_size
+                    and len(leader_entry.get("prefix_ids", ())) >= target_prefix_len
+                    and entry.req.origin_input_ids[:target_prefix_len]
+                    == leader_entry["prefix_ids"][:target_prefix_len]
+                ):
+                    can_bcast_from_leader = True
+                else:
+                    capacity_blocked_ranks.add(decode_dp_rank)
+                    continue
+
+            if can_reuse_prefix:
+                skip_tokens = reuse_skip_tokens
+            elif can_bcast_from_leader:
+                skip_tokens = target_prefix_len
+            else:
+                skip_tokens = 0
+            entry.req._pd_transfer_skip_tokens = skip_tokens
+            if skip_tokens > 0:
+                entry.req.cached_tokens = max(
+                    int(getattr(entry.req, "cached_tokens", 0) or 0), int(skip_tokens)
+                )
+            req_pull_bytes = getattr(self, "_req_pull_bytes_per_device", lambda r: 0)(entry.req)
+            if (
+                os.environ.get("SGL_PD_HBM_STAGING_BUDGET", "0") == "1"
+                and (n_transfer + admitted) > 0
+                and (inflight_pull_bytes + req_pull_bytes) > pull_budget_bytes
+            ):
+                # Keep requests that would exceed Decode HBM pull budget waiting in
+                # disagg_prealloc_queue (CPU) until in-flight transfers scatter & free.
+                break
+
+            transfer_tokens = max(1, seqlen - skip_tokens)
+            page_aligned = ((transfer_tokens + page_size - 1) // page_size) * page_size
+            alloc_tokens = eff_prefix_len + page_aligned if can_bcast_from_leader else page_aligned
+            req_sp = getattr(entry.req, "sampling_params", None)
+            req_max_new = int(getattr(req_sp, "max_new_tokens", 0) or 0)
+            if not getattr(req_sp, "ignore_eos", False):
+                req_max_new = min(req_max_new, reserved_per)
+            eff_reserved_per = max(
+                reserved_per, ((req_max_new + page_size - 1) // page_size) * page_size
+            )
+            running_rem_tokens = 0
+            if (
+                self.running_batch is not None
+                and not getattr(self.running_batch, "is_empty", lambda: False)()
+                and hasattr(self.running_batch, "reqs_info")
+                and decode_dp_rank < len(self.running_batch.reqs_info)
+                and self.running_batch.reqs_info[decode_dp_rank].reqs
+            ):
+                for r_req in self.running_batch.reqs_info[decode_dp_rank].reqs:
+                    r_sp = getattr(r_req, "sampling_params", None)
+                    r_max = int(getattr(r_sp, "max_new_tokens", 0) or reserved_per)
+                    if not getattr(r_sp, "ignore_eos", False):
+                        r_max = min(r_max, reserved_per)
+                    r_aligned = ((r_max + page_size - 1) // page_size) * page_size
+                    r_gen = len(getattr(r_req, "output_ids", ()) or ())
+                    running_rem_tokens += max(reserved_per, r_aligned - r_gen)
+            non_running_active = (
+                waiting_per_dp[decode_dp_rank]
+                + transfer_per_dp[decode_dp_rank]
+                + admitted_per_dp[decode_dp_rank]
+            )
+            suffix_tokens = max(
+                1,
+                seqlen - (target_prefix_len if seqlen >= target_prefix_len + page_size else 0),
+            )
+            suffix_page_aligned = ((suffix_tokens + page_size - 1) // page_size) * page_size
+            if enable_pd_prefix_skip:
+                reserved = running_rem_tokens + eff_reserved_per * (non_running_active + 1) + 2048
+                extra_wave_reserve = (
+                    (suffix_page_aligned + eff_reserved_per)
+                    if (not can_reuse_prefix and seqlen >= target_prefix_len + page_size)
+                    else 0
+                )
+            else:
+                reserved = reserved_per * (
+                    n_running + transfer_per_dp[decode_dp_rank] + admitted_per_dp[decode_dp_rank]
+                )
+                extra_wave_reserve = 0
+            if (
+                not can_reuse_prefix
+                and not pin_prefix_slots
+                and slot_list
+                and alloc_tokens + reserved + extra_wave_reserve
+                > allocator.available_size(decode_dp_rank)
+            ):
+                for ev_e in list(slot_list):
+                    if alloc_tokens + reserved + extra_wave_reserve <= allocator.available_size(
+                        decode_dp_rank
+                    ):
+                        break
+                    if int(ev_e.get("ref_count", 0)) <= 0:
+                        _evict_prefix_entry(ev_e)
+                        slot_list.remove(ev_e)
+            if alloc_tokens + reserved + extra_wave_reserve > allocator.available_size(
+                decode_dp_rank
+            ):
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
@@ -716,10 +1492,17 @@ class SchedulerDisaggregationDecodeMixin:
                 self._wait_decode_admission_safe()
                 admission_fenced = True
 
-            kv_indices = allocator.alloc(page_aligned, dp_rank=decode_dp_rank)
-            if kv_indices is None:
+            full_alloc = allocator.alloc(alloc_tokens, dp_rank=decode_dp_rank)
+            if full_alloc is None:
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
+
+            if can_bcast_from_leader:
+                prefix_kv_indices = np.asarray(full_alloc[:eff_prefix_len]).copy()
+                kv_indices = full_alloc[eff_prefix_len:]
+            else:
+                prefix_kv_indices = None
+                kv_indices = full_alloc
 
             try:
                 admission = self.disagg_kv_manager.try_start_decode(
@@ -732,7 +1515,7 @@ class SchedulerDisaggregationDecodeMixin:
                         peer_info=entry.p_info or {},
                         kv_indices=kv_indices,
                         page_size=page_size,
-                        prompt_tokens=len(entry.req.origin_input_ids),
+                        prompt_tokens=transfer_tokens,
                         spec_factory=lambda req=entry.req: self._build_kv_spec_for_req(req),
                         direct_commit=lambda expected, req=entry.req, indices=kv_indices: (
                             self._commit_direct_received_kv(req, indices, expected)
@@ -745,19 +1528,129 @@ class SchedulerDisaggregationDecodeMixin:
                     entry.req.rid,
                 )
                 self._record_decode_transfer_failure("receiver_init")
-                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
+                self._release_decode_kv_indices(full_alloc, decode_dp_rank)
                 self.disagg_prealloc_queue.remove(entry.req_id)
                 self._abort_decode_request(entry.req, "receiver_init")
                 continue
 
             if admission.state == AdmissionState.DEFERRED:
-                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
+                self._release_decode_kv_indices(full_alloc, decode_dp_rank)
                 self._expire_decode_prealloc(entry)
                 continue
 
             receiver = admission.receiver
             if receiver is None:
                 raise RuntimeError("admitted transfer is missing a receiver")
+
+            if dpseq is not None:
+                if active_wave_dpseq is None:
+                    active_wave_dpseq = dpseq
+                self._pd_next_expected_dpseq[decode_dp_rank] = dpseq + 1
+            if can_reuse_prefix and cached_entry is not None:
+                if cached_entry in slot_list:
+                    slot_list.remove(cached_entry)
+                slot_list.append(cached_entry)
+                cached_entry["ref_count"] = int(cached_entry.get("ref_count", 0)) + 1
+                entry.req._pd_shared_prefix_entry = cached_entry
+                prefix_len = skip_tokens if shard_prefix_len == 0 else eff_prefix_len
+                if (
+                    not pin_prefix_slots
+                    and shard_prefix_len == 0
+                    and skip_tokens > 0
+                    and os.environ.get("SGL_PD_MULTI_TURN_PREFIX_EXTEND", "1") == "1"
+                ):
+                    cap_len = min(
+                        target_prefix_len,
+                        ((len(entry.req.origin_input_ids) - page_size) // page_size) * page_size,
+                    )
+                    if reuse_lcp_tokens == reuse_cmp_len and cap_len > skip_tokens:
+                        extra_tokens = cap_len - skip_tokens
+                        cached_entry["kv_indices"] = np.concatenate(
+                            [
+                                cached_entry["kv_indices"],
+                                np.asarray(kv_indices, dtype=np.int32)[:extra_tokens],
+                            ]
+                        )
+                        cached_entry["prefix_ids"] = list(entry.req.origin_input_ids[: cap_len + 1])
+                        prefix_len = cap_len
+                entry.req._pd_shared_prefix_len = prefix_len
+                entry.req._pd_seq_pos_offset = (
+                    0 if shard_prefix_len == 0 else (target_prefix_len - eff_prefix_len)
+                )
+            elif can_bcast_from_leader and leader_entry is not None:
+                while len(slot_list) >= max_prefix_slots and slot_list:
+                    ev_victim = slot_list.pop(0)
+                    _evict_prefix_entry(ev_victim)
+                new_cache_entry = {
+                    "prefix_ids": list(entry.req.origin_input_ids[: target_prefix_len + 1]),
+                    "kv_indices": prefix_kv_indices,
+                    "scatter_kv_indices": None,
+                    "scatter_kv_extra": None,
+                    "ref_count": 1,
+                    "evict_on_zero": False,
+                    "populated": False,
+                    "source_leader_entry": leader_entry,
+                    "dp_rank": decode_dp_rank,
+                }
+                leader_entry["ref_count"] = int(leader_entry.get("ref_count", 0)) + 1
+                slot_list.append(new_cache_entry)
+                entry.req._pd_shared_prefix_entry = new_cache_entry
+                entry.req._pd_shared_prefix_len = eff_prefix_len
+                entry.req._pd_seq_pos_offset = target_prefix_len - eff_prefix_len
+            else:
+                cap_len = min(
+                    target_prefix_len,
+                    ((seqlen - page_size) // page_size) * page_size,
+                )
+                if (
+                    enable_pd_prefix_skip
+                    and cap_len >= min_prefix_skip
+                    and (shard_prefix_len == 0 or seqlen >= target_prefix_len + page_size)
+                ):
+                    if pin_prefix_slots and len(slot_list) >= max_prefix_slots:
+                        entry.req._pd_shared_prefix_entry = None
+                        entry.req._pd_shared_prefix_len = 0
+                        entry.req._pd_seq_pos_offset = 0
+                    else:
+                        while len(slot_list) >= max_prefix_slots and slot_list:
+                            ev_victim = slot_list.pop(0)
+                            _evict_prefix_entry(ev_victim)
+                        kv_indices_np = np.asarray(kv_indices)
+                        store_kv_len = eff_prefix_len if shard_prefix_len > 0 else cap_len
+                        new_cache_entry = {
+                            "prefix_ids": list(entry.req.origin_input_ids[: cap_len + 1]),
+                            "kv_indices": kv_indices_np[:store_kv_len].copy(),
+                            "scatter_kv_indices": (
+                                kv_indices_np[:target_prefix_len].copy()
+                                if shard_prefix_len > 0
+                                else None
+                            ),
+                            "scatter_kv_extra": (
+                                kv_indices_np[eff_prefix_len:target_prefix_len].copy()
+                                if shard_prefix_len > 0
+                                else None
+                            ),
+                            "ref_count": 1,
+                            "evict_on_zero": False,
+                            "populated": False,
+                            "source_leader_entry": None,
+                            "dp_rank": decode_dp_rank,
+                        }
+                        slot_list.append(new_cache_entry)
+                        self._pd_latest_leader_prefix = new_cache_entry
+                        entry.req._pd_shared_prefix_entry = new_cache_entry
+                        entry.req._pd_shared_prefix_len = store_kv_len
+                        entry.req._pd_seq_pos_offset = (
+                            target_prefix_len - eff_prefix_len if shard_prefix_len > 0 else 0
+                        )
+                else:
+                    if max_prefix_slots <= 1 and not pin_prefix_slots:
+                        for ev_e in list(slot_list):
+                            _evict_prefix_entry(ev_e)
+                        slot_list.clear()
+                    entry.req._pd_shared_prefix_entry = None
+                    entry.req._pd_shared_prefix_len = 0
+                    entry.req._pd_seq_pos_offset = 0
 
             entry.kv_indices = kv_indices
             entry.receiver = receiver
@@ -767,9 +1660,13 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_transfer_queue.add(entry)
             admitted += 1
             admitted_per_dp[decode_dp_rank] += 1
+            inflight_pull_bytes += req_pull_bytes
 
     def _expire_decode_prealloc(self: Scheduler, entry: DecodeBookkeeping) -> None:
-        timeout_s = self.server_args.disaggregation_pull_timeout_seconds
+        timeout_s = max(
+            float(os.environ.get("SGL_PD_MIN_PULL_TIMEOUT_SECS", "0")),
+            float(self.server_args.disaggregation_pull_timeout_seconds),
+        )
         if timeout_s <= 0 or time.monotonic() - entry.created_at < timeout_s:
             return
         self.disagg_prealloc_queue.remove(entry.req_id)
@@ -807,27 +1704,330 @@ class SchedulerDisaggregationDecodeMixin:
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 
-    def _build_kv_spec_for_req(self: Scheduler, req: Req) -> list[jax.ShapeDtypeStruct]:
-        """Build per-layer ShapeDtypeStructs matching P's KV layout."""
+    def _use_pd_spec_meta_transfer(self: Scheduler) -> bool:
+        if os.environ.get("SGL_PD_DIRECT_DECODE", "0") != "1":
+            return False
+        if getattr(self, "disagg_use_d2h_staging", False):
+            return False
+        mgr = getattr(self, "disagg_kv_manager", None)
+        return getattr(mgr, "engine_name", None) == "jax" and not getattr(
+            mgr, "requires_host_staging", False
+        )
 
-        from sgl_jax.srt.disaggregation.prefill import _pad_to_page_bucket
+    def _admit_pd_direct_decode_reqs(self: Scheduler) -> int:
+        """Directly admit PD requests that already received their first output token into running_batch."""
+        if not self.waiting_queue:
+            return 0
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+        from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+        from sgl_jax.srt.speculative.relay_buffer import update_spec_relay_buffers_admit
+
+        running_per_dp = [
+            len(info.reqs) if info.reqs else 0 for info in self.running_batch.reqs_info
+        ]
+        max_bs_per_dp = max(1, int(self.max_total_num_tokens) // max(1, int(self.dp_size)))
+        if getattr(self.server_args, "max_running_requests", None):
+            max_bs_per_dp = min(
+                max_bs_per_dp,
+                max(1, int(self.server_args.max_running_requests) // max(1, int(self.dp_size))),
+            )
+
+        ready_reqs: list[Req] = []
+        remaining_waiting: list[Req] = []
+        avail_req_slots = self.req_to_token_pool.available_size()
+        for req in self.waiting_queue:
+            if not getattr(req, "_pd_direct_decode_ready", False):
+                remaining_waiting.append(req)
+                continue
+            prefix_entry = getattr(req, "_pd_shared_prefix_entry", None)
+            if prefix_entry is not None and not prefix_entry.get("populated", True):
+                remaining_waiting.append(req)
+                continue
+            dp_rank = _request_dp_rank(req, self.dp_size)
+            if running_per_dp[dp_rank] >= max_bs_per_dp or avail_req_slots < 1:
+                remaining_waiting.append(req)
+                continue
+            running_per_dp[dp_rank] += 1
+            avail_req_slots -= 1
+            ready_reqs.append(req)
+
+        if not ready_reqs:
+            return 0
+
+        self.waiting_queue = remaining_waiting
+        is_spec = getattr(self, "_is_spec_decode_enabled", lambda: False)()
+        topk = int(getattr(self.server_args, "speculative_eagle_topk", 1) or 1)
+        num_steps = int(getattr(self.server_args, "speculative_num_steps", 1) or 1)
+        from sgl_jax.srt.mem_cache.common import release_kv_cache
+
+        admitted_reqs: list[Req] = []
+        for req in ready_reqs:
+            req.req_pool_idx = None
+            req_pool_indices = self.req_to_token_pool.alloc([req])
+            if req_pool_indices is None:
+                self.waiting_queue.insert(0, req)
+                continue
+            req.req_pool_idx = req_pool_indices[0]
+            pos_off = int(getattr(req, "_pd_seq_pos_offset", 0) or 0)
+            seqlen = len(req.origin_input_ids) - pos_off
+            raw_prealloc = getattr(req, "_pd_prealloc_kv_indices", None)
+            if raw_prealloc is None:
+                raw_prealloc = getattr(req, "_decode_prealloc_tokens", None)
+            prealloc = np.asarray(raw_prealloc if raw_prealloc is not None else [], dtype=np.int32)
+            write_len = min(seqlen, len(prealloc))
+            if write_len > 0:
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, write_len)), prealloc[:write_len]
+                )
+            req.kv_committed_len = seqlen
+            req.kv_allocated_len = seqlen
+            req.fill_ids = list(req.origin_input_ids)
+            req.extend_input_len = 0
+            req.prefix_indices = np.empty((0,), dtype=np.int32)
+            first_tok = int(getattr(req, "_pd_first_output_id", 0))
+            req.output_ids.append(first_tok)
+            req.check_finished()
+            if req.finished():
+                release_kv_cache(req, self.tree_cache, allow_overallocated=is_spec)
+            req._pd_direct_decode_ready = False
+            admitted_reqs.append(req)
+
+        if not admitted_reqs:
+            return 0
+
+        self.stream_output(admitted_reqs, False, False)
+        active_reqs = [r for r in admitted_reqs if not r.finished()]
+        if not active_reqs:
+            return len(admitted_reqs)
+
+        reqs_per_dp: list[list[Req]] = [[] for _ in range(self.dp_size)]
+        for r in active_reqs:
+            reqs_per_dp[_request_dp_rank(r, self.dp_size)].append(r)
+
+        admit_batch = ScheduleBatch.init_new(
+            reqs_per_dp,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.dp_size,
+            spec_algorithm=self.spec_algorithm,
+            mesh=self.mesh,
+            embedding_pool=getattr(self, "embedding_pool", None),
+        )
+        relay_owner = (
+            getattr(self, "draft_worker", None)
+            if getattr(getattr(self, "draft_worker", None), "spec_relay_buffers", None) is not None
+            else getattr(self, "tp_worker", None)
+        )
+        relay_buffers = (
+            getattr(relay_owner, "spec_relay_buffers", None) if relay_owner is not None else None
+        )
+        hidden_size = int(getattr(self.model_config, "hidden_size", 1) or 1)
+        topk_width = num_steps if num_steps > 1 and topk == 1 else topk
+
+        for dp_rank, info in enumerate(admit_batch.reqs_info):
+            if not info.reqs:
+                continue
+            info.req_pool_indices = np.asarray([r.req_pool_idx for r in info.reqs], dtype=np.int32)
+            if is_spec:
+                seq_lens_list = [
+                    len(r.origin_input_ids)
+                    - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                    + len(r.output_ids)
+                    for r in info.reqs
+                ]
+                info.orig_seq_lens = [
+                    len(r.origin_input_ids) + len(r.output_ids) for r in info.reqs
+                ]
+            else:
+                seq_lens_list = [
+                    len(r.origin_input_ids)
+                    - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                    + max(0, len(r.output_ids) - 1)
+                    for r in info.reqs
+                ]
+                info.orig_seq_lens = [
+                    len(r.origin_input_ids) + max(0, len(r.output_ids) - 1) for r in info.reqs
+                ]
+            info.seq_lens = np.asarray(seq_lens_list, dtype=np.int32)
+            info.seq_lens_sum = int(info.seq_lens.sum())
+            info.extend_lens = [1] * len(info.reqs)
+            info.prefix_lens = [
+                len(r.origin_input_ids) - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                for r in info.reqs
+            ]
+            info.positions = list(seq_lens_list)
+            info.output_ids = np.asarray([int(r.output_ids[-1]) for r in info.reqs], dtype=np.int32)
+            if self.model_config is not None and hasattr(self.model_config, "vocab_size"):
+                info.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                    info,
+                    self.model_config.vocab_size,
+                    batch=admit_batch,
+                )
+            if is_spec:
+                n_dp = len(info.reqs)
+                first_toks_dp = info.output_ids
+                if relay_buffers is not None:
+                    info.spec_info = EagleDraftInput(
+                        future_indices=info.req_pool_indices,
+                        allocate_lens=info.seq_lens.copy(),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                    )
+                else:
+                    topk_idx_dp = np.repeat(first_toks_dp[:, None], topk_width, axis=1)
+                    for req_i, r in enumerate(info.reqs):
+                        draft_ids = getattr(r, "_pd_initial_draft_ids", None)
+                        if draft_ids:
+                            take_k = min(topk_width, len(draft_ids))
+                            topk_idx_dp[req_i, :take_k] = np.asarray(
+                                draft_ids[:take_k], dtype=np.int32
+                            )
+                    info.spec_info = EagleDraftInput(
+                        topk_p=np.ones((n_dp, topk_width), dtype=np.float32),
+                        topk_index=topk_idx_dp,
+                        hidden_states=np.zeros((n_dp, hidden_size), dtype=np.float32),
+                        verified_id=first_toks_dp.copy(),
+                        accept_length=np.zeros((n_dp,), dtype=np.int32),
+                        allocate_lens=info.seq_lens.copy(),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                    )
+
+        if is_spec and relay_buffers is not None:
+            dp_size = int(self.dp_size)
+            max_running = int(getattr(self.server_args, "max_running_requests", 256) or 256)
+            per_dp_cap = max(
+                1,
+                max_running // max(1, dp_size),
+                max(len(r_list) for r_list in reqs_per_dp),
+            )
+            total_slots = dp_size * per_dp_cap
+            fut_idx_np = np.zeros((total_slots,), dtype=np.int32)
+            val_mask_np = np.zeros((total_slots,), dtype=np.bool_)
+            relay_num_steps = int(relay_buffers.topk_index.shape[-1])
+            topk_idx_np = np.zeros((total_slots, relay_num_steps), dtype=np.int32)
+            ver_id_np = np.zeros((total_slots,), dtype=np.int32)
+            new_seq_np = np.zeros((total_slots,), dtype=np.int32)
+            dp_cursors = [0] * dp_size
+            for r in active_reqs:
+                d = _request_dp_rank(r, dp_size)
+                slot = d * per_dp_cap + dp_cursors[d]
+                dp_cursors[d] += 1
+                fut_idx_np[slot] = int(r.req_pool_idx)
+                val_mask_np[slot] = True
+                t0 = int(r.output_ids[-1])
+                topk_idx_np[slot, :] = t0
+                draft_ids = getattr(r, "_pd_initial_draft_ids", None)
+                if draft_ids:
+                    take_k = min(relay_num_steps, len(draft_ids))
+                    topk_idx_np[slot, :take_k] = np.asarray(draft_ids[:take_k], dtype=np.int32)
+                ver_id_np[slot] = t0
+                new_seq_np[slot] = (
+                    len(r.origin_input_ids)
+                    - int(getattr(r, "_pd_seq_pos_offset", 0) or 0)
+                    + len(r.output_ids)
+                )
+            sh_1d = NamedSharding(self.mesh, PartitionSpec("data"))
+            sh_2d = NamedSharding(self.mesh, PartitionSpec("data", None))
+            with jax.set_mesh(self.mesh):
+                updated_relay = update_spec_relay_buffers_admit(
+                    relay_buffers,
+                    jax.device_put(fut_idx_np, sh_1d),
+                    jax.device_put(val_mask_np, sh_1d),
+                    jax.device_put(topk_idx_np, sh_2d),
+                    jax.device_put(ver_id_np, sh_1d),
+                    jax.device_put(new_seq_np, sh_1d),
+                    dp_size=dp_size,
+                )
+            relay_owner.spec_relay_buffers = updated_relay
+
+        if self.running_batch.is_empty():
+            self.running_batch = admit_batch
+        else:
+            self.running_batch.merge_batch(admit_batch)
+        return len(admitted_reqs)
+
+    def _build_kv_spec_for_req(self: Scheduler, req: Req):
+        """Build per-layer ShapeDtypeStructs matching P's KV layout (and indexer_kv if present)."""
+
+        from sgl_jax.srt.disaggregation.prefill import (
+            _pad_to_page_bucket,
+            _page_transfer_axis_and_multiple,
+            local_kv_spec_for_pool,
+            local_spec_meta_sharding,
+        )
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        all_pools = [kv_pool] + list(getattr(self, "_get_draft_kv_pools", lambda: ())())
+        total_layers = sum(int(p.layer_num) for p in all_pools)
+        total_indexer_layers = sum(
+            len(getattr(p, "indexer_key_buffer", None) or ()) for p in all_pools
+        )
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
-        num_pages = (seqlen + page_size - 1) // page_size
-        padded_pages = _pad_to_page_bucket(num_pages)
+        skip_tokens = int(getattr(req, "_pd_transfer_skip_tokens", 0) or 0)
+        transfer_tokens = max(1, seqlen - skip_tokens)
+        num_pages = (transfer_tokens + page_size - 1) // page_size
+        _, _, min_multiple = _page_transfer_axis_and_multiple(kv_pool)
+        padded_pages = _pad_to_page_bucket(num_pages, min_multiple=min_multiple)
+        indexer_buffers = getattr(kv_pool, "indexer_key_buffer", None)
+        use_spec_meta = self._use_pd_spec_meta_transfer()
+        if use_spec_meta:
+            meta_shape, meta_sharding = local_spec_meta_sharding()
+            spec_meta_spec = jax.ShapeDtypeStruct(
+                meta_shape,
+                jnp.int32,
+                sharding=meta_sharding,
+            )
+        else:
+            spec_meta_spec = None
         if jax.process_count() > 1:
-            from sgl_jax.srt.disaggregation.prefill import local_kv_spec_for_pool
-
-            return local_kv_spec_for_pool(kv_pool, kv_pool.layer_num, padded_pages)
+            kv_spec = local_kv_spec_for_pool(kv_pool, total_layers, padded_pages)
+            if indexer_buffers and total_indexer_layers > 0:
+                idx_tail = indexer_buffers[0].shape[1:]
+                idx_spec = local_kv_spec_for_pool(
+                    kv_pool,
+                    total_indexer_layers,
+                    padded_pages,
+                    per_layer_tail=idx_tail,
+                )
+                out = {"kv": kv_spec, "indexer_kv": idx_spec}
+                if spec_meta_spec is not None:
+                    out["spec_meta"] = spec_meta_spec
+                return out
+            if spec_meta_spec is not None:
+                return {"kv": kv_spec, "spec_meta": spec_meta_spec}
+            return kv_spec
         per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
         shape = (padded_pages, *per_layer_tail)
         sharding = kv_pool.kv_sharding
-        return [
+        kv_spec = [
             jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
-            for _ in range(kv_pool.layer_num)
+            for _ in range(total_layers)
         ]
+        if indexer_buffers and total_indexer_layers > 0:
+            idx_tail = indexer_buffers[0].shape[1:]
+            idx_shape = (padded_pages, *idx_tail)
+            idx_spec = [
+                jax.ShapeDtypeStruct(idx_shape, kv_pool.dtype, sharding=sharding)
+                for _ in range(total_indexer_layers)
+            ]
+            out = {"kv": kv_spec, "indexer_kv": idx_spec}
+            if spec_meta_spec is not None:
+                out["spec_meta"] = spec_meta_spec
+            return out
+        if spec_meta_spec is not None:
+            return {"kv": kv_spec, "spec_meta": spec_meta_spec}
+        return kv_spec
 
     def _install_received_kv(self: Scheduler, req: Req, kv_indices, kv) -> None:
         self._maybe_log_decode_pull_debug(req, kv)
@@ -843,10 +2043,12 @@ class SchedulerDisaggregationDecodeMixin:
         """Record a backend that wrote the destination KV pages directly."""
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        all_pools = [kv_pool] + list(getattr(self, "_get_draft_kv_pools", lambda: ())())
         num_pages = (len(req.origin_input_ids) + kv_pool.page_size - 1) // kv_pool.page_size
         total = 0
-        for layer in kv_pool.kv_buffer:
-            total += num_pages * (int(layer.nbytes) // int(layer.shape[0]))
+        for pool in all_pools:
+            for layer in pool.kv_buffer:
+                total += num_pages * (int(layer.nbytes) // int(layer.shape[0]))
         with suppress(Exception):
             from sgl_jax.srt.disaggregation.common.metrics import (
                 PD_TRANSFER_BYTES_TOTAL,
@@ -864,29 +2066,60 @@ class SchedulerDisaggregationDecodeMixin:
                 f"{req.rid!r}; allocator may have OOM'd"
             )
 
+        indexer_kv = None
+        if isinstance(kv, tuple):
+            kv, indexer_kv = kv
+
+        from sgl_jax.srt.disaggregation.prefill import _page_transfer_axis_and_multiple
+
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        if jax.process_count() > 1 and kv.is_fully_addressable:
+        all_pools = [kv_pool] + list(getattr(self, "_get_draft_kv_pools", lambda: ())())
+        pool_pspec = kv_pool.kv_sharding.spec
+        is_page_axis_sharded, page_axis, _ = _page_transfer_axis_and_multiple(kv_pool)
+
+        if jax.process_count() > 1 and getattr(kv, "is_fully_addressable", False):
             # Pulled KV is this host's local shard on a 1-D local mesh.
             # Assemble it into the global pool sharding (zero-copy: each NP
             # contributes its own addressable_shards).
-            pool_pspec = kv_pool.kv_sharding.spec
-            stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
-            gsh = NamedSharding(kv_pool.mesh, stacked_spec)
-            per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
-            gshape = (kv.shape[0], kv.shape[1]) + per_layer_tail
+            if is_page_axis_sharded:
+                stacked_spec = PartitionSpec(None, page_axis, *pool_pspec[1:])
+                gsh = NamedSharding(kv_pool.mesh, stacked_spec)
+                per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+                gshape = (kv.shape[0], kv.shape[1] * jax.process_count()) + per_layer_tail
+            else:
+                stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
+                gsh = NamedSharding(kv_pool.mesh, stacked_spec)
+                per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+                gshape = (kv.shape[0], kv.shape[1]) + per_layer_tail
             kv = jax.make_array_from_single_device_arrays(
                 gshape, gsh, [s.data for s in kv.addressable_shards]
             )
+            if indexer_kv is not None and getattr(indexer_kv, "is_fully_addressable", False):
+                idx_tail = kv_pool.indexer_key_buffer[0].shape[1:]
+                if is_page_axis_sharded:
+                    idx_gshape = (
+                        indexer_kv.shape[0],
+                        indexer_kv.shape[1] * jax.process_count(),
+                    ) + idx_tail
+                else:
+                    idx_gshape = (indexer_kv.shape[0], indexer_kv.shape[1]) + idx_tail
+                indexer_kv = jax.make_array_from_single_device_arrays(
+                    idx_gshape, gsh, [s.data for s in indexer_kv.addressable_shards]
+                )
+
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
-        num_pages = (seqlen + page_size - 1) // page_size
+        skip_tokens = int(getattr(req, "_pd_transfer_skip_tokens", 0) or 0)
+        transfer_tokens = max(1, seqlen - skip_tokens)
+        num_pages = (transfer_tokens + page_size - 1) // page_size
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
         padded_pages = kv[0].shape[0]
         # page_ids_padded is only consumed by the debug verifier below, which is
         # a no-op unless SGL_JAX_PD_DEBUG_KV is set. The write itself is
-        # token-level via ``loc``, so skip this numpy work on the production path.
+        # token-level via ``loc`` (or page-level scatter for page-axis-sharded
+        # pools), so skip this numpy work on the production path unless needed.
         from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
 
         if kv_debug_enabled(req.rid):
@@ -900,6 +2133,115 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             page_ids_padded = None
 
+        if is_page_axis_sharded:
+            from sgl_jax.srt.disaggregation.prefill import (
+                _globalize_rank_local_page_ids,
+            )
+
+            local_page_ids = kv_indices_np[: num_pages * page_size : page_size] // page_size
+            if padded_pages > num_pages:
+                # Page 0 of each DP rank's local slice is the reserved sentinel
+                # padding page (allocated and never assigned to active requests).
+                local_page_ids = np.concatenate(
+                    [
+                        local_page_ids,
+                        np.zeros(padded_pages - num_pages, dtype=local_page_ids.dtype),
+                    ]
+                )
+            global_page_ids = _globalize_rank_local_page_ids(
+                local_page_ids,
+                dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                dp_size=int(getattr(kv_pool, "dp_size", 1)),
+                total_pages=int(kv_pool.kv_buffer[0].shape[0]),
+            )
+            page_indices = jax.device_put(
+                global_page_ids,
+                NamedSharding(kv_pool.mesh, PartitionSpec(None)),
+            )
+            kv_cursor = 0
+            idx_cursor = 0
+            kv_layers = _jit_unstack_layers(kv) if isinstance(kv, jax.Array) else kv
+            idx_layers = (
+                _jit_unstack_layers(indexer_kv)
+                if (indexer_kv is not None and isinstance(indexer_kv, jax.Array))
+                else indexer_kv
+            )
+            use_fused_scatter = (
+                os.environ.get("SGL_FUSED_KV_SCATTER", "1") == "1" and padded_pages <= 256
+            )
+            for pool in all_pools:
+                n_layers = pool.layer_num
+                if use_fused_scatter and n_layers > 1:
+                    try:
+                        chunk_sz = (
+                            6 if n_layers % 6 == 0 else (13 if n_layers % 13 == 0 else n_layers)
+                        )
+                        for s in range(0, n_layers, chunk_sz):
+                            e = min(s + chunk_sz, n_layers)
+                            kv_vals = list(kv_layers[kv_cursor + s : kv_cursor + e])
+                            pool.kv_buffer[s:e] = _jit_scatter_all_layers(
+                                pool.kv_buffer[s:e],
+                                page_indices,
+                                kv_vals,
+                                pool.kv_sharding,
+                            )
+                    except Exception:
+                        for layer_idx in range(n_layers):
+                            pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
+                                pool.kv_buffer[layer_idx],
+                                page_indices,
+                                kv_layers[kv_cursor + layer_idx],
+                                pool.kv_sharding,
+                            )
+                else:
+                    for layer_idx in range(n_layers):
+                        pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
+                            pool.kv_buffer[layer_idx],
+                            page_indices,
+                            kv_layers[kv_cursor + layer_idx],
+                            pool.kv_sharding,
+                        )
+                kv_cursor += n_layers
+                if idx_layers is not None and getattr(pool, "indexer_key_buffer", None):
+                    n_idx = len(pool.indexer_key_buffer)
+                    if use_fused_scatter and n_idx > 1:
+                        try:
+                            idx_chunk = 7 if n_idx % 7 == 0 else n_idx
+                            for s in range(0, n_idx, idx_chunk):
+                                e = min(s + idx_chunk, n_idx)
+                                idx_vals = list(idx_layers[idx_cursor + s : idx_cursor + e])
+                                pool.indexer_key_buffer[s:e] = _jit_scatter_all_layers(
+                                    pool.indexer_key_buffer[s:e],
+                                    page_indices,
+                                    idx_vals,
+                                    pool.kv_sharding,
+                                )
+                        except Exception:
+                            for slot_idx in range(n_idx):
+                                pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
+                                    pool.indexer_key_buffer[slot_idx],
+                                    page_indices,
+                                    idx_layers[idx_cursor + slot_idx],
+                                    pool.kv_sharding,
+                                )
+                    else:
+                        for slot_idx in range(n_idx):
+                            pool.indexer_key_buffer[slot_idx] = _jit_scatter_one_layer(
+                                pool.indexer_key_buffer[slot_idx],
+                                page_indices,
+                                idx_layers[idx_cursor + slot_idx],
+                                pool.kv_sharding,
+                            )
+                    idx_cursor += n_idx
+            last_pool = all_pools[-1]
+            if kv_debug_enabled(req.rid):
+                if indexer_kv is not None and getattr(last_pool, "indexer_key_buffer", None):
+                    jax.block_until_ready(last_pool.indexer_key_buffer[-1])
+                else:
+                    jax.block_until_ready(last_pool.kv_buffer[-1])
+                self._maybe_verify_decode_writeback_debug(req, kv_pool, page_ids_padded, kv)
+            return
+
         # Write via the in-place Pallas kernel (``update_fused_kv_cache_vectorized``
         # with ``input_output_aliases``), so the footprint scales with the tokens
         # written. ``loc`` is per-token absolute pool slots; -1 marks padding
@@ -912,19 +2254,32 @@ class SchedulerDisaggregationDecodeMixin:
             NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
         )
 
-        for i, layer_id in enumerate(
-            range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
-        ):
-            layer_idx = layer_id - kv_pool.start_layer
-            kv_pool.kv_buffer[layer_idx] = write_kv_layer(
-                kv[i],
-                loc,
-                kv_pool.kv_buffer[layer_idx],
-                page_size,
-                kv_pool.kv_partition_axis,
-                kv_pool.attention_data_partition_axis,
-                kv_pool.mesh,
-            )
+        kv_cursor = 0
+        idx_cursor = 0
+        for pool in all_pools:
+            for layer_idx in range(pool.layer_num):
+                pool.kv_buffer[layer_idx] = write_kv_layer(
+                    kv[kv_cursor],
+                    loc,
+                    pool.kv_buffer[layer_idx],
+                    page_size,
+                    pool.kv_partition_axis,
+                    pool.attention_data_partition_axis,
+                    pool.mesh,
+                )
+                kv_cursor += 1
+            if indexer_kv is not None and getattr(pool, "indexer_key_buffer", None):
+                for slot_idx in range(len(pool.indexer_key_buffer)):
+                    pool.indexer_key_buffer[slot_idx] = write_kv_layer(
+                        indexer_kv[idx_cursor],
+                        loc,
+                        pool.indexer_key_buffer[slot_idx],
+                        page_size,
+                        pool.kv_partition_axis,
+                        pool.attention_data_partition_axis,
+                        pool.mesh,
+                    )
+                    idx_cursor += 1
         self._maybe_verify_decode_writeback_debug(req, kv_pool, page_ids_padded, kv)
 
     def _set_decode_bookkeeping(self: Scheduler, req: Req, kv_indices) -> None:
@@ -933,14 +2288,15 @@ class SchedulerDisaggregationDecodeMixin:
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
-        seqlen = len(req.origin_input_ids)
+        pos_off = int(getattr(req, "_pd_seq_pos_offset", 0) or 0)
+        seqlen = len(req.origin_input_ids) - pos_off
         # The unused received tail page may already have been reclaimed.
         # Slice by prompt length rather than dropping another retained slot.
         req.prefix_indices = kv_indices_np[: max(seqlen - 1, 0)]
         req.last_matched_prefix_len = len(req.prefix_indices)
         req._pd_skip_prefix_match = True
         req._pd_prealloc_kv_indices = kv_indices_np
-        req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
+        req.fill_ids = list(req.origin_input_ids[pos_off:]) + list(req.output_ids)
 
     def _enqueue_for_decode(self: Scheduler, req: Req) -> None:
         """Put ``req`` into the scheduler's decode-ready queue."""
@@ -1036,7 +2392,7 @@ class SchedulerDisaggregationDecodeMixin:
                 PD_TRANSFER_BYTES_TOTAL,
             )
 
-            if not kv:
+            if kv is None:
                 return
             leaves = jax.tree.leaves(kv)
             total = int(sum(int(x.nbytes) for x in leaves))
@@ -1051,6 +2407,8 @@ class SchedulerDisaggregationDecodeMixin:
         if not kv_debug_enabled(req.rid):
             return
 
+        if isinstance(kv, tuple):
+            kv = kv[0]
         snapshot = build_kv_debug_snapshot(kv)
         logger.warning(
             "PD-KV-DEBUG decode_pull req_id=%s shape=%s dtype=%s sharding=%s digest=%s sample=%s",
@@ -1084,8 +2442,9 @@ class SchedulerDisaggregationDecodeMixin:
             kv_pool.mesh,
             PartitionSpec(None, *kv_pool.kv_sharding.spec[1:]),
         )
+        get_buf = getattr(kv_pool, "get_fused_kv_buffer", kv_pool.get_kv_buffer)
         layer_buffers = [
-            kv_pool.get_kv_buffer(layer_id)
+            get_buf(layer_id)
             for layer_id in range(
                 kv_pool.start_layer,
                 kv_pool.start_layer + kv_pool.layer_num,

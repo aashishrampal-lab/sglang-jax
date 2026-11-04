@@ -417,6 +417,35 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+        if (
+            "SGL_DECODE_MAX_MEM_FRACTION" in os.environ
+            and self.disaggregation_mode == "decode"
+            and self.mem_fraction_static is not None
+        ):
+            max_decode_mem = float(os.environ["SGL_DECODE_MAX_MEM_FRACTION"])
+            if self.mem_fraction_static > max_decode_mem:
+                logger.info(
+                    "Clamping decode mem_fraction_static from %.3f to %.3f for runtime XLA/pull headroom",
+                    self.mem_fraction_static,
+                    max_decode_mem,
+                )
+                self.mem_fraction_static = max_decode_mem
+        elif (
+            "SGL_PREFILL_MAX_MEM_FRACTION" in os.environ
+            and self.disaggregation_mode == "prefill"
+            and self.context_length is not None
+            and self.context_length >= 200000
+            and self.mem_fraction_static is not None
+        ):
+            max_prefill_mem = float(os.environ["SGL_PREFILL_MAX_MEM_FRACTION"])
+            if self.mem_fraction_static > max_prefill_mem:
+                logger.info(
+                    "Clamping 256k prefill mem_fraction_static from %.3f to %.3f for runtime XLA headroom",
+                    self.mem_fraction_static,
+                    max_prefill_mem,
+                )
+                self.mem_fraction_static = max_prefill_mem
+
         # Set chunked prefill size
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 4096
@@ -742,17 +771,25 @@ class ServerArgs:
         option = "--disaggregation-enable-overlap-schedule"
         if self.disaggregation_mode not in ("prefill", "decode"):
             raise ValueError(f"{option} requires --disaggregation-mode prefill or decode")
-        if not self.disaggregation_use_raiden:
+        allow_decode_overlap = (
+            self.disaggregation_mode == "decode"
+            and os.environ.get("SGL_PD_ALLOW_DECODE_OVERLAP", "0") == "1"
+        )
+        if not allow_decode_overlap and not self.disaggregation_use_raiden:
             raise ValueError(f"{option} requires --disaggregation-use-raiden")
         if not self.disable_radix_cache:
             raise ValueError(f"{option} requires --disable-radix-cache")
-        if self.nnodes != 1:
+        if not allow_decode_overlap and self.nnodes != 1:
             raise ValueError(f"{option} requires --nnodes=1 per serving instance")
         if self.pd_disaggregation:
             raise ValueError(f"{option} does not support --pd-disaggregation (Pathways)")
         if self.disable_overlap_schedule:
             raise ValueError(f"{option} conflicts with --disable-overlap-schedule")
-        if self.speculative_algorithm and self.speculative_algorithm.strip():
+        if (
+            not allow_decode_overlap
+            and self.speculative_algorithm
+            and self.speculative_algorithm.strip()
+        ):
             raise ValueError(f"{option} does not support --speculative-algorithm")
         if self.enable_lora or self.enable_static_lora or self.lora_paths:
             raise ValueError(f"{option} does not support LoRA")
