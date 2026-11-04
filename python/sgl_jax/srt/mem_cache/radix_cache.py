@@ -457,11 +457,11 @@ class RadixCache(BasePrefixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
-        if self.disable:
+        if self.disable or node is None:
             return IncLockRefResult(delta=0)
 
         delta = 0
-        while node != self.root_node:
+        while node is not None and node != self.root_node:
             if node.lock_ref == 0:
                 # Get dp_rank from node's key
                 node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
@@ -473,11 +473,11 @@ class RadixCache(BasePrefixCache):
         return IncLockRefResult(delta=delta)
 
     def dec_lock_ref(self, node: TreeNode, params: DecLockRefParams | None = None):
-        if self.disable:
+        if self.disable or node is None:
             return 0
 
         delta = 0
-        while node != self.root_node:
+        while node is not None and node != self.root_node:
             if node.lock_ref == 1:
                 # Get dp_rank from node's key
                 node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
