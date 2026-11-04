@@ -2063,8 +2063,10 @@ class Scheduler(
             df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "0"))
             self._decode_first_n = df
             self._consec_decode = 0
+        has_active_chunked = any(req is not None for req in self.chunked_reqs)
         skip_prefill = (
             df > 0
+            and not has_active_chunked
             and not self.running_batch.is_empty()
             and not self.running_batch.is_prefill_only
             and self._consec_decode < df
@@ -3340,6 +3342,8 @@ class Scheduler(
                     if batch.forward_mode.is_decode()
                     else None
                 )
+                if batch_output.next_draft_input is not None:
+                    batch_output.next_draft_input.new_seq_lens = None
 
         if batch_output.next_draft_input is not None:
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(

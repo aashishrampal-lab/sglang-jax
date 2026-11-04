@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -123,7 +124,9 @@ class EagleDraftInput:
     future_indices: np.ndarray | None = None
 
     def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
-        target_alloc = self.ALLOC_LEN_PER_DECODE * 2
+        target_alloc = self.ALLOC_LEN_PER_DECODE * int(
+            os.environ.get("SGL_EAGLE_ALLOC_DECODE_STEPS", "2")
+        )
         total = 0
         for req in requests:
             cur = req.kv_allocated_len
