@@ -1042,23 +1042,27 @@ def streamindex_topk(
         # sequences in one batch have similar lengths to reduce waste of compute.
         # With the same batch size, the longest sequence will determine number of
         # blocks to run computation for.
-        decode_batch_end = distribution[0] // decode_req_batch_size * decode_req_batch_size
-        scores = run_topk_kernel(
-            q,
-            prepared_indexer_weights,
-            cache_kv,
-            scores_init,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-            num_queries_per_block=num_queries_per_blocks[0],
-            start_seq_idx=jnp.array(0),
-            end_seq_idx=decode_batch_end,
-            static_q_len=1,
-            seq_batch_size=decode_req_batch_size,
-            case=MlaCase.DECODE,
-        )
+        if q.shape[0] >= decode_req_batch_size:
+            decode_batch_end = distribution[0] // decode_req_batch_size * decode_req_batch_size
+            scores = run_topk_kernel(
+                q,
+                prepared_indexer_weights,
+                cache_kv,
+                scores_init,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+                num_queries_per_block=num_queries_per_blocks[0],
+                start_seq_idx=jnp.array(0),
+                end_seq_idx=decode_batch_end,
+                static_q_len=1,
+                seq_batch_size=decode_req_batch_size,
+                case=MlaCase.DECODE,
+            )
+        else:
+            decode_batch_end = jnp.array(0, dtype=jnp.int32)
+            scores = scores_init
         # Handle num_decode_seqs % decode_req_batch_size != 0 case.
         scores = run_topk_kernel(
             q,

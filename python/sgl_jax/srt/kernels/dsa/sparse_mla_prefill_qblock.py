@@ -663,10 +663,11 @@ def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref,
     E = n_ref[0]
 
     def entry(e, carry):
-        kind = tbl_ref[e, 0]
-        src = tbl_ref[e, 1]
-        dst = tbl_ref[e, 2]
-        n = tbl_ref[e, 3]
+        base = 4 * e
+        kind = tbl_ref[base]
+        src = tbl_ref[base + 1]
+        dst = tbl_ref[base + 2]
+        n = tbl_ref[base + 3]
 
         @pl.when((kind == 0) & (n > 0))
         def _():
@@ -711,8 +712,10 @@ def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref,
 
 # Row counts up to this size get a run table of at least ``num_rows`` entries by
 # default, so ``pallas_always_fits`` holds and the runtime cond is dropped. The
-# table is ``[3 * r_cap, 4]`` int32 in SMEM (48 KB at 1024 rows). Decode-form
-# speculative verify at 64 requests x 4 draft tokens is 256 rows; the old default
+# table is flattened to 1D ``[12 * r_cap]`` int32 in SMEM (48 KB at 1024 rows;
+# keeping it 2D ``[3 * r_cap, 4]`` pads the minor dim to 128 lanes = 1.5 MiB
+# and overflows 1 MiB SMEM at r_cap=1024). Decode-form speculative verify at
+# 64 requests x 4 draft tokens is 256 rows; the old default
 # (2 * pages + 130 = 134) did not cover it and cost two whole-pool copies per
 # layer (~0.15 ms each on GLM-5.2 tp16).
 STATIC_DISPATCH_MAX_ROWS = 1024
@@ -786,15 +789,16 @@ def paged_write_back(
     if r_cap is None:
         r_cap = default_run_capacity(Tp, ps)
     table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
+    table_flat = table.reshape(-1)
     row_w = row.reshape(Tp // pk, pk, D)
     n_ent = (3 * jnp.minimum(n_raw, r_cap)).reshape(1).astype(jnp.int32)  # live table entries
 
-    def _pallas(cache, row_w, table, n_ent):
+    def _pallas(cache, row_w, table_flat, n_ent):
         return pl.pallas_call(
             _write_back_kernel,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.SMEM),  # live entry count [1]
-                pl.BlockSpec(memory_space=pltpu.SMEM),  # run table
+                pl.BlockSpec(memory_space=pltpu.SMEM),  # 1D run table [12 * r_cap]
                 pl.BlockSpec(memory_space=pltpu.HBM),  # row (word view)
                 pl.BlockSpec(memory_space=pltpu.HBM),  # cache (aliased)
             ],
@@ -807,10 +811,10 @@ def paged_write_back(
             ],
             input_output_aliases={3: 0},
             interpret=interpret,
-        )(n_ent, table, row_w, cache)
+        )(n_ent, table_flat, row_w, cache)
 
-    def _scatter(cache, row_w, table, n_ent):
-        del table, n_ent
+    def _scatter(cache, row_w, table_flat, n_ent):
+        del table_flat, n_ent
         # 4D-native scatter: same slot semantics as the flat-view version but
         # without cache.reshape(Pn*ps, D), which on jax 0.11.1 materializes a
         # full retile of the pool inside this cond branch (branch_1_fun,
@@ -824,12 +828,12 @@ def paged_write_back(
     if interpret:
         # interpret cannot lower dynamic-size DMAs; the scatter is the
         # bit-identical reference semantics anyway.
-        return _scatter(cache, row_w, table, n_ent)
+        return _scatter(cache, row_w, table_flat, n_ent)
     if pallas_always_fits(Tp, r_cap):
         # Static dispatch: the run table cannot overflow, so the lax.cond is
         # not needed. It is also expensive: both branches hand back a whole
         # pool, XLA cannot alias the pool in place across the conditional
         # (spec verify: 2 x ~0.02 ms per layer; draft-extend: three 372 MB
         # pool copies per step on GLM-5.2 tp16).
-        return _pallas(cache, row_w, table, n_ent)
-    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table, n_ent)
+        return _pallas(cache, row_w, table_flat, n_ent)
+    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table_flat, n_ent)

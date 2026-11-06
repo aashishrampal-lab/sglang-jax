@@ -565,6 +565,60 @@ class TestScGatherAndTorchTpuParity(unittest.TestCase):
                 atol=1e-6,
             )
 
+    def test_07_paged_write_back_1024_rows_1d_smem_and_tp1_heads(self):
+        """Regression test for T=1024 (dp=16, num_tokens=16384) 1D SMEM run table & H=128 (tp=1)."""
+        from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+            default_run_capacity,
+            paged_write_back,
+            pallas_always_fits,
+        )
+
+        rng = np.random.default_rng(77)
+        page_size = 128
+        total_pages = 24
+        T = 1024
+        r_cap = default_run_capacity(T, page_size)
+        self.assertEqual(r_cap, 1024)
+        self.assertTrue(pallas_always_fits(T, r_cap))
+
+        is_cpu = jax.default_backend() == "cpu"
+        # Non-contiguous page mapping + ragged tail drop (-1) at T=1024
+        loc_np = np.full((T,), -1, dtype=np.int32)
+        pages = [2, 5, 9, 12, 14, 17, 20, 22]
+        for p_i, phys_p in enumerate(pages):
+            s = p_i * page_size
+            loc_np[s : s + page_size] = phys_p * page_size + np.arange(page_size, dtype=np.int32)
+        # Drop last 19 rows and misalign 3 individual slots to exercise both word & RMW runs
+        loc_np[1005:] = -1
+        loc_np[3] = 1 * page_size + 5
+        loc = jnp.asarray(loc_np, dtype=jnp.int32)
+
+        for dtype, dim in ((jnp.float8_e4m3fn, 640), (jnp.uint8, 132)):
+            pk = 32 // jax.dtypes.itemsize_bits(dtype)
+            pspk = page_size // pk
+            if dtype == jnp.uint8:
+                cache = jnp.asarray(rng.integers(0, 255, (total_pages, pspk, pk, dim), dtype=np.uint8))
+                row = jnp.asarray(rng.integers(0, 255, (T, dim), dtype=np.uint8))
+            else:
+                cache = jnp.asarray(rng.standard_normal((total_pages, pspk, pk, dim)) * 0.25).astype(dtype)
+                row = jnp.asarray(rng.standard_normal((T, dim)) * 0.25).astype(dtype)
+
+            actual = jax.jit(
+                lambda c, r, l: paged_write_back(
+                    c, r, l, page_size=page_size, interpret=is_cpu, small_rows_scatter=False
+                )
+            )(cache, row, loc)
+            ref = (
+                cache.reshape(-1, dim)
+                .at[loc]
+                .set(row, mode="drop", wrap_negative_indices=False)
+                .reshape(cache.shape)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(actual.astype(jnp.float32)),
+                np.asarray(ref.astype(jnp.float32)),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
