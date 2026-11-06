@@ -462,18 +462,19 @@ def _sc_gathered_mla_attention_kernel(
             _async_copy(dst, dst, sem, True)
 
     def _fetch_bq_batch(seq_idx_start, sem_idx, *, wait: bool = False):
-        sem = sems.at[1, sem_idx]
+        sem_nope = sems.at[1, sem_idx]
+        sem_pe = sems.at[2, sem_idx]
         dst_nope = bq_nope_x2_ref.at[sem_idx, :]
         dst_pe = bq_pe_x2_ref.at[sem_idx, :]
         if not wait:
-            _async_copy(q_nope_hbm_ref.at[pl.ds(seq_idx_start, batch_size)], dst_nope, sem, False)
-            _async_copy(q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)], dst_pe, sem, False)
+            _async_copy(q_nope_hbm_ref.at[pl.ds(seq_idx_start, batch_size)], dst_nope, sem_nope, False)
+            _async_copy(q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)], dst_pe, sem_pe, False)
         else:
-            _async_copy(dst_nope, dst_nope, sem, True)
-            _async_copy(dst_pe, dst_pe, sem, True)
+            _async_copy(dst_nope, dst_nope, sem_nope, True)
+            _async_copy(dst_pe, dst_pe, sem_pe, True)
 
     def _send_bo_batch(seq_idx_start, sem_idx, *, wait: bool = False):
-        sem = sems.at[2, sem_idx]
+        sem = sems.at[3, sem_idx]
         src = bo_x2_ref.at[sem_idx, :]
         if not wait:
             _async_copy(src, o_hbm_ref.at[pl.ds(seq_idx_start, batch_size)], sem, False)
@@ -730,7 +731,7 @@ def sparse_mla_sc_token_gather_attention(
             pltpu.VMEM((2, k_bsz, H_pad, o_dim), ql_work.dtype),
             pltpu.VMEM((2, k_bsz, H_pad, rope_dim), qpe_work.dtype),
             pltpu.VMEM((2, k_bsz, H_pad, o_dim), ql_work.dtype),
-            pltpu.SemaphoreType.DMA((3, 2)),
+            pltpu.SemaphoreType.DMA((4, 2)),
         ]
         scalar_prefetches = (
             valid_kv_lens,
@@ -767,4 +768,7 @@ def sparse_mla_sc_token_gather_attention(
             )
         )(*scalar_prefetches, ql_work, qpe_work, gathered_kv)
 
-    return ql_work[:, :actual_heads, :o_dim], cache_kv
+    out = ql_work[:, :actual_heads, :o_dim]
+    row_ids = lax.broadcasted_iota(jnp.int32, (T_q, 1, 1), 0)
+    out = jnp.where(row_ids < token_end, out, jnp.zeros_like(out))
+    return out, cache_kv

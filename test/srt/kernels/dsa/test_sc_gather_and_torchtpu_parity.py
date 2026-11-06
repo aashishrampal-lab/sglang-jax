@@ -112,8 +112,12 @@ def _exact_gathered_mla_ref(
 
 class TestScGatherAndTorchTpuParity(unittest.TestCase):
     def test_01_tpu_runtime_tuning_and_fori_patch(self):
-        prev = os.environ.get("LIBTPU_INIT_ARGS")
+        prev_libtpu = os.environ.get("LIBTPU_INIT_ARGS")
+        prev_plat = os.environ.get("JAX_PLATFORMS")
+        prev_accel = os.environ.get("TPU_ACCELERATOR_TYPE")
         try:
+            os.environ["JAX_PLATFORMS"] = ""
+            os.environ["TPU_ACCELERATOR_TYPE"] = "tpu7x"
             os.environ["LIBTPU_INIT_ARGS"] = "--xla_tpu_enable_async_collective_fusion=true"
             merged = configure_libtpu_init_args()
             self.assertIn("--xla_tpu_enable_async_collective_fusion=true", merged)
@@ -125,10 +129,15 @@ class TestScGatherAndTorchTpuParity(unittest.TestCase):
                 "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=67108864", merged
             )
         finally:
-            if prev is None:
-                os.environ.pop("LIBTPU_INIT_ARGS", None)
-            else:
-                os.environ["LIBTPU_INIT_ARGS"] = prev
+            for k_env, v_env in (
+                ("LIBTPU_INIT_ARGS", prev_libtpu),
+                ("JAX_PLATFORMS", prev_plat),
+                ("TPU_ACCELERATOR_TYPE", prev_accel),
+            ):
+                if v_env is None:
+                    os.environ.pop(k_env, None)
+                else:
+                    os.environ[k_env] = v_env
 
         applied = patch_jax_pallas_fori_lowering()
         self.assertTrue(applied, "patch_jax_pallas_fori_lowering should apply cleanly")
@@ -331,41 +340,62 @@ class TestScGatherAndTorchTpuParity(unittest.TestCase):
         )
 
     def test_05_glm_dsa_indexer_hadamard_and_fused_wk_weights_parity(self):
-        from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer, _hadamard_matrix
+        from jax.sharding import AxisType
+        from sgl_jax.srt.models.glm5_moe import GlmDsaIndexer, _get_scaled_hadamard_np
 
-        cfg = types.SimpleNamespace(
-            hidden_size=256,
-            q_lora_rank=128,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            index_n_heads=8,
-            index_topk=64,
-            rms_norm_eps=1e-5,
-            rope_theta=10000.0,
-            rope_parameters=None,
-            max_position_embeddings=4096,
-            quantization_config=None,
-        )
         devices = jax.devices()
-        mesh = Mesh(np.array(devices[:1]).reshape(1, 1), ("data", "tensor"))
-        rngs = nnx.Rngs(0)
+        mesh = Mesh(
+            np.array(devices[:1]).reshape(1, 1),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
         with jax.set_mesh(mesh):
-            indexer = GlmDsaIndexer(cfg, layer_id=0, mesh=mesh, rngs=rngs, dtype=jnp.bfloat16)
+            indexer = GlmDsaIndexer(
+                hidden_size=256,
+                q_lora_rank=128,
+                index_head_dim=128,
+                index_n_heads=8,
+                mesh=mesh,
+                dtype=jnp.bfloat16,
+            )
+            rep2 = NamedSharding(mesh, P(None, None))
+            rep1 = NamedSharding(mesh, P(None))
+            indexer.wq_b.weight.value = jax.device_put(
+                jax.random.normal(jax.random.PRNGKey(101), (128, 1024), dtype=jnp.bfloat16) * 0.08,
+                rep2,
+            )
+            indexer.wk.weight.value = jax.device_put(
+                jax.random.normal(jax.random.PRNGKey(102), (256, 128), dtype=jnp.bfloat16) * 0.08,
+                rep2,
+            )
+            indexer.weights_proj.weight.value = jax.device_put(
+                jax.random.normal(jax.random.PRNGKey(103), (256, 8), dtype=jnp.bfloat16) * 0.08,
+                rep2,
+            )
+            indexer.k_norm.weight.value = jax.device_put(jnp.ones((128,), dtype=jnp.bfloat16), rep1)
+            indexer.k_norm.bias.value = jax.device_put(jnp.zeros((128,), dtype=jnp.bfloat16), rep1)
 
             T = 12
-            hidden = jax.random.normal(jax.random.PRNGKey(1), (T, 256), dtype=jnp.bfloat16)
-            q_lora = jax.random.normal(jax.random.PRNGKey(2), (T, 128), dtype=jnp.bfloat16)
-            pos = jnp.arange(T, dtype=jnp.int32)
+            sh_tok2 = NamedSharding(mesh, P("data", None))
+            sh_tok1 = NamedSharding(mesh, P("data"))
+            hidden = jax.device_put(
+                jax.random.normal(jax.random.PRNGKey(1), (T, 256), dtype=jnp.bfloat16), sh_tok2
+            )
+            q_lora = jax.device_put(
+                jax.random.normal(jax.random.PRNGKey(2), (T, 128), dtype=jnp.bfloat16), sh_tok2
+            )
+            pos = jax.device_put(jnp.arange(T, dtype=jnp.int32), sh_tok1)
+            rotary_emb = lambda p, qr, kr: (qr, kr)
 
-            # Reference: separate Hadamard per tensor + unfused wk / weights_proj
-            q_ref0, k_ref0, w_ref0 = indexer(pos, hidden, q_lora)
+            # Unfused wk / weights_proj + fused BF16 Hadamard
+            q_ref0, k_ref0, w_ref0 = indexer.project(hidden, q_lora, pos, rotary_emb)
             self.assertEqual(q_ref0.dtype, jnp.bfloat16, "q_idx must stay bf16 (no fp32 promotion)")
             self.assertEqual(k_ref0.dtype, jnp.bfloat16, "k_idx must stay bf16 (no fp32 promotion)")
 
             # Check fused wk_weights_proj matches unfused
             fused_ok = indexer.fuse_wk_weights_proj()
             self.assertTrue(fused_ok)
-            q_fused, k_fused, w_fused = indexer(pos, hidden, q_lora)
+            q_fused, k_fused, w_fused = indexer.project(hidden, q_lora, pos, rotary_emb)
             self.assertEqual(q_fused.dtype, jnp.bfloat16)
             self.assertEqual(k_fused.dtype, jnp.bfloat16)
 
@@ -376,14 +406,20 @@ class TestScGatherAndTorchTpuParity(unittest.TestCase):
             self.assertLess(k_diff, 2e-2)
             self.assertLess(w_diff, 2e-2)
 
-            # Verify Hadamard matrix orthogonality
-            hm = _hadamard_matrix(128, jnp.float32)
+            # Verify scaled Hadamard matrix orthogonality
+            hm = _get_scaled_hadamard_np(128)
             ident = hm @ hm.T
-            self.assertLess(float(jnp.max(jnp.abs(ident - jnp.eye(128)))), 1e-5)
+            self.assertLess(float(np.max(np.abs(ident - np.eye(128)))), 1e-5)
 
     def test_06_dsa_backend_e2e_prefill_and_decode_indexshare(self):
+        from jax.sharding import AxisType
+
         devices = jax.devices()
-        mesh = Mesh(np.array(devices[:1]).reshape(1, 1), ("data", "tensor"))
+        mesh = Mesh(
+            np.array(devices[:1]).reshape(1, 1),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
         page_size = 128
         total_pages = 8
         H = 8

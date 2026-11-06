@@ -70,12 +70,12 @@ def _detect_sc_offload_threshold_bytes() -> int | None:
     return None
 
 
-def configure_libtpu_init_args() -> None:
+def configure_libtpu_init_args() -> str:
     """Inject optimal ``LIBTPU_INIT_ARGS`` before ``jax`` initializes ``libtpu``."""
     if os.environ.get("SGL_DISABLE_AUTO_LIBTPU_TUNING", "0") == "1":
-        return
+        return os.environ.get("LIBTPU_INIT_ARGS", "")
     if os.environ.get("JAX_PLATFORMS", "").lower() == "cpu":
-        return
+        return os.environ.get("LIBTPU_INIT_ARGS", "")
 
     existing = os.environ.get("LIBTPU_INIT_ARGS", "").strip()
     extra: list[str] = []
@@ -97,6 +97,7 @@ def configure_libtpu_init_args() -> None:
         if existing:
             assembled = f"{assembled} {existing}"
         os.environ["LIBTPU_INIT_ARGS"] = assembled
+    return os.environ.get("LIBTPU_INIT_ARGS", "")
 
 
 def patch_jax_pallas_fori_lowering() -> bool:

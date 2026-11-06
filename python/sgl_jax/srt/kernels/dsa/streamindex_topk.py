@@ -993,6 +993,43 @@ def streamindex_topk(
         )
 
     def _run_full_topk(_):
+        if jax.default_backend() == "cpu":
+            # Pure-JAX CPU fallback so unit tests can trace both lax.cond branches on CPU.
+            cache_flat = cache_kv.reshape(-1, lkv_dim).astype(jnp.float32)
+            q_f32 = q.astype(jnp.float32)
+            w_f32 = indexer_weights[: q.shape[0]].astype(jnp.float32)
+            t_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
+            num_valid_s = jnp.clip(distribution[2].astype(jnp.int32), 0, max_num_seqs)
+            seg = jnp.clip(
+                jnp.searchsorted(cu_q_lens, t_idx, side="right").astype(jnp.int32) - 1,
+                0,
+                max(0, max_num_seqs - 1),
+            )
+            q_start = cu_q_lens[seg]
+            q_end = cu_q_lens[seg + 1]
+            q_len = q_end - q_start
+            kv_len = seq_lens[seg]
+            valid_q = (t_idx < cu_q_lens[num_valid_s]) & (t_idx >= q_start) & (t_idx < q_end) & (kv_len > 0)
+            q_pos = kv_len - q_len + (t_idx - q_start)
+            max_tok = pages_per_seq * page_size
+            tok_cols = jnp.arange(max_tok, dtype=jnp.int32)
+            pt_idx = jnp.clip(
+                seg[:, None] * pages_per_seq + (tok_cols[None, :] // page_size),
+                0,
+                max(0, page_indices.shape[0] - 1),
+            )
+            phys = page_indices[pt_idx] * page_size + (tok_cols[None, :] % page_size)
+            kv_g = cache_flat[jnp.clip(phys, 0, max(0, cache_flat.shape[0] - 1))]  # [T, max_tok, D]
+            dots = jnp.maximum(jnp.einsum("thd,tkd->thk", q_f32, kv_g), 0.0)
+            sc = jnp.einsum("thk,th->tk", dots, w_f32)
+            vis = valid_q[:, None] & (tok_cols[None, :] <= q_pos[:, None]) & (tok_cols[None, :] < kv_len[:, None])
+            sc = jnp.where(vis, sc, -jnp.inf)
+            top_v, top_i = jax.lax.top_k(sc, min(k, max_tok))
+            res = jnp.where(top_v > -jnp.inf, top_i, -1).astype(jnp.int32)
+            if res.shape[1] < k:
+                res = jnp.pad(res, ((0, 0), (0, k - res.shape[1])), constant_values=-1)
+            return res
+
         # Pre-fill the output with -inf and alias it, so masked / unwritten
         # columns are already -inf.
         scores_init = jnp.full(
@@ -1170,6 +1207,47 @@ def streamindex_page_topk(
     T = q.shape[0]
 
     def _run_full_page_topk(_):
+        if jax.default_backend() == "cpu":
+            cache_pages = cache_kv.reshape(-1, page_size, lkv_dim).astype(jnp.float32)
+            q_f32 = q.astype(jnp.float32)
+            w_f32 = indexer_weights[:T].astype(jnp.float32)
+            t_idx = jnp.arange(T, dtype=jnp.int32)
+            num_valid_s = jnp.clip(num_seqs.astype(jnp.int32), 0, max_num_seqs)
+            seg = jnp.clip(
+                jnp.searchsorted(cu_q_lens, t_idx, side="right").astype(jnp.int32) - 1,
+                0,
+                max(0, max_num_seqs - 1),
+            )
+            q_start = cu_q_lens[seg]
+            q_end = cu_q_lens[seg + 1]
+            q_len = q_end - q_start
+            kv_len = seq_lens[seg]
+            valid_q = (t_idx < cu_q_lens[num_valid_s]) & (t_idx >= q_start) & (t_idx < q_end) & (kv_len > 0)
+            q_pos = kv_len - q_len + (t_idx - q_start)
+            p_cols = jnp.arange(pages_per_seq, dtype=jnp.int32)
+            pt_base = cu_kv_pages[seg]
+            pt_end = cu_kv_pages[seg + 1]
+            pt_unclipped = pt_base[:, None] + p_cols[None, :]
+            pt_idx = jnp.clip(pt_unclipped, 0, max(0, page_indices.shape[0] - 1))
+            phys_p = jnp.clip(page_indices[pt_idx], 0, max(0, cache_pages.shape[0] - 1))
+            kv_p = cache_pages[phys_p]  # [T, pages_per_seq, page_size, D]
+            dots = jnp.maximum(jnp.einsum("thd,tpmd->tphm", q_f32, kv_p), 0.0)
+            tok_sc = jnp.einsum("tphm,th->tpm", dots, w_f32)
+            tok_idx = p_cols[None, :, None] * page_size + jnp.arange(page_size, dtype=jnp.int32)[None, None, :]
+            vis = (
+                valid_q[:, None, None]
+                & (pt_unclipped[:, :, None] < pt_end[:, None, None])
+                & (tok_idx <= q_pos[:, None, None])
+                & (tok_idx < kv_len[:, None, None])
+            )
+            tok_sc = jnp.where(vis, tok_sc, -jnp.inf)
+            page_sc = jnp.max(tok_sc, axis=-1)
+            top_v, top_i = jax.lax.top_k(page_sc, min(k_pages, pages_per_seq))
+            res = jnp.where(top_v > -jnp.inf, top_i, -1).astype(jnp.int32)
+            if res.shape[1] < k_pages:
+                res = jnp.pad(res, ((0, 0), (0, k_pages - res.shape[1])), constant_values=-1)
+            return res
+
         scores_init = jnp.full((T, num_page_sublanes, 128), -jnp.inf, dtype=jnp.float32)
 
         in_specs = [
