@@ -619,6 +619,28 @@ class TestScGatherAndTorchTpuParity(unittest.TestCase):
                 np.asarray(ref.astype(jnp.float32)),
             )
 
+    def test_08_chunk_cache_colocated_init_next_round_input(self):
+        """Regression test for --disable-radix-cache ChunkCache on colocated prefill."""
+        from sgl_jax.srt.managers.schedule_batch import Req
+        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+        from sgl_jax.srt.sampling.sampling_params import SamplingParams
+
+        cache = ChunkCache(req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=128)
+        self.assertIsNone(cache.root_node)
+        self.assertEqual(cache.total_size(), 0)
+        req = Req(
+            rid="r0",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3, 4],
+            sampling_params=SamplingParams(max_new_tokens=2),
+        )
+        req.fill_ids = list(req.origin_input_ids)
+        req.init_next_round_input(cache)
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.last_host_node)
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertEqual(req.extend_input_len, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

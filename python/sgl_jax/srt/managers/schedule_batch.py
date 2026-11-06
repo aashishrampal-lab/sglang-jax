@@ -593,8 +593,9 @@ class Req:
         if tree_cache is not None:
             if getattr(tree_cache, "disable", False) or isinstance(tree_cache, ChunkCache):
                 self.prefix_indices = np.empty((0,), dtype=np.int32)
-                self.last_node = tree_cache.root_node
-                self.last_host_node = tree_cache.root_node
+                root = getattr(tree_cache, "root_node", None)
+                self.last_node = root
+                self.last_host_node = root
                 self.host_hit_length = 0
             else:
                 # A running recurrent req already OWNS its state (running slot):
