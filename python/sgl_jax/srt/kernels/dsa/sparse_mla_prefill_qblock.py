@@ -487,7 +487,7 @@ def prefill_write_and_attend_ragged_qblock(
         row,
         loc.astype(jnp.int32),
         page_size=ps,
-        r_cap=T // ps + S + 34,
+        r_cap=max(default_run_capacity(T, ps), T // ps + S + 34),
         interpret=interpret,
     )
 
@@ -562,7 +562,7 @@ def prefill_write_and_attend_ragged_qblock_tsa(
         row,
         loc.astype(jnp.int32),
         page_size=ps,
-        r_cap=Tkv // ps + S + 34,
+        r_cap=max(default_run_capacity(Tkv, ps), Tkv // ps + S + 34),
         interpret=interpret,
     )
 
@@ -718,7 +718,7 @@ def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref,
 # 64 requests x 4 draft tokens is 256 rows; the old default
 # (2 * pages + 130 = 134) did not cover it and cost two whole-pool copies per
 # layer (~0.15 ms each on GLM-5.2 tp16).
-STATIC_DISPATCH_MAX_ROWS = 1024
+STATIC_DISPATCH_MAX_ROWS = 4096
 # Row counts up to this size take the 4D-native scatter when the caller opts in
 # (speculative verify / draft-extend pre-write); see paged_write_back.
 SCATTER_ROWS_MAX = 1024
