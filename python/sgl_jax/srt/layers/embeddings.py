@@ -106,6 +106,59 @@ class Embed(nnx.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
 
+        if (
+            self.mesh is not None
+            and isinstance(self.kernel_axes[0], tuple)
+            and "data" in self.kernel_axes[0]
+            and "tensor" in self.kernel_axes[0]
+            and "data" in self.mesh.axis_names
+            and "tensor" in self.mesh.axis_names
+        ):
+            dp_size = int(self.mesh.shape["data"])
+            tp_size = int(self.mesh.shape["tensor"])
+            rep_spec = NamedSharding(self.mesh, P(None))
+            if getattr(self.mesh, "_any_axis_explicit", False):
+                rep_ids = jax.sharding.auto_axes(
+                    lambda x: jax.sharding.reshard(x.reshape(-1), rep_spec),
+                    out_sharding=rep_spec,
+                )(inputs)
+            else:
+                rep_ids = jax.sharding.reshard(inputs.reshape(-1), rep_spec)
+
+            def _vocab_parallel_lookup(emb_shard: jax.Array, ids_all: jax.Array) -> jax.Array:
+                v_local = emb_shard.shape[0]
+                shard_idx = jax.lax.axis_index("data") * tp_size + jax.lax.axis_index("tensor")
+                local_ids = ids_all - shard_idx * v_local
+                valid = (local_ids >= 0) & (local_ids < v_local)
+                safe_ids = jnp.where(valid, local_ids, 0)
+                gathered = emb_shard[safe_ids]
+                partial = jnp.where(valid[:, None], gathered, jnp.zeros_like(gathered))
+                if tp_size > 1:
+                    partial = jax.lax.psum(partial, "tensor")
+                if dp_size > 1:
+                    partial = jax.lax.psum_scatter(
+                        partial, "data", scatter_dimension=0, tiled=True
+                    )
+                return partial
+
+            flat_out = jax.shard_map(
+                _vocab_parallel_lookup,
+                mesh=self.mesh,
+                in_specs=(P(("data", "tensor"), self.kernel_axes[-1]), P(None)),
+                out_specs=P("data", self.kernel_axes[-1]),
+                check_vma=False,
+            )(embedding, rep_ids)
+            if inputs.ndim == 1:
+                return flat_out
+            output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
+            output_sharding = NamedSharding(self.mesh, output_pspec)
+            if getattr(self.mesh, "_any_axis_explicit", False):
+                return jax.sharding.auto_axes(
+                    lambda y: y.reshape(inputs.shape + (self.features,)),
+                    out_sharding=output_sharding,
+                )(flat_out)
+            return flat_out.reshape(inputs.shape + (self.features,))
+
         output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         output = embedding.at[inputs].get(out_sharding=output_sharding)

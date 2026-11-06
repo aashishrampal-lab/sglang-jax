@@ -857,6 +857,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 index_n_heads=cfg.index_n_heads,
                 skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
                 full_slot=full_slot,
+                enable_coop_prefill=(getattr(sa, "coop_prefill_mode", "disable") != "disable"),
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

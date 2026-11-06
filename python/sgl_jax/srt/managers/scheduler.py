@@ -2615,6 +2615,9 @@ class Scheduler(
         effective_lcp = max(0, lcp_len - 1) if is_eagle_cache else lcp_len
         coop_target_len = (effective_lcp // self.page_size) * self.page_size
         if coop_target_len < 4096:
+            if not any("__wbar_on__" in str(getattr(r, "rid", "") or "") for r in self.waiting_queue):
+                for r in self.waiting_queue:
+                    r._coop_skipped = True
             return None
 
         target_dp = int(first_req.dp_rank or 0)
@@ -2831,13 +2834,20 @@ class Scheduler(
         is_pd_prefill_mode = (
             getattr(getattr(self, "server_args", None), "disaggregation_mode", "null") == "prefill"
         )
+        _force_wbar_on = any(
+            "__wbar_on__" in str(getattr(r, "rid", "") or "")
+            for r in list(self.waiting_queue) + [x for x in self.chunked_reqs if x is not None]
+        )
         skip_waiting_queue = (
             admissions_paused
             or all_dp_chunked
             or (
                 is_pd_prefill_mode
                 and has_chunked_reqs
-                and os.environ.get("SGL_PD_ONE_REQ_PER_DP_WAVE", "0") == "1"
+                and (
+                    _force_wbar_on
+                    or os.environ.get("SGL_PD_ONE_REQ_PER_DP_WAVE", "0") == "1"
+                )
             )
         )
 
@@ -2995,10 +3005,14 @@ class Scheduler(
                 continue
 
             if (
-                coop_enabled
+                (coop_enabled or _force_wbar_on)
                 and not getattr(req, "_pd_skip_prefix_match", False)
-                and not getattr(req, "_coop_skipped", False)
-                and (busy_for_coop or any(adder.can_run_list.values()))
+                and (not getattr(req, "_coop_skipped", False) or _force_wbar_on)
+                and (
+                    busy_for_coop
+                    or (_force_wbar_on and (has_chunked_reqs or not self.running_batch.is_empty()))
+                    or any(adder.can_run_list.values())
+                )
                 and len(req.origin_input_ids) >= 4096 + self.page_size + 1
             ):
                 evict_sz = self.tree_cache.evictable_size(dp_rank=dp_rank)
@@ -3032,7 +3046,11 @@ class Scheduler(
                 self._extract_pd_dpseq(req) if (is_pd_prefill_mode and use_cross_dp_sync) else None
             )
             if dpseq is not None:
-                if active_wave_dpseq is not None and dpseq != active_wave_dpseq:
+                if (
+                    (_force_wbar_on or os.environ.get("SGL_PD_STRICT_WAVE_DPSEQ", "0") == "1")
+                    and active_wave_dpseq is not None
+                    and dpseq != active_wave_dpseq
+                ):
                     dpseq_blocked_dps.add(dp_rank)
                     continue
                 next_seq_map = getattr(self, "_pd_next_expected_dpseq", None)

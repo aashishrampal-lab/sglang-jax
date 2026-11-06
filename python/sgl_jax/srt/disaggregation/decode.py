@@ -1239,7 +1239,12 @@ class SchedulerDisaggregationDecodeMixin:
                 else None
             )
             if dpseq is not None:
-                if active_wave_dpseq is not None and dpseq != active_wave_dpseq:
+                _dec_wbar_on = "__wbar_on__" in str(getattr(entry.req, "rid", "") or "")
+                if (
+                    (_dec_wbar_on or os.environ.get("SGL_PD_STRICT_WAVE_DPSEQ", "0") == "1")
+                    and active_wave_dpseq is not None
+                    and dpseq != active_wave_dpseq
+                ):
                     capacity_blocked_ranks.add(decode_dp_rank)
                     continue
                 next_seq_map = getattr(self, "_pd_next_expected_dpseq", None)

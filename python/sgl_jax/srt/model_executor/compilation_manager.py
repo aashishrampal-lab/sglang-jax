@@ -244,8 +244,19 @@ class CompilationManager:
             if self.max_total_num_tokens
             else None
         )
+        shared_cap = int(os.environ.get("SGL_SHARED_PREFIX_CACHE_LOC_CAP", "0"))
+        shared_cap_aligned = (
+            ((shared_cap + self.page_size - 1) // self.page_size * self.page_size)
+            if shared_cap > 0
+            else 0
+        )
         return [
-            min(bs * pages_per_req, pool_aligned) if pool_aligned else bs * pages_per_req
+            min(
+                bs * pages_per_req,
+                max(pool_aligned, bs * shared_cap_aligned) if shared_cap_aligned > 0 else pool_aligned,
+            )
+            if pool_aligned
+            else bs * pages_per_req
             for bs in self.bs_buckets
         ]
 

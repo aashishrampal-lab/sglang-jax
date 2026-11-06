@@ -992,73 +992,107 @@ def streamindex_topk(
             scores,
         )
 
-    # Pre-fill the output with -inf and alias it, so masked / unwritten
-    # columns are already -inf.
-    scores_init = jnp.full(
-        (q.shape[0], num_sublanes_total, 128),
-        -jnp.inf,
-        dtype=jnp.float32,
-    )
+    def _run_full_topk(_):
+        # Pre-fill the output with -inf and alias it, so masked / unwritten
+        # columns are already -inf.
+        scores_init = jnp.full(
+            (q.shape[0], num_sublanes_total, 128),
+            -jnp.inf,
+            dtype=jnp.float32,
+        )
 
-    # TODO: we shall sort the sequences by length, so that multiple decode
-    # sequences in one batch have similar lengths to reduce waste of compute.
-    # With the same batch size, the longest sequence will determine number of
-    # blocks to run computation for.
-    decode_batch_end = distribution[0] // decode_req_batch_size * decode_req_batch_size
-    scores = run_topk_kernel(
-        q,
-        prepared_indexer_weights,
-        cache_kv,
-        scores_init,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=decode_batch_end,
-        static_q_len=1,
-        seq_batch_size=decode_req_batch_size,
-        case=MlaCase.DECODE,
-    )
-    # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-    scores = run_topk_kernel(
-        q,
-        prepared_indexer_weights,
-        cache_kv,
-        scores,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=decode_batch_end,
-        end_seq_idx=distribution[1],
-        static_q_len=1,
-        seq_batch_size=1,
-        case=MlaCase.DECODE,
-    )
+        # TODO: we shall sort the sequences by length, so that multiple decode
+        # sequences in one batch have similar lengths to reduce waste of compute.
+        # With the same batch size, the longest sequence will determine number of
+        # blocks to run computation for.
+        decode_batch_end = distribution[0] // decode_req_batch_size * decode_req_batch_size
+        scores = run_topk_kernel(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            scores_init,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=decode_batch_end,
+            static_q_len=1,
+            seq_batch_size=decode_req_batch_size,
+            case=MlaCase.DECODE,
+        )
+        # Handle num_decode_seqs % decode_req_batch_size != 0 case.
+        scores = run_topk_kernel(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            scores,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=decode_batch_end,
+            end_seq_idx=distribution[1],
+            static_q_len=1,
+            seq_batch_size=1,
+            case=MlaCase.DECODE,
+        )
 
-    scores = run_topk_kernel(
-        q,
-        prepared_indexer_weights,
-        cache_kv,
-        scores,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        static_q_len=None,
-        seq_batch_size=1,
-        case=MlaCase.MIXED,
-    )
+        scores = run_topk_kernel(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            scores,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=None,
+            seq_batch_size=1,
+            case=MlaCase.MIXED,
+        )
 
-    scores = scores.reshape(q.shape[0], -1)
-    topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
-    return topk_idxs[: q.shape[0], :k]
+        scores = scores.reshape(q.shape[0], -1)
+        topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
+        return topk_idxs[: q.shape[0], :k].astype(jnp.int32)
+
+    if compression_ratio == 1 and os.environ.get("DSA_STREAMIDX_EARLY_EXIT", "1") == "1":
+        num_seqs_valid = jnp.clip(distribution[2].astype(jnp.int32), 0, max_num_seqs)
+        active_seq_lens = jnp.where(
+            jnp.arange(max_num_seqs, dtype=jnp.int32) < num_seqs_valid, seq_lens, 0
+        )
+
+        def _early_exit_tokens(_):
+            t_out = q.shape[0]
+            t_idx = jnp.arange(t_out, dtype=jnp.int32)
+            seg = jnp.clip(
+                jnp.searchsorted(cu_q_lens, t_idx, side="right").astype(jnp.int32) - 1,
+                0,
+                max(0, max_num_seqs - 1),
+            )
+            q_start = cu_q_lens[seg]
+            q_end = cu_q_lens[seg + 1]
+            q_len = q_end - q_start
+            kv_len = seq_lens[seg]
+            valid_q = (
+                (t_idx < cu_q_lens[num_seqs_valid])
+                & (t_idx >= q_start)
+                & (t_idx < q_end)
+                & (kv_len > 0)
+            )
+            q_pos = kv_len - q_len + (t_idx - q_start)
+            num_vis = jnp.where(valid_q & (q_pos >= 0), jnp.clip(q_pos + 1, 0, k), 0)
+            cols = jnp.arange(k, dtype=jnp.int32)[None, :]
+            return jnp.where(cols < num_vis[:, None], cols, -1).astype(jnp.int32)
+
+        return jax.lax.cond(jnp.max(active_seq_lens) <= k, _early_exit_tokens, _run_full_topk, None)
+
+    return _run_full_topk(None)
 
 
 @functools.partial(
@@ -1134,67 +1168,113 @@ def streamindex_page_topk(
         raise ValueError(f"bkv block token span ({bkv_sz}) must be a multiple of 128.")
 
     T = q.shape[0]
-    scores_init = jnp.full((T, num_page_sublanes, 128), -jnp.inf, dtype=jnp.float32)
 
-    in_specs = [
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-    ]
-    out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+    def _run_full_page_topk(_):
+        scores_init = jnp.full((T, num_page_sublanes, 128), -jnp.inf, dtype=jnp.float32)
 
-    scratch_shapes = [
-        pltpu.VMEM((2, 1, bkv_p * page_size_per_kv_packing, kv_packing, lkv_dim), cache_kv.dtype),
-        pltpu.VMEM((2, 1, bq_sz, num_q_heads, head_dim), q.dtype),
-        pltpu.VMEM((2, 1, bq_sz, num_q_heads), prepared_indexer_weights.dtype),
-        pltpu.VMEM((2, bq_sz, num_page_sublanes, 128), jnp.float32),
-        pltpu.SemaphoreType.DMA((4, 2, 1)),
-    ]
+        in_specs = [
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ]
+        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
 
-    scalar_prefetches = (
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_pages,
-        jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
-        jnp.zeros((3,), jnp.int32),
-        jnp.full((2,), -1, jnp.int32),
-    )
-
-    scope_name = f"StreamIdxPageTC-bq_{bq_sz}-bkvp_{bkv_p}"
-    kernel = jax.named_scope(scope_name)(
-        pl.pallas_call(
-            functools.partial(
-                _scores_kernel,
-                compression_ratio=compression_ratio,
-                static_q_len=None,
-                bq_sz=bq_sz,
-                bkv_p=bkv_p,
-                seq_batch_size=1,
-                pages_per_seq=pages_per_seq,
-                page_pool_size=page_size,
-                num_bkv_max=num_bkv_max,
+        scratch_shapes = [
+            pltpu.VMEM(
+                (2, 1, bkv_p * page_size_per_kv_packing, kv_packing, lkv_dim), cache_kv.dtype
             ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(scalar_prefetches),
-                in_specs=in_specs,
-                out_specs=out_specs,
-                grid=(num_seqs.astype(jnp.int32),),
-                scratch_shapes=scratch_shapes,
-            ),
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
-                disable_bounds_checks=True,
-            ),
-            out_shape=jax.ShapeDtypeStruct(shape=(T, num_page_sublanes, 128), dtype=jnp.float32),
-            input_output_aliases={len(scalar_prefetches) + 3: 0},
-            name=scope_name,
+            pltpu.VMEM((2, 1, bq_sz, num_q_heads, head_dim), q.dtype),
+            pltpu.VMEM((2, 1, bq_sz, num_q_heads), prepared_indexer_weights.dtype),
+            pltpu.VMEM((2, bq_sz, num_page_sublanes, 128), jnp.float32),
+            pltpu.SemaphoreType.DMA((4, 2, 1)),
+        ]
+
+        scalar_prefetches = (
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_pages,
+            jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
+            jnp.zeros((3,), jnp.int32),
+            jnp.full((2,), -1, jnp.int32),
         )
-    )
-    page_scores = kernel(*scalar_prefetches, q, prepared_indexer_weights, cache_kv, scores_init)
 
-    page_scores = page_scores.reshape(T, num_page_cols)[:, :pages_per_seq]
-    top_vals, top_idxs = jax.lax.top_k(page_scores, k_pages)
-    return jnp.where(top_vals > -jnp.inf, top_idxs, -1)
+        scope_name = f"StreamIdxPageTC-bq_{bq_sz}-bkvp_{bkv_p}"
+        kernel = jax.named_scope(scope_name)(
+            pl.pallas_call(
+                functools.partial(
+                    _scores_kernel,
+                    compression_ratio=compression_ratio,
+                    static_q_len=None,
+                    bq_sz=bq_sz,
+                    bkv_p=bkv_p,
+                    seq_batch_size=1,
+                    pages_per_seq=pages_per_seq,
+                    page_pool_size=page_size,
+                    num_bkv_max=num_bkv_max,
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=len(scalar_prefetches),
+                    in_specs=in_specs,
+                    out_specs=out_specs,
+                    grid=(num_seqs.astype(jnp.int32),),
+                    scratch_shapes=scratch_shapes,
+                ),
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("arbitrary",),
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    disable_bounds_checks=True,
+                ),
+                out_shape=jax.ShapeDtypeStruct(
+                    shape=(T, num_page_sublanes, 128), dtype=jnp.float32
+                ),
+                input_output_aliases={len(scalar_prefetches) + 3: 0},
+                name=scope_name,
+            )
+        )
+        page_scores = kernel(*scalar_prefetches, q, prepared_indexer_weights, cache_kv, scores_init)
+
+        page_scores = page_scores.reshape(T, num_page_cols)[:, :pages_per_seq]
+        top_vals, top_idxs = jax.lax.top_k(page_scores, k_pages)
+        return jnp.where(top_vals > -jnp.inf, top_idxs, -1).astype(jnp.int32)
+
+    if compression_ratio == 1 and os.environ.get("DSA_STREAMIDX_EARLY_EXIT", "1") == "1":
+        num_seqs_valid = jnp.clip(num_seqs.astype(jnp.int32), 0, max_num_seqs)
+        active_seq_lens = jnp.where(
+            jnp.arange(max_num_seqs, dtype=jnp.int32) < num_seqs_valid, seq_lens, 0
+        )
+
+        def _early_exit_pages(_):
+            t_idx = jnp.arange(T, dtype=jnp.int32)
+            seg = jnp.clip(
+                jnp.searchsorted(cu_q_lens, t_idx, side="right").astype(jnp.int32) - 1,
+                0,
+                max(0, max_num_seqs - 1),
+            )
+            q_start = cu_q_lens[seg]
+            q_end = cu_q_lens[seg + 1]
+            q_len = q_end - q_start
+            kv_len = seq_lens[seg]
+            valid_q = (
+                (t_idx < cu_q_lens[num_seqs_valid])
+                & (t_idx >= q_start)
+                & (t_idx < q_end)
+                & (kv_len > 0)
+            )
+            q_pos = kv_len - q_len + (t_idx - q_start)
+            max_vis_p = min(k_pages, pages_per_seq)
+            num_vis_p = jnp.where(
+                valid_q & (q_pos >= 0), jnp.clip(q_pos // page_size + 1, 0, max_vis_p), 0
+            )
+            pcols = jnp.arange(k_pages, dtype=jnp.int32)[None, :]
+            return jnp.where(pcols < num_vis_p[:, None], pcols, -1).astype(jnp.int32)
+
+        return jax.lax.cond(
+            jnp.max(active_seq_lens) <= k_pages * page_size,
+            _early_exit_pages,
+            _run_full_page_topk,
+            None,
+        )
+
+    return _run_full_page_topk(None)

@@ -38,6 +38,10 @@ from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     prefill_write_and_attend_ragged_qblock,
     prefill_write_and_attend_ragged_qblock_tsa,
 )
+from sgl_jax.srt.kernels.dsa.sparse_mla_sc_gather import (
+    prepare_sc_gather_metadata,
+    sparse_mla_sc_token_gather_attention,
+)
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
     streamindex_topk,
@@ -45,6 +49,9 @@ from sgl_jax.srt.kernels.dsa.streamindex_topk import (
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.utils.profiling_utils import named_scope
+from sgl_jax.srt.utils.tpu_runtime_tuning import patch_jax_pallas_fori_lowering
+
+patch_jax_pallas_fori_lowering()
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -163,6 +170,24 @@ _IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV",
 _TSA_PREFILL = os.environ.get("DSA_TSA_PREFILL", "0") == "1"
 _TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 
+# Direct 4D paged_write_back for indexer key cache (eliminates 4D<->3D full-pool
+# relayout copies across all 21 full DSA layers). Default ON.
+_PALLAS_IDX_WRITE = os.environ.get("DSA_PALLAS_IDX_WRITE", "1") == "1"
+
+# Token-level SparseCore KV gather + double-buffered TensorCore MLA attention
+# (ports vllm-torchtpu's dsa_gather + split-Q MLA pipeline onto sglang-jax's 4D
+# fused KV cache). DSA_SC_TOKEN_GATHER=1 enables both prefill and decode unless
+# overridden individually via DSA_PREFILL_SC_TOKEN_GATHER / DSA_DECODE_SC_TOKEN_GATHER.
+_SC_TOKEN_GATHER_DEFAULT = os.environ.get("DSA_SC_TOKEN_GATHER", "0") == "1"
+_PREFILL_SC_TOKEN_GATHER = (
+    os.environ.get("DSA_PREFILL_SC_TOKEN_GATHER", "1" if _SC_TOKEN_GATHER_DEFAULT else "0") == "1"
+)
+_DECODE_SC_TOKEN_GATHER = (
+    os.environ.get("DSA_DECODE_SC_TOKEN_GATHER", "1" if _SC_TOKEN_GATHER_DEFAULT else "0") == "1"
+)
+_INDEXER_PREFILL_TOKEN_QB = int(os.environ.get("DSA_INDEXER_PREFILL_TOKEN_QB", "64"))
+_INDEXER_PREFILL_TOKEN_BKVP = int(os.environ.get("DSA_INDEXER_PREFILL_TOKEN_BKVP", "32"))
+
 
 @register_pytree_node_class
 @dataclass
@@ -201,6 +226,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         index_n_heads: int,
         skip_offset: int,
         full_slot: dict[int, int],
+        enable_coop_prefill: bool = False,
         **mla_kwargs,
     ):
         super().__init__(**mla_kwargs)
@@ -209,6 +235,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         self.index_n_heads = index_n_heads
         self.skip_offset = skip_offset
         self.full_slot = full_slot
+        self.enable_coop_prefill = bool(
+            enable_coop_prefill or os.environ.get("DSA_ENABLE_COOP_PREFILL", "0") == "1"
+        )
 
     def tree_flatten(self):
         children, aux = super().tree_flatten()
@@ -219,6 +248,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             "index_n_heads": self.index_n_heads,
             "skip_offset": self.skip_offset,
             "full_slot": self.full_slot,
+            "enable_coop_prefill": self.enable_coop_prefill,
         }
         return children, aux
 
@@ -230,6 +260,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             index_n_heads=aux_data["index_n_heads"],
             skip_offset=aux_data["skip_offset"],
             full_slot=aux_data["full_slot"],
+            enable_coop_prefill=aux_data.get("enable_coop_prefill", False),
             num_attn_heads=aux_data["num_attn_heads"],
             kv_lora_rank=aux_data["kv_lora_rank"],
             qk_nope_head_dim=aux_data["qk_nope_head_dim"],
@@ -322,6 +353,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 compute_topk=is_decode,
                 compute_pages=is_decode,
+                forward_batch=forward_batch,
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=topk, topk_pages=topk_pages)
 
@@ -363,6 +395,74 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # the per-query-token kernel handles uniformly.
         if not is_decode:
             if _PREFILL_SPARSE:
+                # Token-level SparseCore gather + double-buffered TensorCore MLA
+                # (skip only when an MTP step explicitly hands page-only reuse).
+                use_prefill_sc_gather = _PREFILL_SC_TOKEN_GATHER and not (
+                    is_full and dsa_topk_reuse and dsa_topk_in is None and dsa_topk_pages_in is not None
+                )
+                if use_prefill_sc_gather:
+                    reuse_tokens = is_full and dsa_topk_reuse and dsa_topk_in is not None
+                    if reuse_tokens and bool(
+                        getattr(forward_batch, "spec_kvshare_readonly", False)
+                    ):
+                        topk_tokens = None
+                    else:
+                        idx_cache, topk_tokens = self._maybe_index_prefill_tokens(
+                            is_full,
+                            q_idx,
+                            k_idx,
+                            idx_weights,
+                            idx_cache,
+                            dpa,
+                            md,
+                            compute_topk=not reuse_tokens,
+                            forward_batch=forward_batch,
+                        )
+                    topk_tokens_use = (
+                        topk_tokens if (is_full and not reuse_tokens) else dsa_topk_in
+                    )
+                    if topk_tokens_use is not None:
+                        tp_size = (
+                            self.mesh.shape["tensor"]
+                            if (self.mesh is not None and "tensor" in self.mesh.axis_names)
+                            else 1
+                        )
+                        dp_size = (
+                            self.mesh.shape[dpa]
+                            if (self.mesh is not None and dpa in self.mesh.axis_names)
+                            else 1
+                        )
+                        use_tsa = _TSA_PREFILL and _tsa_eligible(q.shape[0], dp_size, tp_size)
+                        run_sc_prefill = (
+                            self._run_sparse_sc_token_gather_tsa
+                            if use_tsa
+                            else self._run_sparse_sc_token_gather
+                        )
+                        o, kv_cache = run_sc_prefill(
+                            q,
+                            q_rope,
+                            new_kv_c,
+                            new_k_pe,
+                            kv_cache,
+                            topk_tokens_use,
+                            sm_scale,
+                            dpa,
+                            md,
+                            forward_batch,
+                        )
+                        return o, DSAFusedCache(
+                            kv=kv_cache,
+                            idx=idx_cache,
+                            topk=topk_tokens if (is_full and not reuse_tokens) else None,
+                            topk_pages=None,
+                        )
+                    o, kv_cache = self._run_dense(
+                        q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
+                    )
+                    return o, DSAFusedCache(
+                        kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None
+                    )
+
                 reuse_pages = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
                 if reuse_pages and bool(getattr(forward_batch, "spec_kvshare_readonly", False)):
                     topk_pages = None  # KVShare: no indexer-key write for draft steps >= 1
@@ -376,6 +476,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                         dpa,
                         md,
                         compute_pages=not reuse_pages,
+                        forward_batch=forward_batch,
                     )
                 # Page selection for the sparse-prefill attend. A FULL (indexer)
                 # layer just produced [T, k_pages] page-topk; a SHARED layer gets
@@ -435,10 +536,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 compute_topk=False,
                 compute_pages=False,
+                forward_batch=forward_batch,
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
 
         # ── indexer top-k (full) or reuse (shared / MTP IndexShare) ────────
+        use_decode_sc_gather = _DECODE_SC_TOKEN_GATHER and _PAGE_TOPK_BUDGET == 0
         reuse_topk = is_full and dsa_topk_reuse and dsa_topk_in is not None
         idx_cache, topk, topk_pages = self._maybe_index(
             is_full,
@@ -449,7 +552,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             dpa,
             md,
             compute_topk=not reuse_topk,
-            compute_pages=not reuse_topk,
+            compute_pages=(not reuse_topk) and (not use_decode_sc_gather),
+            forward_batch=forward_batch,
         )
         if not is_full or reuse_topk:
             assert (
@@ -462,6 +566,26 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages_use = topk_pages
 
         # ── sparse MLA over top-k ─────────────────────────────────────────
+        if use_decode_sc_gather:
+            o, kv_cache = self._run_sparse_sc_token_gather(
+                q,
+                q_rope,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                topk_use,
+                sm_scale,
+                dpa,
+                md,
+                forward_batch,
+            )
+            return o, DSAFusedCache(
+                kv=kv_cache,
+                idx=idx_cache,
+                topk=topk if (is_full and not reuse_topk) else None,
+                topk_pages=None,
+            )
+
         o, kv_cache = self._run_sparse(
             q,
             q_rope,
@@ -519,19 +643,74 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md = self.forward_metadata
 
         kv_cache = self._write_kv_only_prefill(new_kv_c, new_k_pe, kv_cache, dpa, md, forward_batch)
-        idx_cache = self._write_idx_only(is_full, k_idx, idx_cache, dpa, md)
+        idx_cache = self._write_idx_only(
+            is_full, k_idx, idx_cache, dpa, md, forward_batch=forward_batch
+        )
         return DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
 
     # ────────────────────────────────────────────────────────────────────────
     # internals
     # ────────────────────────────────────────────────────────────────────────
 
+    def _resolve_write_loc(
+        self, forward_batch, md, num_tokens: int, dpa: str
+    ) -> tuple[jax.Array | None, bool]:
+        """Return ``(loc [num_tokens], readonly)`` cached per forward step."""
+        if forward_batch is None:
+            return None, False
+        readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+        if readonly:
+            return None, True
+        mode = getattr(forward_batch, "forward_mode", None)
+        raw_loc = getattr(forward_batch, "out_cache_loc", None)
+        if (
+            mode is not None
+            and not mode.is_decode()
+            and not mode.is_target_verify()
+            and not mode.is_draft_extend()
+            and raw_loc is not None
+            and raw_loc.shape[0] == num_tokens
+        ):
+            return raw_loc.astype(jnp.int32), False
+        loc_key = (
+            id(md.seq_lens),
+            id(md.page_indices),
+            id(md.cu_q_lens),
+            id(md.cu_kv_lens),
+            int(num_tokens),
+        )
+        cached = getattr(forward_batch, "_sc_write_loc_cache", None)
+        if cached is not None and cached[0] == loc_key:
+            return cached[1], False
+        loc = self._spec_token_slots_sharded(md, num_tokens, dpa)
+        try:
+            forward_batch._sc_write_loc_cache = (loc_key, loc)
+        except Exception:
+            pass
+        return loc, False
+
+    def _resolve_fixed_stride_pages(self, forward_batch, md, dpa: str) -> jax.Array | None:
+        """Cache ``_fixed_stride_pages`` once per forward step across all 21 full layers."""
+        if forward_batch is None or os.environ.get("DSA_SHARE_SPARSE_META", "1") != "1":
+            return None
+        fpi_key = (id(md.seq_lens), id(md.page_indices), id(md.cu_kv_lens))
+        cached = getattr(forward_batch, "_fixed_pi_cache", None)
+        if cached is not None and cached[0] == fpi_key:
+            return cached[1]
+        fixed_pi = self._fixed_stride_pages_sharded(md, dpa)
+        try:
+            forward_batch._fixed_pi_cache = (fpi_key, fixed_pi)
+        except Exception:
+            pass
+        return fixed_pi
+
     def _scatter_or_coop_idx(self, cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa):
         page_size = cache3d.shape[1]
         idx_dim = cache3d.shape[2]
         coop_chunk = k_.shape[0]
         if (
-            coop_chunk >= 256
+            self.enable_coop_prefill
+            and coop_chunk >= 256
             and coop_chunk % page_size == 0
             and self.mesh is not None
             and self.mesh.shape.get(dpa, 1) > 1
@@ -563,10 +742,81 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             return cache3d, seq_lens_
         return _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq), seq_lens_
 
+    def _write_idx_4d(self, cache_, k_, seq_lens_, pi_, cuq_, cukv_, dpa, loc_=None):
+        """Write ``k_`` directly into 4D ``cache_`` without 4D<->3D full-pool relayout."""
+        page_size = cache_.shape[1] * cache_.shape[2]
+        idx_dim = cache_.shape[3]
+        pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+        if not _PALLAS_IDX_WRITE:
+            cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
+            cache3d, seq_lens_ = self._scatter_or_coop_idx(
+                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
+            )
+            return cache3d.reshape(cache_.shape), seq_lens_
+
+        coop_chunk = k_.shape[0]
+        use_interpret = jax.default_backend() == "cpu"
+
+        def _normal_write_4d(c4d_, sl_cur):
+            slots = (
+                loc_
+                if loc_ is not None
+                else _spec_token_slots(sl_cur, cuq_, cukv_, pi_, coop_chunk, page_size)
+            )
+            k_write = k_.astype(c4d_.dtype)
+            if k_write.shape[-1] < idx_dim:
+                k_write = jnp.pad(k_write, ((0, 0), (0, idx_dim - k_write.shape[-1])))
+            return paged_write_back(
+                c4d_,
+                k_write,
+                slots.astype(jnp.int32),
+                page_size=page_size,
+                interpret=use_interpret,
+                small_rows_scatter=(coop_chunk <= 256),
+            )
+
+        if (
+            self.enable_coop_prefill
+            and coop_chunk >= 256
+            and coop_chunk % page_size == 0
+            and self.mesh is not None
+            and self.mesh.shape.get(dpa, 1) > 1
+            and (self.mesh.shape[dpa] * coop_chunk) % page_size == 0
+            and pi_.shape[0] >= (self.mesh.shape[dpa] * coop_chunk) // page_size
+        ):
+            coop_flag = seq_lens_[-1]
+            seq_lens_ = jnp.where(coop_flag < 0, seq_lens_.at[-1].set(0), seq_lens_)
+
+            def _coop_update_4d(c4d_):
+                pos_base = -coop_flag - 1
+                start_page = pos_base // page_size
+                dp_sz = self.mesh.shape[dpa]
+                pages_per_step = (dp_sz * coop_chunk) // page_size
+                all_k = jax.lax.all_gather(k_, dpa, axis=0, tiled=True)
+                k_pad = idx_dim - all_k.shape[-1]
+                if k_pad > 0:
+                    all_k = jnp.pad(all_k, ((0, 0), (0, k_pad)))
+                merged_pages = all_k.astype(c4d_.dtype).reshape(
+                    pages_per_step, c4d_.shape[1], c4d_.shape[2], idx_dim
+                )
+                dest_pages = jax.lax.dynamic_slice_in_dim(pi_, start_page, pages_per_step, axis=0)
+                return c4d_.at[dest_pages].set(merged_pages)
+
+            cache_ = jax.lax.cond(
+                coop_flag < 0,
+                _coop_update_4d,
+                lambda c4d_: _normal_write_4d(c4d_, seq_lens_),
+                cache_,
+            )
+            return cache_, seq_lens_
+
+        return _normal_write_4d(cache_, seq_lens_), seq_lens_
+
     def _coop_kv_update(self, kvc_, kpe_, cache_, seq_lens_, pi_, dpa):
         coop_chunk = kvc_.shape[0]
         if (
-            coop_chunk >= 256
+            self.enable_coop_prefill
+            and coop_chunk >= 256
             and coop_chunk % self.page_size == 0
             and self.mesh is not None
             and self.mesh.shape.get(dpa, 1) > 1
@@ -595,8 +845,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             cache_ = jax.lax.cond(coop_flag < 0, _coop_update, lambda c_: c_, cache_)
         return cache_, seq_lens_
 
-    def _write_idx_only(self, is_full, k_idx, idx_cache, dpa, md):
+    def _write_idx_only(self, is_full, k_idx, idx_cache, dpa, md, *, forward_batch=None):
         if not is_full or k_idx is None or idx_cache is None:
+            return idx_cache
+        loc, readonly = self._resolve_write_loc(forward_batch, md, k_idx.shape[0], dpa)
+        if readonly:
             return idx_cache
         in_specs = (
             P(dpa, None),  # k_idx [T, D_idx]
@@ -606,26 +859,27 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),  # cu_q_lens
             P(dpa),  # cu_kv_lens
         )
-        out_specs = P(dpa, None, None, None)
-
-        def _run(k_, cache_, seq_lens_, pi_, cuq_, cukv_):
-            page_size = cache_.shape[1] * cache_.shape[2]
-            idx_dim = cache_.shape[3]
-            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d, _ = self._scatter_or_coop_idx(
-                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
-            )
-            return cache3d.reshape(cache_.shape)
-
-        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+        args = [
             k_idx,
             idx_cache,
             md.seq_lens,
             md.page_indices,
             md.cu_q_lens,
             md.cu_kv_lens,
-        )
+        ]
+        if loc is not None:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
+        out_specs = P(dpa, None, None, None)
+
+        def _run(k_, cache_, seq_lens_, pi_, cuq_, cukv_, *rest):
+            loc_ = rest[0] if rest else None
+            cache_, _ = self._write_idx_4d(
+                cache_, k_, seq_lens_, pi_, cuq_, cukv_, dpa, loc_=loc_
+            )
+            return cache_
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
 
     def _write_kv_only_prefill(self, kvc, kpe, cache, dpa, md, forward_batch):
         page_size = self.page_size
@@ -678,7 +932,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             T = kvc_.shape[0]
             rope = kpe_.shape[-1]
             Dk_pad = cache_.shape[3]
-            S = sl_.shape[0]
             row = jnp.zeros((T, Dk_pad), cache_.dtype)
             row = row.at[:, :kv_lora_rank].set(kvc_.astype(cache_.dtype))
             row = row.at[:, kv_lora_rank : kv_lora_rank + rope].set(
@@ -689,7 +942,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 row,
                 loc_.astype(jnp.int32),
                 page_size=page_size,
-                r_cap=T // page_size + S + 34,
                 interpret=use_interpret,
             )
 
@@ -707,6 +959,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         *,
         compute_topk=True,
         compute_pages=False,
+        forward_batch=None,
     ):
         """On full layers: write k_idx into paged indexer cache, compute top-k
         (and, when ``compute_pages``, the unique-page list for IndexShare).
@@ -716,6 +969,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         during chunked prefill we only need the k_idx cache write."""
         if not is_full or q_idx is None:
             return idx_cache, None, None
+
+        loc, readonly = self._resolve_write_loc(forward_batch, md, k_idx.shape[0], dpa)
+        fixed_pi = (
+            self._resolve_fixed_stride_pages(forward_batch, md, dpa)
+            if (compute_topk and (_INDEXER_KERNEL or _INDEXER_KERNEL_PREFILL))
+            else None
+        )
 
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] — replicated: softmax needs all heads
@@ -728,23 +988,48 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),  # cu_kv_lens
             P(dpa),  # distribution
         )
+        args = [
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+        ]
+        has_loc = (not readonly) and (loc is not None)
+        has_fpi = fixed_pi is not None
+        if has_loc:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
+        if has_fpi:
+            in_specs = in_specs + (P(dpa),)
+            args.append(fixed_pi)
         out_specs = (P(dpa, None, None, None), P(dpa, None), P(dpa, None))
 
-        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
+        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_, *extra):
             page_size = cache_.shape[1] * cache_.shape[2]
             idx_dim = cache_.shape[3]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d, seq_lens_ = self._scatter_or_coop_idx(
-                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
-            )
+            extra_idx = 0
+            loc_ = None
+            if has_loc:
+                loc_ = extra[extra_idx]
+                extra_idx += 1
+            fpi_ = extra[extra_idx] if has_fpi else None
+            if not readonly:
+                cache_, seq_lens_ = self._write_idx_4d(
+                    cache_, k_, seq_lens_, pi_, cuq_, cukv_, dpa, loc_=loc_
+                )
             if compute_topk and _PAGE_TOPK_BUDGET > 0:
                 # Page-scoring path: budget pages picked directly by max-pooled
                 # page score; token-level topk is not materialized (sparse MLA
                 # attends whole pages via topk_pages, so it never reads it).
                 topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
                 k_eff = min(_PAGE_TOPK_BUDGET, pages_per_seq)
-                if _INDEXER_KERNEL_PREFILL or _INDEXER_KERNEL:
+                if (_INDEXER_KERNEL_PREFILL or _INDEXER_KERNEL) and jax.default_backend() == "tpu":
                     tp_sz = (
                         self.mesh.shape["tensor"]
                         if (self.mesh is not None and "tensor" in self.mesh.axis_names)
@@ -753,7 +1038,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     topk_pages = _run_streamindex_page_topk_tp(
                         q_,
                         w_,
-                        cache3d.reshape(cache_.shape),
+                        cache_,
                         seq_lens_,
                         pi_,
                         cuq_,
@@ -764,8 +1049,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                         pages_per_seq=pages_per_seq,
                         num_queries_per_block=1,
                         tp_size=tp_sz,
+                        precomputed_fixed_pi=fpi_,
                     )
                 else:
+                    cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
                     topk_pages = streamindex_page_topk_ref(
                         q_,
                         w_,
@@ -781,14 +1068,19 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                         # belongs to seq i — enables the O(S * max_kv) fast path.
                         one_token_per_seq=True,
                     )
-                return cache3d.reshape(cache_.shape), topk, topk_pages
-            if compute_topk and _INDEXER_KERNEL:
+                return cache_, topk, topk_pages
+            if compute_topk and _INDEXER_KERNEL and jax.default_backend() == "tpu":
+                fpi_use = (
+                    fpi_
+                    if fpi_ is not None
+                    else _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq)
+                )
                 topk = streamindex_topk(
                     q_,
                     w_,
-                    cache3d.reshape(cache_.shape),
+                    cache_,
                     seq_lens_,
-                    _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+                    fpi_use,
                     cuq_,
                     dist_,
                     k=self.index_topk,
@@ -798,6 +1090,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     num_queries_per_block=1,
                 )
             elif compute_topk:
+                cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
                 topk = streamindex_topk_ref(
                     q_,
                     w_,
@@ -825,21 +1118,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 )
             else:
                 topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
-            return cache3d.reshape(cache_.shape), topk, topk_pages
+            return cache_, topk, topk_pages
 
         idx_cache, topk, topk_pages = jax.shard_map(
             _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
-        )(
-            q_idx,
-            k_idx,
-            idx_weights,
-            idx_cache,
-            md.seq_lens,
-            md.page_indices,
-            md.cu_q_lens,
-            md.cu_kv_lens,
-            md.distribution,
-        )
+        )(*args)
         return idx_cache, topk, (topk_pages if compute_pages else None)
 
     def _run_sparse(
@@ -1276,6 +1559,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 return idx_cache, None
             return idx_cache, topk_pages
 
+        loc, readonly = self._resolve_write_loc(forward_batch, md, k_idx.shape[0], dpa)
         in_specs = (
             P(dpa, None, None),  # q_idx    [T_q, H_idx, D_idx] replicated
             P(dpa, None),  # k_idx    [T, D_idx]
@@ -1287,20 +1571,32 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),  # cu_kv_lens
             P(dpa),  # distribution
         )
+        args = [
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+        ]
+        has_loc = (not readonly) and (loc is not None)
+        if has_loc:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
         out_specs = (P(dpa, None, None, None), P(dpa, None))
 
-        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
-            page_size = cache_.shape[1] * cache_.shape[2]
-            idx_dim = cache_.shape[3]
+        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_, *rest):
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d, seq_lens_ = self._scatter_or_coop_idx(
-                cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq, dpa
-            )
-            if not compute_pages:
-                return cache3d.reshape(cache_.shape), jnp.full(
-                    (k_.shape[0], k_pages), -1, jnp.int32
+            loc_ = rest[0] if rest else None
+            if not readonly:
+                cache_, seq_lens_ = self._write_idx_4d(
+                    cache_, k_, seq_lens_, pi_, cuq_, cukv_, dpa, loc_=loc_
                 )
+            if not compute_pages:
+                return cache_, jnp.full((k_.shape[0], k_pages), -1, jnp.int32)
             if (
                 _SPEC_VERIFY_LAST_Q_ONLY
                 and q_group is not None
@@ -1321,7 +1617,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 topk_pages_last = _prefill_page_topk(
                     q_last,
                     w_last,
-                    cache3d,
+                    cache_,
                     seq_lens_,
                     pi_,
                     cuq_last,
@@ -1340,7 +1636,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 topk_pages = _prefill_page_topk(
                     q_,
                     w_,
-                    cache3d,
+                    cache_,
                     seq_lens_,
                     pi_,
                     cuq_,
@@ -1354,11 +1650,52 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     tp_size=tp_sz if is_spec_mode else 1,
                     uniform_q_per_seq=is_spec_mode,
                 )
-            return cache3d.reshape(cache_.shape), topk_pages
+            return cache_, topk_pages
 
         idx_cache, topk_pages = jax.shard_map(
             _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
-        )(
+        )(*args)
+        if not compute_pages:
+            return idx_cache, None
+        return idx_cache, topk_pages
+
+    def _maybe_index_prefill_tokens(
+        self,
+        is_full,
+        q_idx,
+        k_idx,
+        idx_weights,
+        idx_cache,
+        dpa,
+        md,
+        *,
+        compute_topk=True,
+        forward_batch=None,
+    ):
+        """Prefill token-topk: write ``k_idx`` in 4D and compute causal ``[T, index_topk]``."""
+        if not is_full or q_idx is None:
+            return idx_cache, None
+
+        loc, readonly = self._resolve_write_loc(forward_batch, md, k_idx.shape[0], dpa)
+        use_kernel = (_INDEXER_KERNEL or _INDEXER_KERNEL_PREFILL) and jax.default_backend() == "tpu"
+        fixed_pi = (
+            self._resolve_fixed_stride_pages(forward_batch, md, dpa)
+            if (compute_topk and use_kernel)
+            else None
+        )
+
+        in_specs = (
+            P(dpa, None, None),  # q_idx   [T, H_idx, D_idx]
+            P(dpa, None),  # k_idx   [T, D_idx]
+            P(dpa, None),  # weights [T, H_idx]
+            P(dpa, None, None, None),  # idx_cache 4D
+            P(dpa),  # seq_lens
+            P(dpa),  # page_indices
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+            P(dpa),  # distribution
+        )
+        args = [
             q_idx,
             k_idx,
             idx_weights,
@@ -1368,15 +1705,487 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
-        )
-        if not compute_pages:
+        ]
+        has_loc = (not readonly) and (loc is not None)
+        has_fpi = fixed_pi is not None
+        if has_loc:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
+        if has_fpi:
+            in_specs = in_specs + (P(dpa),)
+            args.append(fixed_pi)
+        out_specs = (P(dpa, None, None, None), P(dpa, None))
+
+        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_, *extra):
+            page_size = cache_.shape[1] * cache_.shape[2]
+            idx_dim = cache_.shape[3]
+            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            extra_idx = 0
+            loc_ = None
+            if has_loc:
+                loc_ = extra[extra_idx]
+                extra_idx += 1
+            fpi_ = extra[extra_idx] if has_fpi else None
+            if not readonly:
+                cache_, seq_lens_ = self._write_idx_4d(
+                    cache_, k_, seq_lens_, pi_, cuq_, cukv_, dpa, loc_=loc_
+                )
+            if not compute_topk:
+                return cache_, jnp.full((q_.shape[0], 1), -1, jnp.int32)
+            if use_kernel:
+                fpi_use = (
+                    fpi_
+                    if fpi_ is not None
+                    else _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq)
+                )
+                bq = min(_INDEXER_PREFILL_TOKEN_QB, max(1, q_.shape[0]))
+                topk = streamindex_topk(
+                    q_,
+                    w_,
+                    cache_,
+                    seq_lens_,
+                    fpi_use,
+                    cuq_,
+                    dist_,
+                    k=self.index_topk,
+                    compression_ratio=1,
+                    num_kv_pages_per_block=_INDEXER_PREFILL_TOKEN_BKVP,
+                    num_queries_per_block=bq,
+                )
+            else:
+                cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
+                topk = streamindex_topk_ref(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    k=self.index_topk,
+                    pages_per_seq=pages_per_seq,
+                    one_token_per_seq=False,
+                )
+            return cache_, topk
+
+        idx_cache, topk = jax.shard_map(
+            _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
+        )(*args)
+        if not compute_topk:
             return idx_cache, None
-        return idx_cache, topk_pages
+        return idx_cache, topk
+
+    def _run_sparse_sc_token_gather(
+        self, ql, qpe, kvc, kpe, cache, topk_tokens, sm_scale, dpa, md, forward_batch=None
+    ):
+        """Token-level SparseCore KV gather + double-buffered TensorCore MLA (prefill & decode)."""
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        sm = float(sm_scale)
+        loc, readonly = self._resolve_write_loc(forward_batch, md, kvc.shape[0], dpa)
+
+        precomputed_meta = None
+        if forward_batch is not None and os.environ.get("DSA_SHARE_SPARSE_META", "1") == "1":
+            meta_key = (
+                id(topk_tokens),
+                id(md.seq_lens),
+                id(md.page_indices),
+                id(md.cu_q_lens),
+                id(md.cu_kv_lens),
+                int(cache.shape[0]),
+                int(ql.shape[0]),
+                False,
+            )
+            cached_meta = getattr(forward_batch, "_sc_gather_meta_cache", None)
+            if cached_meta is not None and cached_meta[0] == meta_key:
+                precomputed_meta = cached_meta[1]
+            else:
+                dp_sz = (
+                    self.mesh.shape[dpa]
+                    if (self.mesh is not None and dpa in self.mesh.axis_names)
+                    else 1
+                )
+                num_cache_pages_local = cache.shape[0] // dp_sz
+
+                def _prep_sc_meta(topk_, sl_, pi_, cuq_, cukv_):
+                    sl_clean = (
+                        jnp.where(sl_[-1] < 0, sl_.at[-1].set(0), sl_)
+                        if self.enable_coop_prefill
+                        else sl_
+                    )
+                    vkvl, phys_idx, tok_end = prepare_sc_gather_metadata(
+                        topk_,
+                        sl_clean,
+                        pi_,
+                        cuq_,
+                        cukv_,
+                        page_size=page_size,
+                        total_num_pages=num_cache_pages_local,
+                    )
+                    return vkvl, phys_idx, tok_end.reshape(1)
+
+                precomputed_meta = jax.shard_map(
+                    _prep_sc_meta,
+                    in_specs=(P(dpa, None), P(dpa), P(dpa), P(dpa), P(dpa)),
+                    out_specs=(P(dpa), P(dpa, None), P(dpa)),
+                    check_vma=False,
+                )(topk_tokens, md.seq_lens, md.page_indices, md.cu_q_lens, md.cu_kv_lens)
+                try:
+                    forward_batch._sc_gather_meta_cache = (meta_key, precomputed_meta)
+                except Exception:
+                    pass
+
+        has_loc = (not readonly) and (loc is not None)
+        if precomputed_meta is not None:
+            in_specs = (
+                P(dpa, "tensor", None),  # ql
+                P(dpa, "tensor", None),  # qpe
+                P(dpa, None),  # kvc
+                P(dpa, None),  # kpe
+                P(dpa, None, None, None),  # cache
+                P(dpa),  # seq_lens
+                P(dpa),  # cu_q_lens
+                P(dpa),  # cu_kv_lens
+                P(dpa),  # page_indices
+                P(dpa),  # valid_kv_lens
+                P(dpa, None),  # physical_indices
+                P(dpa),  # token_end [1]
+            )
+            args = [
+                ql,
+                qpe,
+                kvc,
+                kpe,
+                cache,
+                md.seq_lens,
+                md.cu_q_lens,
+                md.cu_kv_lens,
+                md.page_indices,
+                precomputed_meta[0],
+                precomputed_meta[1],
+                precomputed_meta[2],
+            ]
+            if has_loc:
+                in_specs = in_specs + (P(dpa),)
+                args.append(loc)
+            out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+            def _run_cached(
+                ql_, qpe_, kvc_, kpe_, cache_, sl_, cuq_, cukv_, pi_, vkvl_, phys_idx_, tend_, *rest
+            ):
+                cache_, sl_ = self._coop_kv_update(kvc_, kpe_, cache_, sl_, pi_, dpa)
+                if readonly:
+                    loc_ = None
+                elif rest:
+                    loc_ = rest[0]
+                else:
+                    loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, kvc_.shape[0], page_size)
+                o, cache_new = sparse_mla_sc_token_gather_attention(
+                    ql_,
+                    qpe_,
+                    None if readonly else kvc_,
+                    None if readonly else kpe_,
+                    cache_,
+                    loc_,
+                    vkvl_,
+                    phys_idx_,
+                    tend_[0],
+                    page_size=page_size,
+                    kv_lora_rank=kv_lora_rank,
+                    sm_scale=sm,
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                )
+                return o.astype(ql_.dtype), cache_new
+
+            return jax.shard_map(
+                _run_cached, in_specs=in_specs, out_specs=out_specs, check_vma=False
+            )(*args)
+
+        in_specs = (
+            P(dpa, "tensor", None),
+            P(dpa, "tensor", None),
+            P(dpa, None),
+            P(dpa, None),
+            P(dpa, None, None, None),
+            P(dpa, None),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+        )
+        args = [
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_tokens,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        ]
+        if has_loc:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
+        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, sl_, cuq_, cukv_, pi_, *rest):
+            cache_, sl_ = self._coop_kv_update(kvc_, kpe_, cache_, sl_, pi_, dpa)
+            if readonly:
+                loc_ = None
+            elif rest:
+                loc_ = rest[0]
+            else:
+                loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, kvc_.shape[0], page_size)
+            vkvl, phys_idx, tok_end = prepare_sc_gather_metadata(
+                topk_,
+                sl_,
+                pi_,
+                cuq_,
+                cukv_,
+                page_size=page_size,
+                total_num_pages=cache_.shape[0],
+            )
+            o, cache_new = sparse_mla_sc_token_gather_attention(
+                ql_,
+                qpe_,
+                None if readonly else kvc_,
+                None if readonly else kpe_,
+                cache_,
+                loc_,
+                vkvl,
+                phys_idx,
+                tok_end,
+                page_size=page_size,
+                kv_lora_rank=kv_lora_rank,
+                sm_scale=sm,
+                vmem_limit_bytes=self.vmem_limit_bytes,
+            )
+            return o.astype(ql_.dtype), cache_new
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
+
+    def _run_sparse_sc_token_gather_tsa(
+        self, ql, qpe, kvc, kpe, cache, topk_tokens, sm_scale, dpa, md, forward_batch=None
+    ):
+        """Token-sharded-attention variant of SparseCore token-gather MLA prefill."""
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        sm = float(sm_scale)
+        tp_size = self.mesh.shape["tensor"]
+        loc, readonly = self._resolve_write_loc(forward_batch, md, kvc.shape[0], dpa)
+
+        precomputed_meta = None
+        if forward_batch is not None and os.environ.get("DSA_SHARE_SPARSE_META", "1") == "1":
+            meta_key = (
+                id(topk_tokens),
+                id(md.seq_lens),
+                id(md.page_indices),
+                id(md.cu_q_lens),
+                id(md.cu_kv_lens),
+                int(cache.shape[0]),
+                int(ql.shape[0]),
+                True,
+            )
+            cached_meta = getattr(forward_batch, "_sc_gather_meta_cache", None)
+            if cached_meta is not None and cached_meta[0] == meta_key:
+                precomputed_meta = cached_meta[1]
+            else:
+                dp_sz = (
+                    self.mesh.shape[dpa]
+                    if (self.mesh is not None and dpa in self.mesh.axis_names)
+                    else 1
+                )
+                num_cache_pages_local = cache.shape[0] // dp_sz
+                t_local = (ql.shape[0] // dp_sz) // tp_size
+
+                def _prep_sc_meta_tsa(topk_, sl_, pi_, cuq_, cukv_):
+                    sl_clean = (
+                        jnp.where(sl_[-1] < 0, sl_.at[-1].set(0), sl_)
+                        if self.enable_coop_prefill
+                        else sl_
+                    )
+                    off = jax.lax.axis_index("tensor") * t_local
+                    topk_loc = jax.lax.dynamic_slice_in_dim(topk_, off, t_local, axis=0)
+                    vkvl, phys_idx, tok_end = prepare_sc_gather_metadata(
+                        topk_loc,
+                        sl_clean,
+                        pi_,
+                        cuq_,
+                        cukv_,
+                        page_size=page_size,
+                        total_num_pages=num_cache_pages_local,
+                        q_token_offset=off,
+                    )
+                    return vkvl[None, :], phys_idx[None, :, :], tok_end.reshape(1, 1)
+
+                precomputed_meta = jax.shard_map(
+                    _prep_sc_meta_tsa,
+                    in_specs=(P(dpa, None), P(dpa), P(dpa), P(dpa), P(dpa)),
+                    out_specs=(P(dpa, "tensor"), P(dpa, "tensor", None), P(dpa, "tensor")),
+                    check_vma=False,
+                )(topk_tokens, md.seq_lens, md.page_indices, md.cu_q_lens, md.cu_kv_lens)
+                try:
+                    forward_batch._sc_gather_meta_cache = (meta_key, precomputed_meta)
+                except Exception:
+                    pass
+
+        has_loc = (not readonly) and (loc is not None)
+        if precomputed_meta is not None:
+            in_specs = (
+                P(dpa, "tensor", None),
+                P(dpa, "tensor", None),
+                P(dpa, None),
+                P(dpa, None),
+                P(dpa, None, None, None),
+                P(dpa),
+                P(dpa),
+                P(dpa),
+                P(dpa),
+                P(dpa, "tensor"),
+                P(dpa, "tensor", None),
+                P(dpa, "tensor"),
+            )
+            args = [
+                ql,
+                qpe,
+                kvc,
+                kpe,
+                cache,
+                md.seq_lens,
+                md.cu_q_lens,
+                md.cu_kv_lens,
+                md.page_indices,
+                precomputed_meta[0],
+                precomputed_meta[1],
+                precomputed_meta[2],
+            ]
+            if has_loc:
+                in_specs = in_specs + (P(dpa),)
+                args.append(loc)
+            out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+            def _run_tsa_cached(
+                ql_, qpe_, kvc_, kpe_, cache_, sl_, cuq_, cukv_, pi_, vkvl_, phys_idx_, tend_, *rest
+            ):
+                cache_, sl_ = self._coop_kv_update(kvc_, kpe_, cache_, sl_, pi_, dpa)
+                if readonly:
+                    loc_ = None
+                elif rest:
+                    loc_ = rest[0]
+                else:
+                    loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, kvc_.shape[0], page_size)
+                ql_t = jax.lax.all_to_all(ql_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+                qpe_t = jax.lax.all_to_all(qpe_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+                o_t, cache_new = sparse_mla_sc_token_gather_attention(
+                    ql_t,
+                    qpe_t,
+                    None if readonly else kvc_,
+                    None if readonly else kpe_,
+                    cache_,
+                    loc_,
+                    vkvl_[0],
+                    phys_idx_[0],
+                    tend_[0, 0],
+                    page_size=page_size,
+                    kv_lora_rank=kv_lora_rank,
+                    sm_scale=sm,
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                )
+                o = jax.lax.all_to_all(
+                    o_t.astype(ql_.dtype), "tensor", split_axis=1, concat_axis=0, tiled=True
+                )
+                return o, cache_new
+
+            return jax.shard_map(
+                _run_tsa_cached, in_specs=in_specs, out_specs=out_specs, check_vma=False
+            )(*args)
+
+        in_specs = (
+            P(dpa, "tensor", None),
+            P(dpa, "tensor", None),
+            P(dpa, None),
+            P(dpa, None),
+            P(dpa, None, None, None),
+            P(dpa, None),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+        )
+        args = [
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_tokens,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        ]
+        if has_loc:
+            in_specs = in_specs + (P(dpa),)
+            args.append(loc)
+        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+        def _run_tsa(ql_, qpe_, kvc_, kpe_, cache_, topk_, sl_, cuq_, cukv_, pi_, *rest):
+            cache_, sl_ = self._coop_kv_update(kvc_, kpe_, cache_, sl_, pi_, dpa)
+            if readonly:
+                loc_ = None
+            elif rest:
+                loc_ = rest[0]
+            else:
+                loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, kvc_.shape[0], page_size)
+            t_local = ql_.shape[0] // tp_size
+            ql_t = jax.lax.all_to_all(ql_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+            qpe_t = jax.lax.all_to_all(qpe_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+            off = jax.lax.axis_index("tensor") * t_local
+            topk_loc = jax.lax.dynamic_slice_in_dim(topk_, off, t_local, axis=0)
+            vkvl, phys_idx, tok_end = prepare_sc_gather_metadata(
+                topk_loc,
+                sl_,
+                pi_,
+                cuq_,
+                cukv_,
+                page_size=page_size,
+                total_num_pages=cache_.shape[0],
+                q_token_offset=off,
+            )
+            o_t, cache_new = sparse_mla_sc_token_gather_attention(
+                ql_t,
+                qpe_t,
+                None if readonly else kvc_,
+                None if readonly else kpe_,
+                cache_,
+                loc_,
+                vkvl,
+                phys_idx,
+                tok_end,
+                page_size=page_size,
+                kv_lora_rank=kv_lora_rank,
+                sm_scale=sm,
+                vmem_limit_bytes=self.vmem_limit_bytes,
+            )
+            o = jax.lax.all_to_all(
+                o_t.astype(ql_.dtype), "tensor", split_axis=1, concat_axis=0, tiled=True
+            )
+            return o, cache_new
+
+        return jax.shard_map(_run_tsa, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            *args
+        )
 
     def _spec_metadata_as_decode(self, md, num_tokens: int, dpa):
         """Pseudo-decode metadata for a spec batch (rank-local build, P(dpa) out)."""
         page_size = self.page_size
-        t_local = num_tokens // self.mesh.shape[dpa]
+        dp_sz = (
+            self.mesh.shape[dpa] if (self.mesh is not None and dpa in self.mesh.axis_names) else 1
+        )
+        t_local = num_tokens // dp_sz
         in_specs = (P(dpa), P(dpa), P(dpa), P(dpa))
         out_specs = (P(dpa), P(dpa), P(dpa), P(dpa), P(dpa))
 
@@ -1393,7 +2202,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
     def _spec_token_slots_sharded(self, md, num_tokens: int, dpa):
         """Compute `_spec_token_slots` once per forward pass instead of 78 times."""
         page_size = self.page_size
-        t_local = num_tokens // self.mesh.shape[dpa]
+        dp_sz = (
+            self.mesh.shape[dpa] if (self.mesh is not None and dpa in self.mesh.axis_names) else 1
+        )
+        t_local = num_tokens // dp_sz
         in_specs = (P(dpa), P(dpa), P(dpa), P(dpa))
         out_specs = P(dpa)
 

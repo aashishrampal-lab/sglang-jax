@@ -87,7 +87,7 @@ class MiniLoadBalancer:
         self._next_dp_rank: int = 0
         self._active_prefix_sig: tuple | None = None
         self._active_prefix_leader_dp: int | None = None
-        self._post_sem = asyncio.Semaphore(64)
+        self._post_sem = asyncio.Semaphore(512)
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":

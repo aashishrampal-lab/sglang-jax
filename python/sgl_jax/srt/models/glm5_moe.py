@@ -170,6 +170,48 @@ class GlmDsaIndexer(nnx.Module):
             mesh=mesh,
             scope_name="weights_proj",
         )
+        self.wk_weights_proj = nnx.data(None) if hasattr(nnx, "data") else None
+
+    def fuse_wk_weights_proj(self, drop_originals: bool = True) -> bool:
+        """Fuse standalone BF16 ``wk`` + ``weights_proj`` into one ``LinearBase``."""
+        if os.environ.get("DSA_FUSED_WK_WEIGHTS", "1") == "0" or self.wk_weights_proj is not None:
+            return False
+        if self.wk is None or self.weights_proj is None:
+            return False
+        if isinstance(self.wk, QuantizedLinear) or isinstance(self.weights_proj, QuantizedLinear):
+            return False
+        if (
+            getattr(self.wk, "kernel_axes", None) != (None, None)
+            or getattr(self.weights_proj, "kernel_axes", None) != (None, None)
+            or getattr(self.wk, "bias", None) is not None
+            or getattr(self.weights_proj, "bias", None) is not None
+        ):
+            return False
+        w_k = self.wk.weight.value
+        w_p = self.weights_proj.weight.value
+        if (
+            not isinstance(w_k, jax.Array)
+            or not isinstance(w_p, jax.Array)
+            or isinstance(w_k, jax.ShapeDtypeStruct)
+            or isinstance(w_p, jax.ShapeDtypeStruct)
+            or w_k.dtype != w_p.dtype
+        ):
+            return False
+        fused = LinearBase(
+            input_size=int(w_k.shape[0]),
+            output_size=int(w_k.shape[1] + w_p.shape[1]),
+            use_bias=False,
+            kernel_axes=(None, None),
+            params_dtype=w_k.dtype,
+            mesh=self.mesh,
+            scope_name="wk_weights_proj",
+        )
+        fused.weight.value = jnp.concatenate([w_k, w_p], axis=1)
+        self.wk_weights_proj = nnx.data(fused) if hasattr(nnx, "data") else fused
+        if drop_originals:
+            self.wk = nnx.data(None) if hasattr(nnx, "data") else None
+            self.weights_proj = nnx.data(None) if hasattr(nnx, "data") else None
+        return True
 
     def project(
         self,
@@ -195,8 +237,14 @@ class GlmDsaIndexer(nnx.Module):
         query, _ = self.wq_b(qr_q)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
+        weights = None
         if precomputed_wk is not None:
             key = precomputed_wk
+        elif self.wk_weights_proj is not None:
+            kw_out, _ = self.wk_weights_proj(hidden_states)
+            key = kw_out[:, : self.head_dim]
+            w_all = kw_out[:, self.head_dim :]
+            weights = w_all[q_group - 1 :: q_group] if use_q_slice else w_all
         else:
             key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
@@ -218,11 +266,36 @@ class GlmDsaIndexer(nnx.Module):
             query = query.at[:, :, :rope_dim].set(q_rope)
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim))
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        orig_dtype = query.dtype
+        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim), dtype=orig_dtype)
+        if not use_q_slice and key.dtype == orig_dtype and query.shape[0] == key.shape[0]:
+            qk_cat = jnp.concatenate((query, key[:, None, :]), axis=1)
+            qk_flat = qk_cat.reshape(-1, self.head_dim)
+            qk_h = jax.lax.dot_general(
+                qk_flat,
+                h_matrix,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(orig_dtype)
+            qk_h = qk_h.reshape(query.shape[0], self.n_head + 1, self.head_dim)
+            query = qk_h[:, : self.n_head, :]
+            key = qk_h[:, self.n_head, :]
+        else:
+            query = jax.lax.dot_general(
+                query,
+                h_matrix,
+                (((2,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(orig_dtype)
+            key = jax.lax.dot_general(
+                key.astype(orig_dtype),
+                h_matrix,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(key.dtype)
 
-        weights, _ = self.weights_proj(hs_q)
+        if weights is None:
+            weights, _ = self.weights_proj(hs_q)
         return query, key, weights
 
     def project_key_only(
@@ -236,6 +309,9 @@ class GlmDsaIndexer(nnx.Module):
         """Indexer key projection only (for KV-only draft prefill on 1P)."""
         if precomputed_wk is not None:
             key = precomputed_wk
+        elif self.wk_weights_proj is not None:
+            kw_out, _ = self.wk_weights_proj(hidden_states)
+            key = kw_out[:, : self.head_dim]
         else:
             key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
@@ -248,8 +324,13 @@ class GlmDsaIndexer(nnx.Module):
         else:
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim))
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim), dtype=key.dtype)
+        key = jax.lax.dot_general(
+            key,
+            h_matrix,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(key.dtype)
         return key
 
     def __call__(
@@ -267,8 +348,14 @@ class GlmDsaIndexer(nnx.Module):
 
         if precomputed_wk is not None:
             key = precomputed_wk
+            weights_pre = None
+        elif self.wk_weights_proj is not None:
+            kw_out, _ = self.wk_weights_proj(hidden_states)
+            key = kw_out[:, : self.head_dim]
+            weights_pre = kw_out[:, self.head_dim :]
         else:
             key, _ = self.wk(hidden_states)
+            weights_pre = None
         key = self.k_norm(key)
 
         # Apply RoPE
@@ -287,11 +374,18 @@ class GlmDsaIndexer(nnx.Module):
             query = query.at[:, :, :rope_dim].set(q_rope)
             key = key.at[:, :rope_dim].set(k_rope)
 
-        # Apply Hadamard Transform
-        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim))
-
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        # Apply Hadamard Transform without promoting BF16 outputs to FP32
+        orig_dtype = query.dtype
+        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim), dtype=orig_dtype)
+        query = jax.lax.dot_general(
+            query, h_matrix, (((2,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        ).astype(orig_dtype)
+        key = jax.lax.dot_general(
+            key.astype(orig_dtype),
+            h_matrix,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(key.dtype)
 
         # 2. Compute Logits (simplified dense dot product)
         key_replicated = jax.sharding.reshard(
@@ -300,7 +394,10 @@ class GlmDsaIndexer(nnx.Module):
         logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
 
         # 3. Apply weights_proj
-        weights, _ = self.weights_proj(hidden_states)
+        if weights_pre is not None:
+            weights = weights_pre
+        else:
+            weights, _ = self.weights_proj(hidden_states)
 
         # Scale and apply weights
         scaling = self.head_dim**-0.5
@@ -833,16 +930,19 @@ class Glm5Attention(nnx.Module):
 
 def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
     """Fuse replicated block-quant `q_a_proj` + `kv_a_proj_with_mqa` (+ `indexer.wk`) across all `Glm5Attention` layers."""
-    if os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") == "0":
-        return 0
     fused_with_wk = 0
     fused_no_wk = 0
+    fused_bf16_wk_w = 0
+    allow_qkv_a = os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") != "0"
     for _, sub in module.iter_modules():
-        if isinstance(sub, Glm5Attention) and sub.fuse_qkv_a_proj():
-            if sub._qkv_a_has_wk:
-                fused_with_wk += 1
-            else:
-                fused_no_wk += 1
+        if isinstance(sub, Glm5Attention):
+            if allow_qkv_a and sub.fuse_qkv_a_proj():
+                if sub._qkv_a_has_wk:
+                    fused_with_wk += 1
+                else:
+                    fused_no_wk += 1
+            if sub.indexer is not None and sub.indexer.fuse_wk_weights_proj():
+                fused_bf16_wk_w += 1
     total = fused_with_wk + fused_no_wk
     if total:
         logger.info(
@@ -852,7 +952,12 @@ def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
             fused_with_wk,
             fused_no_wk,
         )
-    return total
+    if fused_bf16_wk_w:
+        logger.info(
+            "Fused %d GlmDsaIndexer standalone BF16 (wk + weights_proj) projections",
+            fused_bf16_wk_w,
+        )
+    return total + fused_bf16_wk_w
 
 
 class Glm5MLP(nnx.Module):
@@ -1105,7 +1210,15 @@ class Glm5DecoderLayer(nnx.Module):
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
             self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
             num_shared_experts = getattr(config, "n_shared_experts", 0)
-            use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
+            _tp_se = int(mesh.shape.get("tensor", 1)) if mesh is not None else 1
+            _shard_se = os.environ.get("SGLANG_JAX_SHARD_SHARED_EXPERTS", "1") == "1" and _tp_se > 1
+            use_inkernel_se = (
+                self.moe_backend == MoEBackend.FUSED_V2
+                and num_shared_experts > 0
+                and not _shard_se
+            )
+            self._use_inkernel_se = use_inkernel_se
+            config._sgl_use_inkernel_se = use_inkernel_se
 
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -1214,7 +1327,7 @@ class Glm5DecoderLayer(nnx.Module):
                     quantization_config=getattr(config, "quantization_config", None),
                 )
 
-            if num_shared_experts > 0 and not self.use_fused:
+            if num_shared_experts > 0 and (not self.use_fused or not use_inkernel_se):
                 self.shared_experts = Glm5MLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=config.moe_intermediate_size * num_shared_experts,
@@ -1276,7 +1389,6 @@ class Glm5DecoderLayer(nnx.Module):
         if (
             self.is_moe_layer
             and self.moe_backend == MoEBackend.FUSED_V2
-            and self.shared_experts is None
             and hidden_states.shape[0]
             >= int(os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER_MIN_TOKENS", "32"))
             and os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER", "1") == "1"
@@ -1290,6 +1402,14 @@ class Glm5DecoderLayer(nnx.Module):
             pad_t = padded_num_tokens - orig_num_tokens
             ep_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
             ep_mask_sharding = NamedSharding(mesh, P(("data", "tensor")))
+
+            if self.shared_experts is not None:
+                normed_hs = self.post_attention_layernorm(hidden_states)
+                shared_output = self.shared_experts(normed_hs)
+                ep_input = normed_hs
+            else:
+                shared_output = None
+                ep_input = hidden_states
 
             def _prep_ep(hs_in, mask_in):
                 if pad_t > 0:
@@ -1305,16 +1425,17 @@ class Glm5DecoderLayer(nnx.Module):
                 if token_valid_mask is not None:
                     hs_ep, mask_ep = jax.sharding.auto_axes(
                         _prep_ep, out_sharding=(ep_sharding, ep_mask_sharding)
-                    )(hidden_states, token_valid_mask)
+                    )(ep_input, token_valid_mask)
                 else:
                     hs_ep = jax.sharding.auto_axes(
                         lambda h: _prep_ep(h, None)[0], out_sharding=ep_sharding
-                    )(hidden_states)
+                    )(ep_input)
                     mask_ep = None
             else:
-                hs_ep, mask_ep = _prep_ep(hidden_states, token_valid_mask)
+                hs_ep, mask_ep = _prep_ep(ep_input, token_valid_mask)
 
-            hs_ep = self.post_attention_layernorm(hs_ep)
+            if self.shared_experts is None:
+                hs_ep = self.post_attention_layernorm(hs_ep)
             router_logits = self.moe_gate(hs_ep)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
@@ -1334,6 +1455,8 @@ class Glm5DecoderLayer(nnx.Module):
                     )(hidden_states)
                 else:
                     hidden_states = hidden_states[:orig_num_tokens]
+            if shared_output is not None:
+                hidden_states = hidden_states + shared_output
             if not getattr(forward_batch, "return_routed_experts", False):
                 topk_ids = None
             return hidden_states, residual, kv_fused, topk_ids
@@ -1394,12 +1517,26 @@ class Glm5Model(nnx.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        _emb_world = (
+            int(mesh.shape.get("data", 1)) * int(mesh.shape.get("tensor", 1))
+            if mesh is not None and "data" in mesh.axis_names and "tensor" in mesh.axis_names
+            else 1
+        )
+        _emb_axes = (
+            (("data", "tensor"), None)
+            if (
+                os.environ.get("SGLANG_JAX_SHARD_EMBED_DP_TP", "1") == "1"
+                and _emb_world > 1
+                and config.vocab_size % _emb_world == 0
+            )
+            else ("tensor", None)
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=_emb_axes,
             mesh=mesh,
         )
 
@@ -1615,10 +1752,14 @@ class Glm5ForCausalLM(nnx.Module):
         )
 
     def _create_glm5_weight_mappings(self, model_config: ModelConfig) -> dict:
+        for _lyr in getattr(self.model, "layers", ()):
+            if hasattr(_lyr, "_use_inkernel_se"):
+                self.config._sgl_use_inkernel_se = _lyr._use_inkernel_se
+                break
         mappings = {
             "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
-                sharding=("tensor", None),
+                sharding=self.model.embed_tokens.kernel_axes,
                 transpose=False,
             ),
             "model.norm.weight": WeightSpec(
@@ -1817,7 +1958,7 @@ class Glm5ForCausalLM(nnx.Module):
             num_shared = getattr(self.config, "n_shared_experts", 0)
             if num_shared > 0:
                 sp = f"{prefix}.mlp.shared_experts"
-                if moe_backend == "fused_v2":
+                if moe_backend == "fused_v2" and getattr(self.config, "_sgl_use_inkernel_se", True):
                     for hf_name, target_name in (
                         ("gate_proj", "w1_shared"),
                         ("up_proj", "w3_shared"),
@@ -1949,11 +2090,25 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         # We must index layer_id=0 so it does not exceed the KV buffer array bounds!
         self.mtp_layer_idx = 0
 
+        _nextn_world = (
+            int(mesh.shape.get("data", 1)) * int(mesh.shape.get("tensor", 1))
+            if mesh is not None and "data" in mesh.axis_names and "tensor" in mesh.axis_names
+            else 1
+        )
+        _nextn_emb_axes = (
+            (("data", "tensor"), None)
+            if (
+                os.environ.get("SGLANG_JAX_SHARD_EMBED_DP_TP", "1") == "1"
+                and _nextn_world > 1
+                and config.vocab_size % _nextn_world == 0
+            )
+            else ("tensor", None)
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=_nextn_emb_axes,
             param_dtype=dtype,
             mesh=mesh,
         )
@@ -2093,6 +2248,8 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         return nextn_pool_updates(kv_fused, is_dsa)
 
     def load_weights(self, model_config: ModelConfig):
+        if hasattr(self, "mtp_block") and hasattr(self.mtp_block, "_use_inkernel_se"):
+            model_config.hf_config._sgl_use_inkernel_se = self.mtp_block._use_inkernel_se
         self.loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )

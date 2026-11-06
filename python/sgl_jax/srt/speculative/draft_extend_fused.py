@@ -3080,7 +3080,12 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         == "prefill"
     )
     is_intermediate_chunk = bool(
-        np.any(valid_mask) and np.all(extend_next_token_ids[valid_mask] >= 0)
+        np.any(valid_mask)
+        and (
+            np.any(extend_next_token_ids[valid_mask] >= 0)
+            if os.environ.get("SGL_MTP_KV_ONLY_ANY_INTERMEDIATE", "0") == "1"
+            else np.all(extend_next_token_ids[valid_mask] >= 0)
+        )
     )
     use_kv_only = is_intermediate_chunk or (
         is_disagg_prefill and os.environ.get("SGL_PD_DIRECT_DECODE", "0") != "1"
@@ -3088,15 +3093,24 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     prefill_num_layers = (
         len(all_memory_pools) if use_kv_only else draft_worker.speculative_num_steps
     )
-    if not hasattr(draft_worker, "_fused_greedy_prefill_jit_fn"):
-        hf_config = getattr(
-            getattr(draft_worker._worker.model_runner, "model_config", None), "hf_config", None
-        )
-        draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
+    hf_config = getattr(
+        getattr(draft_worker._worker.model_runner, "model_config", None), "hf_config", None
+    )
+    hidden_relay = mtp_hidden_relay_enabled(hf_config)
+    prefill_cache = getattr(draft_worker, "_fused_greedy_prefill_jit_fns", None)
+    if prefill_cache is None:
+        prefill_cache = {}
+        draft_worker._fused_greedy_prefill_jit_fns = prefill_cache
+    prefill_key = (int(prefill_num_layers), int(draft_worker.topk), bool(hidden_relay))
+    prefill_jit_fn = prefill_cache.get(prefill_key)
+    if prefill_jit_fn is None:
+        prefill_jit_fn = _build_prefill(
             num_layers=prefill_num_layers,
             topk=draft_worker.topk,
-            hidden_relay=mtp_hidden_relay_enabled(hf_config),
+            hidden_relay=hidden_relay,
         )
+        prefill_cache[prefill_key] = prefill_jit_fn
+    draft_worker._fused_greedy_prefill_jit_fn = prefill_jit_fn
     safe_indices = np.where(
         valid_mask,
         np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
