@@ -6,6 +6,7 @@ from typing import Any
 import jax
 import numpy as np
 from flax import nnx
+from jax import lax, shard_map
 from jax import numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -84,6 +85,160 @@ def _load_shared_expert(inputs, *, mesh, quantized_dtype):
             arrays[0].T, arrays[1], quantized_dtype=quantized_dtype
         )
         return weight, scale.reshape(1, 1, -1)
+
+
+@partial(
+    jax.jit,
+    static_argnames=("mesh", "ep_axis", "k_axis", "n_axis", "reduce_k_axis"),
+)
+def _requantize_moe_expert_block_fp8(
+    w_q: jax.Array,
+    s_4d: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    ep_axis,
+    k_axis: str | None,
+    n_axis: str | None,
+    reduce_k_axis: bool,
+) -> tuple[jax.Array, jax.Array]:
+    w_spec = P(ep_axis, k_axis, n_axis)
+    s_in_spec = P(ep_axis, k_axis if s_4d.shape[1] > 1 else None, None, n_axis)
+    s_out_spec = P(ep_axis, None, None, n_axis)
+    fmax = float(jnp.finfo(w_q.dtype).max)
+
+    def _local(w_loc: jax.Array, s_loc: jax.Array) -> tuple[jax.Array, jax.Array]:
+        def _one_expert(pair):
+            w_e, s_e = pair  # w_e: [K, N], s_e: [K_blocks, 1, N]
+            k_dim, n_dim = w_e.shape
+            k_blocks = s_e.shape[0]
+            bk = (k_dim + k_blocks - 1) // k_blocks
+            if k_dim == k_blocks * bk:
+                w_f32 = (
+                    w_e.reshape(k_blocks, bk, n_dim).astype(jnp.float32) * s_e[:, 0:1, :]
+                ).reshape(k_dim, n_dim)
+            else:
+                s_2d = jnp.repeat(s_e[:, 0, :], bk, axis=0)[:k_dim, :]
+                w_f32 = w_e.astype(jnp.float32) * s_2d
+            amax = jnp.max(jnp.abs(w_f32), axis=0)
+            if reduce_k_axis and k_axis is not None:
+                amax = lax.pmax(amax, axis_name=k_axis)
+            new_s = jnp.where(amax == 0.0, jnp.float32(1.0), amax / jnp.float32(fmax))
+            new_w = jnp.clip(w_f32 / new_s[None, :], -fmax, fmax).astype(w_e.dtype)
+            return new_w, new_s.reshape(1, 1, n_dim)
+
+        return lax.map(_one_expert, (w_loc, s_loc))
+
+    return shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(w_spec, s_in_spec),
+        out_specs=(w_spec, s_out_spec),
+        check_vma=False,
+    )(w_q, s_4d)
+
+
+def requantize_static_block_fp8_model(module: nnx.Module) -> tuple[int, int]:
+    """Convert static block-scaled FP8 linear & routed MoE weights in-place to per-channel FP8.
+
+    Matches tpu-inference's load-time ``requantize_fp8_per_channel`` strategy on TPU:
+    1. Dense ``QuantizedLinear`` layers switch from 2D ``[128, 128]`` block scales
+       (Pallas VPU-accumulation matmul) to 1D per-channel scales (native XLA W8A8
+       ``lax.dot_general``).
+    2. Routed ``FusedEPMoEV2`` / ``EPMoE`` experts switch from ``K=128`` sub-channel
+       scales (12-16 inner scale-group loops per dot) to ``(E, 1, 1, N)`` per-channel
+       scales (single whole-tile dot + single scale multiply).
+
+    Controlled by ``SGLANG_JAX_REQUANTIZE_BLOCK_FP8`` (default ``"1"``).
+    """
+    if os.environ.get("SGLANG_JAX_REQUANTIZE_BLOCK_FP8", "1") == "0":
+        return 0, 0
+
+    linear_count = 0
+    moe_count = 0
+    for _, sub in module.iter_modules():
+        if isinstance(sub, QuantizedLinear):
+            if sub.requantize_block_to_per_channel():
+                linear_count += 1
+        elif isinstance(sub, FusedEPMoEV2):
+            if (
+                sub.w1_scale is None
+                or not isinstance(sub.w1.value, jax.Array)
+                or isinstance(sub.w1.value, jax.ShapeDtypeStruct)
+                or getattr(sub.w1_scale.value, "ndim", 0) != 4
+                or int(sub.w1_scale.value.shape[1]) <= 1
+            ):
+                continue
+            ep_axis = ("data", "tensor")
+            w_sh = NamedSharding(sub.mesh, P(ep_axis, None, None))
+            s_sh = NamedSharding(sub.mesh, P(ep_axis, None, None, None))
+            for w_attr, s_attr in (
+                ("w1", "w1_scale"),
+                ("w3", "w3_scale"),
+                ("w2", "w2_scale"),
+            ):
+                w_param = getattr(sub, w_attr)
+                s_param = getattr(sub, s_attr)
+                w_val = jax.sharding.reshard(w_param.value, w_sh)
+                s_val = jax.sharding.reshard(s_param.value, s_sh)
+                new_w, new_s = _requantize_moe_expert_block_fp8(
+                    w_val,
+                    s_val,
+                    mesh=sub.mesh,
+                    ep_axis=ep_axis,
+                    k_axis=None,
+                    n_axis=None,
+                    reduce_k_axis=False,
+                )
+                w_param.value = new_w
+                s_param.value = new_s
+            sub.quant_block_k = None
+            sub.quant_block_n = None
+            moe_count += 1
+        elif isinstance(sub, EPMoE):
+            if (
+                sub.wi_0_scale is None
+                or not isinstance(sub.wi_0.value, jax.Array)
+                or isinstance(sub.wi_0.value, jax.ShapeDtypeStruct)
+                or getattr(sub.wi_0_scale.value, "ndim", 0) != 4
+                or int(sub.wi_0_scale.value.shape[1]) <= 1
+            ):
+                continue
+            tp_moe = int(sub.moe_mesh.shape.get("tensor", 1))
+            for w_attr, s_attr, k_ax, n_ax in (
+                ("wi_0", "wi_0_scale", None, "tensor"),
+                ("wi_1", "wi_1_scale", None, "tensor"),
+                ("wo", "wo_scale", "tensor", None),
+            ):
+                w_param = getattr(sub, w_attr)
+                s_param = getattr(sub, s_attr)
+                w_val = jax.sharding.reshard(
+                    w_param.value, NamedSharding(sub.moe_mesh, P("expert", k_ax, n_ax))
+                )
+                s_val = jax.sharding.reshard(
+                    s_param.value, NamedSharding(sub.moe_mesh, P("expert", k_ax, None, n_ax))
+                )
+                new_w, new_s = _requantize_moe_expert_block_fp8(
+                    w_val,
+                    s_val,
+                    mesh=sub.moe_mesh,
+                    ep_axis="expert",
+                    k_axis=k_ax,
+                    n_axis=n_ax,
+                    reduce_k_axis=(k_ax is not None and tp_moe > 1),
+                )
+                w_param.value = new_w
+                s_param.value = new_s
+            sub.weight_block_size = None
+            moe_count += 1
+
+    if linear_count or moe_count:
+        logger.info(
+            "Requantized static block-FP8 weights to per-channel FP8 in-place: "
+            "linear_layers=%d, moe_layers=%d",
+            linear_count,
+            moe_count,
+        )
+    return linear_count, moe_count
 
 
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.
@@ -610,65 +765,129 @@ class Glm5Attention(nnx.Module):
             or isinstance(s_kva, jax.ShapeDtypeStruct)
         ):
             return False
-        if getattr(s_qa, "ndim", 0) != 3 or getattr(s_kva, "ndim", 0) != 3:
+        s_ndim = getattr(s_qa, "ndim", 0)
+        if s_ndim not in (1, 3) or getattr(s_kva, "ndim", 0) != s_ndim:
             return False
-        self.q_a_proj.pad_out_rows(256)
-        self.kv_a_proj_with_mqa.pad_out_rows(256)
-        w_qa = self.q_a_proj.weight_q.value
-        s_qa = self.q_a_proj.weight_scale.value
-        w_kva = self.kv_a_proj_with_mqa.weight_q.value
-        s_kva = self.kv_a_proj_with_mqa.weight_scale.value
-        qa_valid = self.q_a_proj.n_out_valid or int(w_qa.shape[0])
-        kva_valid = self.kv_a_proj_with_mqa.n_out_valid or int(w_kva.shape[0])
-        qa_pad = int(w_qa.shape[0])
-        kva_pad = int(w_kva.shape[0])
 
-        has_wk = (
-            fuse_wk
-            and self.indexer is not None
-            and isinstance(self.indexer.wk, QuantizedLinear)
-            and self.indexer.wk.kernel_axes == (None, None)
-            and self.indexer.wk.bias is None
-            and isinstance(self.indexer.wk.weight_q.value, jax.Array)
-            and isinstance(self.indexer.wk.weight_scale.value, jax.Array)
-            and not isinstance(self.indexer.wk.weight_q.value, jax.ShapeDtypeStruct)
-            and not isinstance(self.indexer.wk.weight_scale.value, jax.ShapeDtypeStruct)
-            and getattr(self.indexer.wk.weight_scale.value, "ndim", 0) == 3
-        )
-        if has_wk:
-            self.indexer.wk.pad_out_rows(256)
-            w_wk = self.indexer.wk.weight_q.value
-            s_wk = self.indexer.wk.weight_scale.value
-            wk_valid = self.indexer.wk.n_out_valid or int(w_wk.shape[0])
-            w_fused = jnp.concatenate([w_qa, w_kva, w_wk], axis=0)
-            s_fused = jnp.concatenate([s_qa, s_kva, s_wk], axis=2)
-            self._qkv_a_has_wk = True
-            self._qkv_a_offsets = (
-                qa_valid,
-                qa_pad,
-                qa_pad + kva_valid,
-                qa_pad + kva_pad,
-                qa_pad + kva_pad + wk_valid,
+        if s_ndim == 1:
+            qa_valid = self.q_a_proj.n_out_valid or int(w_qa.shape[0])
+            kva_valid = self.kv_a_proj_with_mqa.n_out_valid or int(w_kva.shape[0])
+            w_qa = w_qa[:qa_valid, :]
+            s_qa = s_qa[:qa_valid]
+            w_kva = w_kva[:kva_valid, :]
+            s_kva = s_kva[:kva_valid]
+
+            def _pad_rows_1d(w_arr: jax.Array, s_arr: jax.Array, mult: int = 128):
+                rem = int(w_arr.shape[0]) % mult
+                if rem == 0:
+                    return w_arr, s_arr
+                pad_r = mult - rem
+                return (
+                    jnp.pad(w_arr, ((0, pad_r), (0, 0))),
+                    jnp.pad(s_arr, (0, pad_r), constant_values=1.0),
+                )
+
+            w_qa, s_qa = _pad_rows_1d(w_qa, s_qa, 128)
+            w_kva, s_kva = _pad_rows_1d(w_kva, s_kva, 128)
+            qa_pad = int(w_qa.shape[0])
+            kva_pad = int(w_kva.shape[0])
+
+            has_wk = (
+                fuse_wk
+                and self.indexer is not None
+                and isinstance(self.indexer.wk, QuantizedLinear)
+                and self.indexer.wk.kernel_axes == (None, None)
+                and self.indexer.wk.bias is None
+                and isinstance(self.indexer.wk.weight_q.value, jax.Array)
+                and isinstance(self.indexer.wk.weight_scale.value, jax.Array)
+                and not isinstance(self.indexer.wk.weight_q.value, jax.ShapeDtypeStruct)
+                and not isinstance(self.indexer.wk.weight_scale.value, jax.ShapeDtypeStruct)
+                and getattr(self.indexer.wk.weight_scale.value, "ndim", 0) == 1
             )
+            if has_wk:
+                w_wk = self.indexer.wk.weight_q.value
+                s_wk = self.indexer.wk.weight_scale.value
+                wk_valid = self.indexer.wk.n_out_valid or int(w_wk.shape[0])
+                w_wk, s_wk = _pad_rows_1d(w_wk[:wk_valid, :], s_wk[:wk_valid], 128)
+                w_fused = jnp.concatenate([w_qa, w_kva, w_wk], axis=0)
+                s_fused = jnp.concatenate([s_qa, s_kva, s_wk], axis=0)
+                self._qkv_a_has_wk = True
+                self._qkv_a_offsets = (
+                    qa_valid,
+                    qa_pad,
+                    qa_pad + kva_valid,
+                    qa_pad + kva_pad,
+                    qa_pad + kva_pad + wk_valid,
+                )
+            else:
+                w_fused = jnp.concatenate([w_qa, w_kva], axis=0)
+                s_fused = jnp.concatenate([s_qa, s_kva], axis=0)
+                self._qkv_a_has_wk = False
+                self._qkv_a_offsets = (
+                    qa_valid,
+                    qa_pad,
+                    qa_pad + kva_valid,
+                    0,
+                    0,
+                )
         else:
-            w_fused = jnp.concatenate([w_qa, w_kva], axis=0)
-            s_fused = jnp.concatenate([s_qa, s_kva], axis=2)
-            self._qkv_a_has_wk = False
-            self._qkv_a_offsets = (
-                qa_valid,
-                qa_pad,
-                qa_pad + kva_valid,
-                0,
-                0,
-            )
+            self.q_a_proj.pad_out_rows(256)
+            self.kv_a_proj_with_mqa.pad_out_rows(256)
+            w_qa = self.q_a_proj.weight_q.value
+            s_qa = self.q_a_proj.weight_scale.value
+            w_kva = self.kv_a_proj_with_mqa.weight_q.value
+            s_kva = self.kv_a_proj_with_mqa.weight_scale.value
+            qa_valid = self.q_a_proj.n_out_valid or int(w_qa.shape[0])
+            kva_valid = self.kv_a_proj_with_mqa.n_out_valid or int(w_kva.shape[0])
+            qa_pad = int(w_qa.shape[0])
+            kva_pad = int(w_kva.shape[0])
 
-        # Pad total output rows to a multiple of 1024 (e.g. 2816 -> 3072) so
-        # out_block_size = 1024 divides n_out without any runtime jnp.pad.
-        rem_1024 = int(w_fused.shape[0]) % 1024
-        if rem_1024 != 0:
-            pad_rows = 1024 - rem_1024
-            w_fused = jnp.pad(w_fused, ((0, pad_rows), (0, 0)))
-            s_fused = jnp.pad(s_fused, ((0, 0), (0, 0), (0, pad_rows)))
+            has_wk = (
+                fuse_wk
+                and self.indexer is not None
+                and isinstance(self.indexer.wk, QuantizedLinear)
+                and self.indexer.wk.kernel_axes == (None, None)
+                and self.indexer.wk.bias is None
+                and isinstance(self.indexer.wk.weight_q.value, jax.Array)
+                and isinstance(self.indexer.wk.weight_scale.value, jax.Array)
+                and not isinstance(self.indexer.wk.weight_q.value, jax.ShapeDtypeStruct)
+                and not isinstance(self.indexer.wk.weight_scale.value, jax.ShapeDtypeStruct)
+                and getattr(self.indexer.wk.weight_scale.value, "ndim", 0) == 3
+            )
+            if has_wk:
+                self.indexer.wk.pad_out_rows(256)
+                w_wk = self.indexer.wk.weight_q.value
+                s_wk = self.indexer.wk.weight_scale.value
+                wk_valid = self.indexer.wk.n_out_valid or int(w_wk.shape[0])
+                w_fused = jnp.concatenate([w_qa, w_kva, w_wk], axis=0)
+                s_fused = jnp.concatenate([s_qa, s_kva, s_wk], axis=2)
+                self._qkv_a_has_wk = True
+                self._qkv_a_offsets = (
+                    qa_valid,
+                    qa_pad,
+                    qa_pad + kva_valid,
+                    qa_pad + kva_pad,
+                    qa_pad + kva_pad + wk_valid,
+                )
+            else:
+                w_fused = jnp.concatenate([w_qa, w_kva], axis=0)
+                s_fused = jnp.concatenate([s_qa, s_kva], axis=2)
+                self._qkv_a_has_wk = False
+                self._qkv_a_offsets = (
+                    qa_valid,
+                    qa_pad,
+                    qa_pad + kva_valid,
+                    0,
+                    0,
+                )
+
+            # Pad total output rows to a multiple of 1024 (e.g. 2816 -> 3072) so
+            # out_block_size = 1024 divides n_out without any runtime jnp.pad.
+            rem_1024 = int(w_fused.shape[0]) % 1024
+            if rem_1024 != 0:
+                pad_rows = 1024 - rem_1024
+                w_fused = jnp.pad(w_fused, ((0, pad_rows), (0, 0)))
+                s_fused = jnp.pad(s_fused, ((0, 0), (0, 0), (0, pad_rows)))
 
         fused_proj = QuantizedLinear(
             weight_q=w_fused,
@@ -933,7 +1152,9 @@ def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
     fused_with_wk = 0
     fused_no_wk = 0
     fused_bf16_wk_w = 0
+    fused_gate_up = 0
     allow_qkv_a = os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") != "0"
+    allow_gate_up = os.environ.get("SGLANG_JAX_FUSE_GATE_UP", "1") != "0"
     for _, sub in module.iter_modules():
         if isinstance(sub, Glm5Attention):
             if allow_qkv_a and sub.fuse_qkv_a_proj():
@@ -943,10 +1164,13 @@ def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
                     fused_no_wk += 1
             if sub.indexer is not None and sub.indexer.fuse_wk_weights_proj():
                 fused_bf16_wk_w += 1
+        elif isinstance(sub, Glm5MLP) and allow_gate_up:
+            if sub.fuse_gate_up_proj():
+                fused_gate_up += 1
     total = fused_with_wk + fused_no_wk
     if total:
         logger.info(
-            "Fused %d Glm5Attention input projections into (3072, 6144) QuantizedLinear "
+            "Fused %d Glm5Attention input projections into QuantizedLinear "
             "(with_wk=%d, shared_no_wk=%d)",
             total,
             fused_with_wk,
@@ -957,7 +1181,12 @@ def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
             "Fused %d GlmDsaIndexer standalone BF16 (wk + weights_proj) projections",
             fused_bf16_wk_w,
         )
-    return total + fused_bf16_wk_w
+    if fused_gate_up:
+        logger.info(
+            "Fused %d Glm5MLP (gate_proj + up_proj) per-channel QuantizedLinear projections",
+            fused_gate_up,
+        )
+    return total + fused_bf16_wk_w + fused_gate_up
 
 
 class Glm5MLP(nnx.Module):
@@ -1005,6 +1234,7 @@ class Glm5MLP(nnx.Module):
         )
 
         self.act_fn = jax.nn.silu
+        self.gate_up_proj = nnx.data(None) if hasattr(nnx, "data") else None
 
         if use_fused:
             tp_size = mesh.shape["tensor"]
@@ -1076,6 +1306,69 @@ class Glm5MLP(nnx.Module):
             )
         return tuple(result)
 
+    def fuse_gate_up_proj(self, drop_originals: bool = True) -> bool:
+        """Fuse unsharded/1-shard per-channel ``gate_proj`` + ``up_proj`` into one ``QuantizedLinear``."""
+        if self.use_fused or self.gate_up_proj is not None:
+            return False
+        if not (
+            isinstance(self.gate_proj, QuantizedLinear)
+            and isinstance(self.up_proj, QuantizedLinear)
+        ):
+            return False
+        if (
+            self.gate_proj.bias is not None
+            or self.up_proj.bias is not None
+            or self.gate_proj.kernel_axes != self.up_proj.kernel_axes
+            or self.gate_proj.kernel_axes[0] is not None
+            or self.gate_proj.weight_block_size is not None
+            or self.up_proj.weight_block_size is not None
+        ):
+            return False
+        out_axis = self.gate_proj.kernel_axes[1]
+        if out_axis is not None and int(self.mesh.shape.get(out_axis, 1)) > 1:
+            return False
+        wg = self.gate_proj.weight_q.value
+        sg = self.gate_proj.weight_scale.value
+        wu = self.up_proj.weight_q.value
+        su = self.up_proj.weight_scale.value
+        if (
+            not isinstance(wg, jax.Array)
+            or not isinstance(sg, jax.Array)
+            or not isinstance(wu, jax.Array)
+            or not isinstance(su, jax.Array)
+            or isinstance(wg, jax.ShapeDtypeStruct)
+            or isinstance(sg, jax.ShapeDtypeStruct)
+            or isinstance(wu, jax.ShapeDtypeStruct)
+            or isinstance(su, jax.ShapeDtypeStruct)
+            or getattr(sg, "ndim", 0) != 1
+            or getattr(su, "ndim", 0) != 1
+            or wg.shape != wu.shape
+        ):
+            return False
+        w_sh = NamedSharding(self.mesh, P(out_axis, None))
+        s_sh = NamedSharding(self.mesh, P(out_axis))
+        w_fused = jax.sharding.reshard(jnp.concatenate([wg, wu], axis=0), w_sh)
+        s_fused = jax.sharding.reshard(jnp.concatenate([sg, su], axis=0), s_sh)
+        fused = QuantizedLinear(
+            weight_q=w_fused,
+            weight_scale=s_fused,
+            bias=None,
+            activation_dtype=self.gate_proj.activation_dtype,
+            mesh=self.mesh,
+            kernel_axes=self.gate_proj.kernel_axes,
+            skip_bias_add=False,
+            params_dtype=self.gate_proj.params_dtype,
+            compute_dtype=self.gate_proj.compute_dtype,
+            weight_block_size=None,
+            allow_narrow_n_blockwise=False,
+            scope_name="quantized_gate_up_proj",
+        )
+        self.gate_up_proj = nnx.data(fused) if hasattr(nnx, "data") else fused
+        if drop_originals:
+            self.gate_proj = nnx.data(None) if hasattr(nnx, "data") else None
+            self.up_proj = nnx.data(None) if hasattr(nnx, "data") else None
+        return True
+
     def __call__(self, hidden_states: jax.Array):
         if self.use_fused and hasattr(self, "w_gu"):
             seq_len, _ = hidden_states.shape
@@ -1091,8 +1384,12 @@ class Glm5MLP(nnx.Module):
             )
 
         # Fallback non-fused path
-        a1, _ = self.gate_proj(hidden_states)
-        a2, _ = self.up_proj(hidden_states)
+        if self.gate_up_proj is not None:
+            gu, _ = self.gate_up_proj(hidden_states)
+            a1, a2 = jnp.split(gu, 2, axis=-1)
+        else:
+            a1, _ = self.gate_proj(hidden_states)
+            a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
         if getattr(self.down_proj, "kernel_axes", (None, None))[0] is None:
             # Block-quantized down_proj whose reduce dim does not split into whole
@@ -1738,6 +2035,7 @@ class Glm5ForCausalLM(nnx.Module):
                 gc.collect()
         else:
             loader.load(weight_mappings)
+        requantize_static_block_fp8_model(self)
         fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
 
@@ -2257,6 +2555,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         # MLA absorption and fused-MLP packing run inside loader.load via the
         # modules' prepare_weight_loading hooks (#1716); no post-load pass.
         self.loader.load(mappings)
+        requantize_static_block_fp8_model(self)
         fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
 

@@ -20,6 +20,57 @@ from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 logger = logging.getLogger(__name__)
 
 
+@partial(
+    jax.jit,
+    static_argnames=("mesh", "input_axis", "output_axis", "block_k", "reduce_input_axis"),
+)
+def _requantize_linear_block_fp8(
+    w_q: jax.Array,
+    s_3d: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    input_axis: str | None,
+    output_axis: str | None,
+    block_k: int,
+    reduce_input_axis: bool,
+) -> tuple[jax.Array, jax.Array]:
+    w_spec = P(output_axis, input_axis)
+    s_in_spec = P(input_axis, None, output_axis)
+    s_out_spec = P(output_axis)
+    fmax = float(jnp.finfo(w_q.dtype).max)
+
+    def _local(w_loc: jax.Array, s_loc: jax.Array) -> tuple[jax.Array, jax.Array]:
+        n_out_loc, n_in_loc = w_loc.shape
+        in_blocks_loc = s_loc.shape[0]
+        eff_bk = (
+            block_k
+            if in_blocks_loc * block_k >= n_in_loc
+            else (n_in_loc + in_blocks_loc - 1) // in_blocks_loc
+        )
+        if n_in_loc == in_blocks_loc * eff_bk:
+            w_f32 = (
+                w_loc.reshape(n_out_loc, in_blocks_loc, eff_bk).astype(jnp.float32)
+                * jnp.transpose(s_loc[:, 0, :], (1, 0))[:, :, None]
+            ).reshape(n_out_loc, n_in_loc)
+        else:
+            s_2d = jnp.repeat(s_loc[:, 0, :], eff_bk, axis=0)[:n_in_loc, :].T
+            w_f32 = w_loc.astype(jnp.float32) * s_2d
+        amax = jnp.max(jnp.abs(w_f32), axis=1)
+        if reduce_input_axis and input_axis is not None:
+            amax = lax.pmax(amax, axis_name=input_axis)
+        new_s = jnp.where(amax == 0.0, jnp.float32(1.0), amax / jnp.float32(fmax))
+        new_w = jnp.clip(w_f32 / new_s[:, None], -fmax, fmax).astype(w_loc.dtype)
+        return new_w, new_s
+
+    return shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(w_spec, s_in_spec),
+        out_specs=(w_spec, s_out_spec),
+        check_vma=False,
+    )(w_q, s_3d)
+
+
 def _shard_map_output_partition_dim(
     sharding: jax.sharding.Sharding, axis_name: str | None
 ) -> int | None:
@@ -538,6 +589,65 @@ class QuantizedLinear(nnx.Module):
         self.n_out_valid = n_local
         return True
 
+    def requantize_block_to_per_channel(self) -> bool:
+        """Convert a static 2D block-scaled FP8 linear in-place to 1D per-channel FP8.
+
+        Replaces the 3D ``[in_blocks, 1, n_out]`` block scale with a 1D ``[n_out]``
+        per-output-channel scale so runtime execution uses native XLA W8A8
+        ``lax.dot_general`` instead of the Pallas blockwise VPU-accumulation kernel.
+        """
+        w_q = self.weight_q.value
+        s_val = self.weight_scale.value
+        if (
+            not isinstance(w_q, jax.Array)
+            or not isinstance(s_val, jax.Array)
+            or isinstance(w_q, jax.ShapeDtypeStruct)
+            or isinstance(s_val, jax.ShapeDtypeStruct)
+        ):
+            return False
+        if getattr(s_val, "ndim", 0) != 3 or self.weight_block_size is None:
+            return False
+        fp8_dtypes = tuple(
+            getattr(jnp, name)
+            for name in ("float8_e4m3fn", "float8_e5m2")
+            if hasattr(jnp, name)
+        )
+        if w_q.dtype not in fp8_dtypes:
+            return False
+
+        if self.n_out_valid is not None:
+            out_axis = self.kernel_axes[1]
+            shards = int(self.mesh.shape[out_axis]) if out_axis is not None else 1
+            valid_global = self.n_out_valid * shards
+            if valid_global < int(w_q.shape[0]):
+                w_q = w_q[:valid_global, :]
+                s_val = s_val[:, :, :valid_global]
+
+        input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+        w_spec = P(output_axis, input_axis)
+        s_in_spec = P(input_axis, None, output_axis)
+        w_q = jax.sharding.reshard(w_q, NamedSharding(self.mesh, w_spec))
+        s_val = jax.sharding.reshard(s_val, NamedSharding(self.mesh, s_in_spec))
+        block_k = int(self.weight_block_size[1])
+        reduce_input_axis = (
+            input_axis is not None and int(self.mesh.shape.get(input_axis, 1)) > 1
+        )
+        new_wq, new_scale = _requantize_linear_block_fp8(
+            w_q,
+            s_val,
+            mesh=self.mesh,
+            input_axis=input_axis,
+            output_axis=output_axis,
+            block_k=block_k,
+            reduce_input_axis=reduce_input_axis,
+        )
+        self.weight_q.value = new_wq
+        self.weight_scale.value = new_scale
+        self.weight_block_size = None
+        self.allow_narrow_n_blockwise = False
+        self.n_out_valid = None
+        return True
+
     def __call__(
         self,
         x: jax.Array,
@@ -664,7 +774,11 @@ def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256)
         if sub.pad_out_rows(multiple):
             count += 1
             padded[leaf] = padded.get(leaf, 0) + 1
-        elif n_local % multiple != 0 and sub.n_out_valid is None:
+        elif (
+            n_local % multiple != 0
+            and sub.n_out_valid is None
+            and getattr(sub.weight_scale.value, "ndim", -1) == 3
+        ):
             scale = sub.weight_scale.value
             key = f"{leaf}:scale-ndim-{getattr(scale, 'ndim', -1)}"
             skipped[key] = skipped.get(key, 0) + 1

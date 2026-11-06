@@ -431,12 +431,15 @@ class ModelConfig:
                     "modules_to_not_convert"
                 )
                 moe_activation_dtype = None
+                linear_activation_dtype = None
                 if hf_quant_config.get("activation_scheme") == "dynamic":
                     logger.info(
                         "Detected dynamic FP8 activation scheme in checkpoint, "
-                        "enabling MoE activation quantization"
+                        "enabling linear and MoE activation quantization"
                     )
                     moe_activation_dtype = jnp.float8_e4m3fn
+                    if os.environ.get("SGLANG_JAX_STATIC_FP8_LINEAR_W8A16", "0") != "1":
+                        linear_activation_dtype = "float8_e4m3fn"
                 weight_block_size = hf_quant_config.get("weight_block_size")
                 if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
                     weight_block_size = (int(weight_block_size[0]), int(weight_block_size[1]))
@@ -448,7 +451,7 @@ class ModelConfig:
                         {
                             "module_path": ".*",
                             "weight_dtype": "float8_e4m3fn",
-                            "activation_dtype": None,
+                            "activation_dtype": linear_activation_dtype,
                         }
                     ],
                     moe_weight_dtype=jnp.float8_e4m3fn,
