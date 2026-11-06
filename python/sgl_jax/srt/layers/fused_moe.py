@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -505,14 +507,36 @@ class FusedEPMoE(nnx.Module):
         assert hidden_states.ndim == 2
         orig_num_tokens = hidden_states.shape[0]
         mesh_ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
         if orig_num_tokens % mesh_ep_size != 0:
             padded_num_tokens = (
                 (orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size
             ) * mesh_ep_size
             pad_t = padded_num_tokens - orig_num_tokens
-            hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
-            topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0.0)
-            topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
+
+            def _pad_and_reshard(hs_in, tw_in, ti_in):
+                hs_p = jnp.pad(hs_in, ((0, pad_t), (0, 0)))
+                tw_p = jnp.pad(tw_in, ((0, pad_t), (0, 0)), constant_values=0.0)
+                ti_p = jnp.pad(ti_in, ((0, pad_t), (0, 0)), constant_values=-1)
+                return (
+                    jax.sharding.reshard(hs_p, kernel_sharding),
+                    jax.sharding.reshard(tw_p, kernel_sharding),
+                    jax.sharding.reshard(ti_p, kernel_sharding),
+                )
+
+            if getattr(self.mesh, "_any_axis_explicit", False):
+                hidden_states, topk_weights, topk_ids = jax.sharding.auto_axes(
+                    _pad_and_reshard,
+                    out_sharding=(kernel_sharding, kernel_sharding, kernel_sharding),
+                )(hidden_states, topk_weights, topk_ids)
+            else:
+                hidden_states, topk_weights, topk_ids = _pad_and_reshard(
+                    hidden_states, topk_weights, topk_ids
+                )
+        else:
+            hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
+            topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
+            topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -587,8 +611,250 @@ class FusedEPMoEV2(FusedEPMoE):
     """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
 
     Inherits weight init and quantization from FusedEPMoE. Overrides __call__
-    to dispatch to fused_ep_moe_v2 with v2-specific flags.
+    to dispatch to fused_ep_moe_v2 with v2-specific flags, with an optional
+    small-batch megablox gmm_v2 fast path (SGL_MOE_FUSED_MIN_TOKENS) for decode.
     """
+
+    def _forward_small_batch_ep_gmm(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w3_scale: jax.Array | None,
+        w1_shared: jax.Array | None,
+        w2_shared: jax.Array | None,
+        w3_shared: jax.Array | None,
+        w1_shared_scale: jax.Array | None,
+        w2_shared_scale: jax.Array | None,
+        w3_shared_scale: jax.Array | None,
+        enable_act_quant: bool,
+        swiglu_limit: float | None,
+        shared_swiglu_limit: float | None,
+    ) -> jax.Array:
+        """Small-batch EP-MoE path using all-gather + megablox gmm_v2 + reduce-scatter.
+
+        Avoids fused_ep_moe_v2's SparseCore sync barrier + dynamic ragged-all-to-all
+        overhead on small decode batches (T < SGL_MOE_FUSED_MIN_TOKENS) while reusing
+        FusedEPMoEV2's exact EP-sharded weights (zero extra HBM).
+        """
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import activation_fn
+        from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+
+        ep_axis = ("data", "tensor")
+        dp_size = int(self.mesh.shape["data"])
+        tp_size = int(self.mesh.shape["tensor"])
+        mesh_ep_size = dp_size * tp_size
+        top_k = self.num_experts_per_tok
+        num_experts = self.num_experts
+        act_fn_name = self.activation
+        act_q_dtype = self.activation_quantized_dtype if enable_act_quant else None
+
+        ep_tok_spec = P(ep_axis, None)
+        ep_w_spec = P(ep_axis, None, None)
+        ep_s_spec = P(ep_axis, None, None, None)
+        rep_2d_spec = P(None, None)
+
+        def _shard_fn(
+            hs_local,
+            tw_local,
+            ti_local,
+            w1_loc,
+            w2_loc,
+            w3_loc,
+            w1_s_loc,
+            w2_s_loc,
+            w3_s_loc,
+            w1_se,
+            w2_se,
+            w3_se,
+            w1_se_s,
+            w2_se_s,
+            w3_se_s,
+        ):
+            # 1. Compute shared expert locally on each device's [T_local, H] slice
+            #    (zero collectives; overlaps on MXU with ICI all-gather of hs_local).
+            shared_local = None
+            if w1_se is not None:
+                se_w_quant = w1_se_s is not None
+                if enable_act_quant and se_w_quant:
+                    hs_f32 = hs_local.astype(jnp.float32)
+                    hs_amax = jnp.max(jnp.abs(hs_f32), axis=-1, keepdims=True)
+                    hs_sc = jnp.maximum(hs_amax / jnp.float32(448.0), jnp.float32(1e-12))
+                    hs_fp8 = (hs_f32 / hs_sc).astype(jnp.float8_e4m3fn)
+                    gate_se = jnp.dot(
+                        hs_fp8, w1_se, preferred_element_type=jnp.float32
+                    ) * (hs_sc * w1_se_s)
+                    up_se = jnp.dot(
+                        hs_fp8, w3_se, preferred_element_type=jnp.float32
+                    ) * (hs_sc * w3_se_s)
+                    act_se = activation_fn(
+                        gate_se, up_se, act_fn_name, shared_swiglu_limit
+                    )
+                    act_amax = jnp.max(jnp.abs(act_se), axis=-1, keepdims=True)
+                    act_sc = jnp.maximum(act_amax / jnp.float32(448.0), jnp.float32(1e-12))
+                    act_fp8 = (act_se / act_sc).astype(jnp.float8_e4m3fn)
+                    shared_local = (
+                        jnp.dot(act_fp8, w2_se, preferred_element_type=jnp.float32)
+                        * (act_sc * w2_se_s)
+                    ).astype(hs_local.dtype)
+                elif se_w_quant:
+                    w1_bf16 = (w1_se.astype(jnp.float32) * w1_se_s).astype(hs_local.dtype)
+                    w3_bf16 = (w3_se.astype(jnp.float32) * w3_se_s).astype(hs_local.dtype)
+                    gate_se = jnp.dot(
+                        hs_local, w1_bf16, preferred_element_type=jnp.float32
+                    )
+                    up_se = jnp.dot(
+                        hs_local, w3_bf16, preferred_element_type=jnp.float32
+                    )
+                    act_se = activation_fn(
+                        gate_se, up_se, act_fn_name, shared_swiglu_limit
+                    )
+                    w2_bf16 = (w2_se.astype(jnp.float32) * w2_se_s).astype(hs_local.dtype)
+                    shared_local = jnp.dot(
+                        act_se.astype(hs_local.dtype),
+                        w2_bf16,
+                        preferred_element_type=jnp.float32,
+                    ).astype(hs_local.dtype)
+                else:
+                    gate_se = jnp.dot(hs_local, w1_se, preferred_element_type=jnp.float32)
+                    up_se = jnp.dot(hs_local, w3_se, preferred_element_type=jnp.float32)
+                    act_se = activation_fn(
+                        gate_se, up_se, act_fn_name, shared_swiglu_limit
+                    )
+                    shared_local = jnp.dot(
+                        act_se.astype(hs_local.dtype),
+                        w2_se,
+                        preferred_element_type=jnp.float32,
+                    ).astype(hs_local.dtype)
+
+            # 2. All-gather tokens and routing metadata across the EP mesh.
+            if mesh_ep_size > 1:
+                my_ep = jax.lax.axis_index("data") * tp_size + jax.lax.axis_index("tensor")
+                hs_all = jax.lax.all_gather(hs_local, axis_name=ep_axis, axis=0, tiled=True)
+                tw_all = jax.lax.all_gather(tw_local, axis_name=ep_axis, axis=0, tiled=True)
+                ti_all = jax.lax.all_gather(ti_local, axis_name=ep_axis, axis=0, tiled=True)
+            else:
+                my_ep = jnp.int32(0)
+                hs_all = hs_local
+                tw_all = tw_local
+                ti_all = ti_local
+
+            # Map invalid/padded routing slots (e.g. topk_ids == -1) to expert 0
+            # with zero routing weight so argsort and bincount stay 1:1 aligned.
+            valid_slot = (ti_all >= 0) & (ti_all < num_experts)
+            safe_ids = jnp.where(valid_slot, ti_all, 0)
+            safe_weights = jnp.where(valid_slot, tw_all, 0.0)
+
+            flat_ids = jnp.ravel(safe_ids)
+            sorted_pos = jnp.argsort(flat_ids, stable=True)
+            token_indices = sorted_pos // top_k
+            group_sizes = jnp.bincount(flat_ids, length=num_experts).astype(jnp.int32)
+
+            lhs = hs_all[token_indices]
+            local_num_experts = w1_loc.shape[0]
+            group_offset = jnp.asarray(my_ep * local_num_experts, dtype=jnp.int32)
+
+            gmm_kwargs = dict(
+                group_sizes=group_sizes,
+                preferred_element_type=hs_local.dtype,
+                group_offset=group_offset,
+                maybe_quantize_lhs=enable_act_quant,
+                acc_dtype=jnp.float32,
+                activation_quantized_dtype=act_q_dtype,
+            )
+            gate_out = gmm(
+                lhs=lhs,
+                rhs=w1_loc,
+                rhs_scale=w1_s_loc,
+                zero_initialize=False,
+                **gmm_kwargs,
+            )
+            up_out = gmm(
+                lhs=lhs,
+                rhs=w3_loc,
+                rhs_scale=w3_s_loc,
+                zero_initialize=False,
+                **gmm_kwargs,
+            )
+            inter = activation_fn(
+                gate_out.astype(jnp.float32),
+                up_out.astype(jnp.float32),
+                act_fn_name,
+                swiglu_limit,
+            ).astype(hs_local.dtype)
+            down_out = gmm(
+                lhs=inter,
+                rhs=w2_loc,
+                rhs_scale=w2_s_loc,
+                zero_initialize=True,
+                **gmm_kwargs,
+            )
+
+            total_routed = flat_ids.shape[0]
+            inv_pos = (
+                jnp.zeros(total_routed, dtype=jnp.int32)
+                .at[sorted_pos]
+                .set(jnp.arange(total_routed, dtype=jnp.int32))
+            )
+            unsorted = jnp.take(down_out, indices=inv_pos, axis=0)
+            routed_all = jnp.einsum(
+                "tkh,tk->th",
+                unsorted.reshape(hs_all.shape[0], top_k, -1).astype(jnp.float32),
+                safe_weights.astype(jnp.float32),
+            ).astype(hs_local.dtype)
+
+            if mesh_ep_size > 1:
+                routed_local = jax.lax.psum_scatter(
+                    routed_all, axis_name=ep_axis, scatter_dimension=0, tiled=True
+                )
+            else:
+                routed_local = routed_all
+
+            return routed_local + shared_local if shared_local is not None else routed_local
+
+        in_specs = (
+            ep_tok_spec,
+            ep_tok_spec,
+            ep_tok_spec,
+            ep_w_spec,
+            ep_w_spec,
+            ep_w_spec,
+            ep_s_spec if w1_scale is not None else None,
+            ep_s_spec if w2_scale is not None else None,
+            ep_s_spec if w3_scale is not None else None,
+            rep_2d_spec if w1_shared is not None else None,
+            rep_2d_spec if w2_shared is not None else None,
+            rep_2d_spec if w3_shared is not None else None,
+            rep_2d_spec if w1_shared_scale is not None else None,
+            rep_2d_spec if w2_shared_scale is not None else None,
+            rep_2d_spec if w3_shared_scale is not None else None,
+        )
+        return jax.shard_map(
+            _shard_fn,
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=ep_tok_spec,
+            check_vma=False,
+        )(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.w1.value,
+            self.w2.value,
+            self.w3.value,
+            w1_scale,
+            w2_scale,
+            w3_scale,
+            w1_shared,
+            w2_shared,
+            w3_shared,
+            w1_shared_scale,
+            w2_shared_scale,
+            w3_shared_scale,
+        )
 
     def __call__(
         self,
@@ -609,14 +875,36 @@ class FusedEPMoEV2(FusedEPMoE):
         assert hidden_states.ndim == 2
         orig_num_tokens = hidden_states.shape[0]
         mesh_ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
         if orig_num_tokens % mesh_ep_size != 0:
             padded_num_tokens = (
                 (orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size
             ) * mesh_ep_size
             pad_t = padded_num_tokens - orig_num_tokens
-            hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
-            topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0.0)
-            topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
+
+            def _pad_and_reshard(hs_in, tw_in, ti_in):
+                hs_p = jnp.pad(hs_in, ((0, pad_t), (0, 0)))
+                tw_p = jnp.pad(tw_in, ((0, pad_t), (0, 0)), constant_values=0.0)
+                ti_p = jnp.pad(ti_in, ((0, pad_t), (0, 0)), constant_values=-1)
+                return (
+                    jax.sharding.reshard(hs_p, kernel_sharding),
+                    jax.sharding.reshard(tw_p, kernel_sharding),
+                    jax.sharding.reshard(ti_p, kernel_sharding),
+                )
+
+            if getattr(self.mesh, "_any_axis_explicit", False):
+                hidden_states, topk_weights, topk_ids = jax.sharding.auto_axes(
+                    _pad_and_reshard,
+                    out_sharding=(kernel_sharding, kernel_sharding, kernel_sharding),
+                )(hidden_states, topk_weights, topk_ids)
+            else:
+                hidden_states, topk_weights, topk_ids = _pad_and_reshard(
+                    hidden_states, topk_weights, topk_ids
+                )
+        else:
+            hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
+            topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
+            topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -651,56 +939,75 @@ class FusedEPMoEV2(FusedEPMoE):
             else ("per_channel" if quant_block_k is None else "blockwise")
         )
 
-        if block_config is None:
-            block_config = get_tuned_fused_moe_v2_block_config(
-                num_tokens=hidden_states.shape[0],
-                num_experts=self.num_experts,
-                top_k=self.num_experts_per_tok,
-                hidden_size=self.hidden_size,
-                intermediate_size=self.intermediate_dim,
-                dtype=hidden_states.dtype,
-                weight_dtype=self.w1.value.dtype,
-                ep_size=self.ep_size,
-                use_shared_expert=self.w1_shared is not None,
-                use_grouped_topk=self.use_grouped_topk,
+        fused_min_tokens = int(os.environ.get("SGL_MOE_FUSED_MIN_TOKENS", "0") or "0")
+        if (
+            fused_min_tokens > 0
+            and hidden_states.shape[0] < fused_min_tokens
+            and self.num_experts % mesh_ep_size == 0
+        ):
+            output = self._forward_small_batch_ep_gmm(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w3_scale=w3_scale,
+                w1_shared=w1_shared_val,
+                w2_shared=w2_shared_val,
+                w3_shared=w3_shared_val,
+                w1_shared_scale=w1_shared_scale,
+                w2_shared_scale=w2_shared_scale,
+                w3_shared_scale=w3_shared_scale,
                 enable_act_quant=enable_act_quant,
-                quant_mode=quant_mode,
+                swiglu_limit=swiglu_limit,
+                shared_swiglu_limit=shared_swiglu_limit,
             )
+        else:
+            if block_config is None:
+                block_config = get_tuned_fused_moe_v2_block_config(
+                    num_tokens=hidden_states.shape[0],
+                    num_experts=self.num_experts,
+                    top_k=self.num_experts_per_tok,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_dim,
+                    dtype=hidden_states.dtype,
+                    weight_dtype=self.w1.value.dtype,
+                    ep_size=self.ep_size,
+                    use_shared_expert=self.w1_shared is not None,
+                    use_grouped_topk=self.use_grouped_topk,
+                    enable_act_quant=enable_act_quant,
+                    quant_mode=quant_mode,
+                )
 
-        direct_scaled_dot = w1_scale is not None
-        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
-        hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
-        topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
-        topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
-
-        output = fused_ep_moe_v2(
-            self.mesh,
-            hidden_states,
-            self.w1.value,
-            self.w2.value,
-            self.w3.value,
-            topk_weights,
-            topk_ids,
-            self.num_experts_per_tok,
-            act_fn=self.activation,
-            swiglu_limit=swiglu_limit,
-            shared_swiglu_limit=shared_swiglu_limit,
-            block_config=block_config,
-            quant_block_k=quant_block_k,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w3_scale=w3_scale,
-            w1_shared=w1_shared_val,
-            w2_shared=w2_shared_val,
-            w3_shared=w3_shared_val,
-            w1_shared_scale=w1_shared_scale,
-            w2_shared_scale=w2_shared_scale,
-            w3_shared_scale=w3_shared_scale,
-            enable_act_quant=enable_act_quant,
-            direct_scaled_dot=direct_scaled_dot,
-            dp_axis_name="data",
-            tp_axis_name="tensor",
-        )
+            direct_scaled_dot = w1_scale is not None
+            output = fused_ep_moe_v2(
+                self.mesh,
+                hidden_states,
+                self.w1.value,
+                self.w2.value,
+                self.w3.value,
+                topk_weights,
+                topk_ids,
+                self.num_experts_per_tok,
+                act_fn=self.activation,
+                swiglu_limit=swiglu_limit,
+                shared_swiglu_limit=shared_swiglu_limit,
+                block_config=block_config,
+                quant_block_k=quant_block_k,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w3_scale=w3_scale,
+                w1_shared=w1_shared_val,
+                w2_shared=w2_shared_val,
+                w3_shared=w3_shared_val,
+                w1_shared_scale=w1_shared_scale,
+                w2_shared_scale=w2_shared_scale,
+                w3_shared_scale=w3_shared_scale,
+                enable_act_quant=enable_act_quant,
+                direct_scaled_dot=direct_scaled_dot,
+                dp_axis_name="data",
+                tp_axis_name="tensor",
+            )
 
         # Reshard the MoE output to the caller-requested layout. Under sequence
         # parallelism out_sharding carries the SP-aware reduce_sharding
@@ -708,11 +1015,24 @@ class FusedEPMoEV2(FusedEPMoE):
         # plain DP layout P('data', None). b79f9951 dropped this arg and hardcoded
         # the DP layout, which silently broke SP for MoE layers — restored here.
         if out_sharding is not None:
-            output = jax.sharding.reshard(output, out_sharding)
+            target_out_sharding = out_sharding
         else:
-            output = jax.sharding.reshard(
-                output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+            default_spec = (
+                P("data", None)
+                if orig_num_tokens % self.mesh.shape["data"] == 0
+                else P(None, None)
             )
+            target_out_sharding = jax.sharding.NamedSharding(self.mesh, default_spec)
+
         if orig_num_tokens != output.shape[0]:
-            output = output[:orig_num_tokens]
+            if getattr(self.mesh, "_any_axis_explicit", False):
+                output = jax.sharding.auto_axes(
+                    lambda y: jax.sharding.reshard(y[:orig_num_tokens], target_out_sharding),
+                    out_sharding=target_out_sharding,
+                )(output)
+            else:
+                output = jax.sharding.reshard(output, target_out_sharding)
+                output = output[:orig_num_tokens]
+        else:
+            output = jax.sharding.reshard(output, target_out_sharding)
         return output
