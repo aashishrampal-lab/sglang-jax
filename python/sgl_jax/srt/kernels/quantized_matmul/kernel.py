@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
+import logging
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -11,6 +13,9 @@ from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     should_use_blockwise_kernel,
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
+
+logger = logging.getLogger(__name__)
+_LOGGED_W8A16_BUCKETS: set[tuple[int, int]] = set()
 
 
 def xla_quantized_matmul_local(
@@ -25,6 +30,7 @@ def xla_quantized_matmul_local(
     allow_narrow_n_blockwise: bool = False,
     output_scatter_dimension: int | None = None,
     n_out_valid: int | None = None,
+    w8a16_max_rows: int = 0,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -113,7 +119,27 @@ def xla_quantized_matmul_local(
 
     else:
         # === Standard Per-Channel Quantization Path ===
-        if quantize_activation:
+        # Small-token-bucket W8A16 fast path (parity with vllm-torchtpu's
+        # TPU_FP8_LINEAR_W8A16_MAX_ROWS): for HBM-bandwidth-bound decode buckets
+        # (0 < local_rows <= w8a16_max_rows) with FP8 weights, skip per-token
+        # dynamic FP8 activation quantization and run BF16 x FP8 -> FP32 directly.
+        rows = int(x.shape[0])
+        use_w8a16 = (
+            quantize_activation
+            and 0 < rows <= w8a16_max_rows
+            and jnp.issubdtype(w_q.dtype, jnp.floating)
+        )
+        if use_w8a16:
+            log_key = (rows, int(w8a16_max_rows))
+            if log_key not in _LOGGED_W8A16_BUCKETS:
+                _LOGGED_W8A16_BUCKETS.add(log_key)
+                logger.info(
+                    "FP8 dense linears use W8A16 (bf16 activations) for the %d-row "
+                    "per-DP token bucket (SGL_FP8_LINEAR_W8A16_MAX_ROWS=%d).",
+                    rows,
+                    w8a16_max_rows,
+                )
+        if quantize_activation and not use_w8a16:
             x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
             out = lax.dot_general(
                 x_q,

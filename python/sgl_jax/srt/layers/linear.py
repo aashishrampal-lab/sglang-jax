@@ -20,6 +20,14 @@ from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 logger = logging.getLogger(__name__)
 
 
+def _get_w8a16_max_rows() -> int:
+    raw = os.environ.get(
+        "SGL_FP8_LINEAR_W8A16_MAX_ROWS",
+        os.environ.get("TPU_FP8_LINEAR_W8A16_MAX_ROWS", "0"),
+    )
+    return max(0, int(raw)) if raw else 0
+
+
 @partial(
     jax.jit,
     static_argnames=("mesh", "input_axis", "output_axis", "block_k", "reduce_input_axis"),
@@ -372,6 +380,7 @@ class QuantizedLinear(nnx.Module):
         # Logical output width when the weight rows were pre-padded to a block
         # multiple at load time (pad_out_rows); None = weight is not padded.
         self.n_out_valid: int | None = None
+        self.w8a16_max_rows: int = _get_w8a16_max_rows()
 
     @classmethod
     def from_linear(
@@ -732,6 +741,7 @@ class QuantizedLinear(nnx.Module):
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
                 output_scatter_dimension=output_partition_dim,
                 n_out_valid=self.n_out_valid,
+                w8a16_max_rows=self.w8a16_max_rows,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
