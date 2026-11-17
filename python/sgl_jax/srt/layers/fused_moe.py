@@ -715,9 +715,20 @@ class FusedEPMoEV2(FusedEPMoE):
                     ).astype(hs_local.dtype)
 
             # 2. Bulk XLA ICI ring all-gather across the EP mesh.
+            # Pre-quantize tokens to FP8 before all-gather when W8A8 is active to
+            # halve cross-host ICI volume (201 MiB vs 402 MiB at T=32768, H=6144).
             if mesh_ep_size > 1:
                 my_ep = jax.lax.axis_index("data") * tp_size + jax.lax.axis_index("tensor")
-                hs_all = jax.lax.all_gather(hs_local, axis_name=ep_axis, axis=0, tiled=True)
+                if enable_act_quant and hs_local.dtype == jnp.bfloat16:
+                    hs_f32_ag = hs_local.astype(jnp.float32)
+                    hs_amax_ag = jnp.max(jnp.abs(hs_f32_ag), axis=-1, keepdims=True)
+                    hs_sc_loc = jnp.maximum(hs_amax_ag / jnp.float32(448.0), jnp.float32(1e-12))
+                    hs_q_loc = (hs_f32_ag / hs_sc_loc).astype(jnp.float8_e4m3fn)
+                    hs_q_all = jax.lax.all_gather(hs_q_loc, axis_name=ep_axis, axis=0, tiled=True)
+                    hs_sc_all = jax.lax.all_gather(hs_sc_loc, axis_name=ep_axis, axis=0, tiled=True)
+                    hs_all = (hs_q_all.astype(jnp.float32) * hs_sc_all).astype(hs_local.dtype)
+                else:
+                    hs_all = jax.lax.all_gather(hs_local, axis_name=ep_axis, axis=0, tiled=True)
                 tw_all = jax.lax.all_gather(tw_local, axis_name=ep_axis, axis=0, tiled=True)
                 ti_all = jax.lax.all_gather(ti_local, axis_name=ep_axis, axis=0, tiled=True)
             else:
@@ -808,11 +819,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 **gmm_kwargs,
             )
 
-            inv_pos = (
-                jnp.zeros(total_routed, dtype=jnp.int32)
-                .at[sorted_pos]
-                .set(jnp.arange(total_routed, dtype=jnp.int32))
-            )
+            inv_pos = jnp.argsort(sorted_pos).astype(jnp.int32)
             if use_sc:
                 valid_rows = (inv_pos >= token_start) & (inv_pos < token_end)
                 routed_all = ragged_gather_reduce(
