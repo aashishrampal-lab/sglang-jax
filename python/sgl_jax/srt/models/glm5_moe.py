@@ -22,6 +22,7 @@ from sgl_jax.srt.layers.linear import (
     LinearBase,
     QuantizedLinear,
     prepad_replicated_quantized_linears,
+    transpose_per_channel_quantized_linears,
 )
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
@@ -2038,6 +2039,7 @@ class Glm5ForCausalLM(nnx.Module):
         requantize_static_block_fp8_model(self)
         fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
+        transpose_per_channel_quantized_linears(self)
 
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
 
@@ -2558,6 +2560,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         requantize_static_block_fp8_model(self)
         fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
+        transpose_per_channel_quantized_linears(self)
 
     def get_shared_weight_paths(self):
         # Filled from the target model by EagleDraftWorker._share_embed_head.

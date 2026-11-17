@@ -25,6 +25,7 @@ def xla_quantized_matmul_local(
     allow_narrow_n_blockwise: bool = False,
     output_scatter_dimension: int | None = None,
     n_out_valid: int | None = None,
+    rhs_is_kn: bool = False,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -113,12 +114,13 @@ def xla_quantized_matmul_local(
 
     else:
         # === Standard Per-Channel Quantization Path ===
+        rhs_contract_dim = 0 if rhs_is_kn else 1
         if quantize_activation:
             x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
             out = lax.dot_general(
                 x_q,
                 w_q,
-                dimension_numbers=(((1,), (1,)), ((), ())),
+                dimension_numbers=(((1,), (rhs_contract_dim,)), ((), ())),
                 preferred_element_type=compute_dtype,
             )
             out = (
@@ -130,7 +132,7 @@ def xla_quantized_matmul_local(
             out = lax.dot_general(
                 x,
                 w_q,
-                dimension_numbers=(((1,), (1,)), ((), ())),
+                dimension_numbers=(((1,), (rhs_contract_dim,)), ((), ())),
                 preferred_element_type=compute_dtype,
             )
             out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)

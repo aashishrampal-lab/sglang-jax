@@ -76,6 +76,14 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
         ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
+        # GLM-5.2 / GLM-5.3 per-channel FP8 prefill tiles (100% 128x128 MXU row utilization: btc=128)
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 512, 128, 512, 128),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 512, 128, 512, 128),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 512, 128, 512, 128),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (256, 512, 128, 512, 256),
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (256, 512, 128, 512, 256),
+        ('bfloat16', 'float8_e4m3fn', 65536, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (256, 512, 128, 512, 256),
+        ('bfloat16', 'float8_e4m3fn', 131072, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (256, 512, 128, 512, 256),
         # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
         # K=128, ep=32, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 16 TPU v7x chips, 2026-08-03 (Falcon exp-bkbi8g86uy).

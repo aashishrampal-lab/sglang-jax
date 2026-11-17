@@ -95,6 +95,7 @@ def _scores_kernel(
     bq_weights_x2_ref,  # [2, bq_sz, num_q_heads]
     scores_block_x2_ref,  # [2, bq_sz, num_sublanes_bkv, 128]
     sems,  # [4, 2]
+    sub_scores_ref=None,  # Optional [8, bq_sz // 8, 128] VMEM scratch for fast paged sub-tiling
     *,
     compression_ratio: int,
     static_q_len: int,
@@ -227,20 +228,31 @@ def _scores_kernel(
                     return carry
 
                 if bkv_p > 64:
-                    # Large page blocks (page mode, bkv_p=128): a python-unrolled
-                    # per-page DMA loop bloats the Mosaic program and costs ~40s
-                    # of compile per kernel instance (measured v7x, T=8192); a
-                    # fori_loop compiles in <1s with identical steady-state
-                    # performance (DMA issue rate is not the bottleneck).
-                    lax.fori_loop(0, bkv_p, _start_fetch_page, None, unroll=False)
+                    # Large page blocks (page mode, bkv_p=128): only fetch pages
+                    # up to this sequence's actual kv_len instead of over-fetching
+                    # all 128 pages on partial blocks.
+                    seq_kv_len = seq_lens_ref[seq_idx + batch_idx] // compression_ratio
+                    page_tok_span = page_size_per_kv_packing * kv_packing
+                    valid_pages = jnp.clip(cdiv(seq_kv_len, page_tok_span) - kv_p_start, 0, bkv_p)
+                    lax.fori_loop(0, valid_pages, _start_fetch_page, None, unroll=False)
                 else:
                     # Keep the merged decode path (bkv_p<=64) byte-identical.
                     for i in range(bkv_p):
                         _start_fetch_page(i, None)
             else:
-                dma_bkv_sz = bkv_p * page_size_per_kv_packing
-                dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
-                _async_copy(src=dst_kv, dst=dst_kv, sem=sem, wait=True)
+                if bkv_p > 64:
+                    seq_kv_len = seq_lens_ref[seq_idx + batch_idx] // compression_ratio
+                    page_tok_span = page_size_per_kv_packing * kv_packing
+                    valid_pages = jnp.clip(cdiv(seq_kv_len, page_tok_span) - kv_p_start, 0, bkv_p)
+                    dma_bkv_sz = valid_pages * page_size_per_kv_packing
+                    @pl.when(dma_bkv_sz > 0)
+                    def _wait_valid(dma_bkv_sz=dma_bkv_sz, bkv_vmem_ref=bkv_vmem_ref, sem=sem):
+                        dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
+                        _async_copy(src=dst_kv, dst=dst_kv, sem=sem, wait=True)
+                else:
+                    dma_bkv_sz = bkv_p * page_size_per_kv_packing
+                    dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
+                    _async_copy(src=dst_kv, dst=dst_kv, sem=sem, wait=True)
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         for batch_idx in range(seq_batch_size):
@@ -506,8 +518,6 @@ def _scores_kernel(
                 bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
 
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
-            bq_vec = load_bq(bq_sem_idx)
-            bq_weights_vec = load_bq_weights(bq_sem_idx)
 
             token_start = cu_q_lens_ref[batch_start_seq_idx] + bq_idx * bq_sz
             curr_q_end = cu_q_lens_ref[batch_start_seq_idx + 1]
@@ -528,32 +538,148 @@ def _scores_kernel(
                 scores_block_x2_ref.shape[1:], -jnp.inf, dtype=jnp.float32
             )
 
-            def compute_with_bkv_paged(bkv_idx, _):
-                bkv_sem_idx = sem_ids_ref[1]
-                next_seq_idx, _u, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
-                    batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
+            use_fast_paged_scores = (
+                sub_scores_ref is not None
+                and seq_batch_size == 1
+                and compression_ratio == 1
+                and page_pool_size == 128
+                and bkv_p == 128
+                and num_q_heads == 32
+                and (bq_sz % 64 == 0)
+                and bkv_x2_ref.dtype != jnp.uint8
+            )
+
+            if use_fast_paged_scores:
+                bq_hm = bq_x2_ref.at[bq_sem_idx, 0, :bq_sz][...].transpose(1, 0, 2)
+                q_g0 = bq_hm[:16].reshape(16 * bq_sz, head_dim)
+                q_g1 = bq_hm[16:].reshape(16 * bq_sz, head_dim)
+                w_raw = bq_weights_x2_ref.at[bq_sem_idx, 0, :bq_sz][...].astype(jnp.float32)
+                w_cols_g0 = [
+                    jnp.broadcast_to(w_raw[:, i : i + 1], (bq_sz, 2048)) for i in range(16)
+                ]
+                w_cols_g1 = [
+                    jnp.broadcast_to(w_raw[:, 16 + i : 17 + i], (bq_sz, 2048))
+                    for i in range(16)
+                ]
+                min_q_pos = seq_lens[0] - q_lens[0] + bq_idx * bq_sz
+                max_valid_k = jnp.where(
+                    sz > 0, jnp.minimum(kv_lens[0] - 1, min_q_pos + sz - 1), -1
                 )
+                words_per_sub = 2048 // kv_packing
 
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+                def compute_with_bkv_paged_fast(bkv_idx, _):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    next_seq_idx, _u, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
+                        batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
+                    )
 
-                wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
-                bkv_vec, scale_val_vec = load_bkv(bkv_sem_idx)
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                page_scores = compute_scores(
-                    bq_vec,
-                    bkv_vec,
-                    scale_val_vec,
-                    bq_weights_vec,
-                    bq_pos_compressed_vec,
-                    bkv_idx,
-                )  # [rows, 128] — one pooled lane row per block
-                scores_block_x2_ref[bo_sem_idx, :, bkv_idx, :] = page_scores
-                return None
+                    wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                    sub_scores_ref[...] = jnp.full(
+                        sub_scores_ref.shape, -jnp.inf, dtype=jnp.float32
+                    )
 
-            lax.fori_loop(0, num_bkv, compute_with_bkv_paged, None, unroll=False)
+                    for sub in range(8):
+                        sub_k_start = bkv_idx * bkv_sz + sub * 2048
+                        sub_k_end = sub_k_start + 2048
+
+                        @pl.when(sub_k_start <= max_valid_k)
+                        def _run_sub(
+                            sub=sub,
+                            sub_k_start=sub_k_start,
+                            sub_k_end=sub_k_end,
+                            bkv_sem_idx=bkv_sem_idx,
+                        ):
+                            bkv_sub = bkv_x2_ref.at[
+                                bkv_sem_idx, 0, pl.ds(sub * words_per_sub, words_per_sub)
+                            ][...].reshape(2048, bkv_x2_ref.shape[-1])[:, :head_dim]
+                            st0 = jnp.einsum(
+                                "nd,md->nm",
+                                q_g0,
+                                bkv_sub,
+                                preferred_element_type=jnp.float32,
+                            )
+                            st1 = jnp.einsum(
+                                "nd,md->nm",
+                                q_g1,
+                                bkv_sub,
+                                preferred_element_type=jnp.float32,
+                            )
+                            acc = None
+                            for i in range(16):
+                                r0 = jnp.maximum(
+                                    st0[i * bq_sz : (i + 1) * bq_sz].astype(jnp.bfloat16),
+                                    jnp.bfloat16(0.0),
+                                )
+                                t0 = r0.astype(jnp.float32) * w_cols_g0[i]
+                                acc = t0 if acc is None else acc + t0
+                                r1 = jnp.maximum(
+                                    st1[i * bq_sz : (i + 1) * bq_sz].astype(jnp.bfloat16),
+                                    jnp.bfloat16(0.0),
+                                )
+                                t1 = r1.astype(jnp.float32) * w_cols_g1[i]
+                                acc = acc + t1
+
+                            is_interior = (
+                                (sz == bq_sz)
+                                & (sub_k_end <= min_q_pos + 1)
+                                & (sub_k_end <= kv_lens[0])
+                            )
+
+                            def _mask_boundary(a):
+                                k_span = sub_k_start + lax.broadcasted_iota(
+                                    jnp.int32, (bq_sz, 2048), 1
+                                )
+                                mask = (k_span < kv_lens[0]) & (
+                                    k_span <= bq_pos_compressed_vec[0][:, None]
+                                )
+                                return jnp.where(mask, a, -jnp.inf)
+
+                            acc = lax.cond(is_interior, lambda a: a, _mask_boundary, acc)
+                            pooled = acc.reshape(bq_sz, 16, 128).max(axis=-1)
+                            sub_scores_ref[sub] = pooled.reshape(bq_sz // 8, 128)
+
+                    page_scores = jnp.concatenate(
+                        [sub_scores_ref[sub].reshape(bq_sz, 16) for sub in range(8)], axis=1
+                    )
+                    scores_block_x2_ref[bo_sem_idx, :, bkv_idx, :] = page_scores
+                    return None
+
+                lax.fori_loop(0, num_bkv, compute_with_bkv_paged_fast, None, unroll=False)
+            else:
+                bq_vec = load_bq(bq_sem_idx)
+                bq_weights_vec = load_bq_weights(bq_sem_idx)
+
+                def compute_with_bkv_paged(bkv_idx, _):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    next_seq_idx, _u, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
+                        batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
+                    )
+
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+
+                    wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                    bkv_vec, scale_val_vec = load_bkv(bkv_sem_idx)
+
+                    page_scores = compute_scores(
+                        bq_vec,
+                        bkv_vec,
+                        scale_val_vec,
+                        bq_weights_vec,
+                        bq_pos_compressed_vec,
+                        bkv_idx,
+                    )  # [rows, 128] — one pooled lane row per block
+                    scores_block_x2_ref[bo_sem_idx, :, bkv_idx, :] = page_scores
+                    return None
+
+                lax.fori_loop(0, num_bkv, compute_with_bkv_paged, None, unroll=False)
 
             start_send_page_scores(bo_sem_idx, sz, token_start)
             sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
@@ -1175,6 +1301,17 @@ def streamindex_page_topk(
       i32[T, k_pages] seq-local page ids per query token; -1 for padding.
     """
     max_num_seqs = seq_lens.shape[0]
+    if (
+        jax.default_backend() == "tpu"
+        and cache_kv.dtype in (jnp.float8_e4m3fn, jnp.uint8)
+        and q.dtype != jnp.float8_e4m3fn
+        and os.environ.get("DSA_INDEXER_FP8_Q", "1") == "1"
+    ):
+        q_f32 = q.astype(jnp.float32)
+        q_amax = jnp.max(jnp.abs(q_f32), axis=-1, keepdims=True)
+        q_scale = jnp.maximum(q_amax / jnp.float32(448.0), jnp.float32(1e-12))
+        q = (q_f32 / q_scale).astype(jnp.float8_e4m3fn)
+        indexer_weights = indexer_weights.astype(jnp.float32) * q_scale.squeeze(-1)
     original_dtype = q.dtype
     prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
     q = prepare_q_inputs(q)
@@ -1262,6 +1399,15 @@ def streamindex_page_topk(
         ]
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
 
+        use_fast_paged_scratch = (
+            compression_ratio == 1
+            and page_size == 128
+            and bkv_p == 128
+            and num_q_heads == 32
+            and (bq_sz % 64 == 0)
+            and cache_kv.dtype != jnp.uint8
+            and os.environ.get("DSA_INDEXER_FAST_PAGED", "1") == "1"
+        )
         scratch_shapes = [
             pltpu.VMEM(
                 (2, 1, bkv_p * page_size_per_kv_packing, kv_packing, lkv_dim), cache_kv.dtype
@@ -1270,6 +1416,7 @@ def streamindex_page_topk(
             pltpu.VMEM((2, 1, bq_sz, num_q_heads), prepared_indexer_weights.dtype),
             pltpu.VMEM((2, bq_sz, num_page_sublanes, 128), jnp.float32),
             pltpu.SemaphoreType.DMA((4, 2, 1)),
+            pltpu.VMEM((8, bq_sz // 8, 128), jnp.float32) if use_fast_paged_scratch else None,
         ]
 
         scalar_prefetches = (

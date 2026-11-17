@@ -322,6 +322,7 @@ class QuantizedLinear(nnx.Module):
         weight_block_size: tuple[int, int] | None = None,
         allow_narrow_n_blockwise: bool = False,
         scope_name: str = "quantized_linear",
+        weight_is_kn: bool = False,
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
         # Auto-expand 2D block-quant scale to 3D kernel-ready layout.
@@ -333,7 +334,11 @@ class QuantizedLinear(nnx.Module):
             and not isinstance(weight_scale, jax.ShapeDtypeStruct)
             and weight_scale.ndim == 2
         ):
-            n_out = weight_q.shape[0] if not isinstance(weight_q, jax.ShapeDtypeStruct) else None
+            n_out = (
+                weight_q.shape[1 if weight_is_kn else 0]
+                if not isinstance(weight_q, jax.ShapeDtypeStruct)
+                else None
+            )
             if n_out is not None:
                 weight_scale = expand_block_scale(weight_scale, n_out, int(weight_block_size[0]))
 
@@ -353,8 +358,13 @@ class QuantizedLinear(nnx.Module):
             else:
                 weight_scale = jax.device_put(weight_scale, scale_sharding)
             if isinstance(weight_q, jax.Array) and not isinstance(weight_q, jax.ShapeDtypeStruct):
+                w_spec_init = (
+                    P(kernel_axes[0], kernel_axes[1])
+                    if weight_is_kn
+                    else P(kernel_axes[1], kernel_axes[0])
+                )
                 weight_q = jax.sharding.reshard(
-                    weight_q, NamedSharding(mesh, P(kernel_axes[1], kernel_axes[0]))
+                    weight_q, NamedSharding(mesh, w_spec_init)
                 )
 
         self.weight_q = nnx.Param(weight_q)
@@ -369,6 +379,7 @@ class QuantizedLinear(nnx.Module):
         self.weight_block_size = weight_block_size
         self.allow_narrow_n_blockwise = allow_narrow_n_blockwise
         self.name = scope_name
+        self.weight_is_kn = bool(weight_is_kn)
         # Logical output width when the weight rows were pre-padded to a block
         # multiple at load time (pad_out_rows); None = weight is not padded.
         self.n_out_valid: int | None = None
@@ -646,6 +657,39 @@ class QuantizedLinear(nnx.Module):
         self.weight_block_size = None
         self.allow_narrow_n_blockwise = False
         self.n_out_valid = None
+        self.weight_is_kn = False
+        return True
+
+    def transpose_to_kn(self) -> bool:
+        """Pre-transpose a 1D per-channel ``[N, K]`` ``QuantizedLinear`` in-place to ``[K, N]``
+        so XLA ``lax.dot_general`` contracts ``(((1,), (0,)))`` without RHS relayout."""
+        if getattr(self, "weight_is_kn", False):
+            return False
+        w_q = self.weight_q.value
+        s_val = self.weight_scale.value
+        if (
+            not isinstance(w_q, jax.Array)
+            or isinstance(w_q, jax.ShapeDtypeStruct)
+            or self.weight_block_size is not None
+            or getattr(s_val, "ndim", -1) == 3
+        ):
+            return False
+        input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+        if self.mesh is not None:
+            in_spec = P(output_axis, input_axis)
+            out_spec = P(input_axis, output_axis)
+            w_q = jax.sharding.reshard(w_q, NamedSharding(self.mesh, in_spec))
+            w_kn = shard_map(
+                lambda w: jnp.swapaxes(w, 0, 1),
+                mesh=self.mesh,
+                in_specs=in_spec,
+                out_specs=out_spec,
+                check_vma=False,
+            )(w_q)
+        else:
+            w_kn = jnp.swapaxes(w_q, 0, 1)
+        self.weight_q.value = w_kn
+        self.weight_is_kn = True
         return True
 
     def __call__(
@@ -672,11 +716,12 @@ class QuantizedLinear(nnx.Module):
         # Handle batched inputs by reshaping to 2D.
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
+        is_kn = bool(getattr(self, "weight_is_kn", False))
         scale_val = self.weight_scale.value
         if (
             scale_val.ndim == 2
             and scale_val.shape[1] == 1
-            and scale_val.shape[0] == self.weight_q.value.shape[0]
+            and scale_val.shape[0] == self.weight_q.value.shape[1 if is_kn else 0]
         ):
             scale_val = jnp.squeeze(scale_val, axis=1)
 
@@ -699,7 +744,8 @@ class QuantizedLinear(nnx.Module):
         # as q_b_proj. Explicitly reshard the scale to its expected spec — a no-op
         # when it is already correctly sharded.
         scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
-        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+        w_in_spec = P(input_axis, output_axis) if is_kn else P(output_axis, input_axis)
+        in_specs = (P("data", input_axis), w_in_spec, w_scale_spec)
         weight_val = self.weight_q.value
         if input_axis is None:
             # Reduce axis replicated for this layer (block scale does not tile
@@ -708,14 +754,16 @@ class QuantizedLinear(nnx.Module):
             # narrow-K block-quant layers (e.g. a 2048-wide shared expert at
             # tp32) take this path; tp16 layers are unaffected.
             w_sh = jax.typeof(weight_val).sharding
+            reduce_dim = 0 if is_kn else 1
             if (
                 isinstance(w_sh, NamedSharding)
                 and w_sh.spec
-                and len(w_sh.spec) > 1
-                and w_sh.spec[1] is not None
+                and len(w_sh.spec) > reduce_dim
+                and w_sh.spec[reduce_dim] is not None
             ):
+                rep_w_spec = P(None, output_axis) if is_kn else P(output_axis, None)
                 weight_val = jax.sharding.reshard(
-                    weight_val, NamedSharding(self.mesh, P(output_axis, None))
+                    weight_val, NamedSharding(self.mesh, rep_w_spec)
                 )
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
@@ -732,6 +780,7 @@ class QuantizedLinear(nnx.Module):
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
                 output_scatter_dimension=output_partition_dim,
                 n_out_valid=self.n_out_valid,
+                rhs_is_kn=is_kn,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
@@ -791,5 +840,22 @@ def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256)
             dict(sorted(padded.items())),
             dict(sorted(skipped.items())),
             dict(sorted(seen.items())),
+        )
+    return count
+
+
+def transpose_per_channel_quantized_linears(module: nnx.Module) -> int:
+    """Pre-transpose all 1D per-channel ``QuantizedLinear`` modules under ``module``
+    from ``[N, K]`` to ``[K, N]`` (enabled by ``SGLANG_JAX_TRANSPOSE_DENSE_FP8_KN=1``)."""
+    if os.environ.get("SGLANG_JAX_TRANSPOSE_DENSE_FP8_KN", "1") == "0":
+        return 0
+    count = 0
+    for _, sub in module.iter_modules():
+        if isinstance(sub, QuantizedLinear) and sub.transpose_to_kn():
+            count += 1
+    if count:
+        logger.info(
+            "Pre-transposed %d per-channel QuantizedLinear modules to [K, N] layout.",
+            count,
         )
     return count

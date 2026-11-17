@@ -295,10 +295,26 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     return res
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
+_GENERATE_REQ_FIELDS = {f.name for f in dataclasses.fields(GenerateReqInput)}
+
+
 @app.api_route("/generate", methods=["POST", "PUT"])
-async def generate_request(obj: GenerateReqInput, request: Request):
-    """Handle a generate request."""
+async def generate_request(request: Request):
+    """Handle a generate request with zero-Pydantic C-speed orjson parsing."""
+    try:
+        raw_body = await request.body()
+        payload = orjson.loads(raw_body)
+        if not isinstance(payload, dict):
+            raise ValueError("Expected JSON object body for /generate")
+        obj = GenerateReqInput(
+            **{k: v for k, v in payload.items() if k in _GENERATE_REQ_FIELDS}
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": {"message": f"Invalid /generate request payload: {e}"}},
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

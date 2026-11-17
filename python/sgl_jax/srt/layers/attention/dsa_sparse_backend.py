@@ -34,9 +34,12 @@ from sgl_jax.srt.kernels.dsa.sparse_mla import (
 )
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+    default_run_capacity,
     paged_write_back,
     prefill_write_and_attend_ragged_qblock,
     prefill_write_and_attend_ragged_qblock_tsa,
+    prepare_paged_write_runs,
+    prepare_qblock_ragged_metadata,
 )
 from sgl_jax.srt.kernels.dsa.sparse_mla_sc_gather import (
     prepare_sc_gather_metadata,
@@ -1559,6 +1562,24 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 return idx_cache, None
             return idx_cache, topk_pages
 
+        if (
+            precomputed_fixed_pi is None
+            and compute_pages
+            and _SHARE_SPARSE_META
+            and not self.enable_coop_prefill
+            and forward_batch is not None
+        ):
+            fpi_key = (id(md.seq_lens), id(md.cu_kv_lens), id(md.page_indices), dpa)
+            cached_fpi = getattr(forward_batch, "_prefill_fixed_pi_cache", None)
+            if cached_fpi is not None and cached_fpi[0] == fpi_key:
+                precomputed_fixed_pi = cached_fpi[1]
+            else:
+                precomputed_fixed_pi = self._fixed_stride_pages_sharded(md, dpa)
+                try:
+                    forward_batch._prefill_fixed_pi_cache = (fpi_key, precomputed_fixed_pi)
+                except Exception:
+                    pass
+
         loc, readonly = self._resolve_write_loc(forward_batch, md, k_idx.shape[0], dpa)
         in_specs = (
             P(dpa, None, None),  # q_idx    [T_q, H_idx, D_idx] replicated
@@ -1586,11 +1607,21 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if has_loc:
             in_specs = in_specs + (P(dpa),)
             args.append(loc)
+        has_fpi = precomputed_fixed_pi is not None
+        if has_fpi:
+            in_specs = in_specs + (P(dpa),)
+            args.append(precomputed_fixed_pi)
         out_specs = (P(dpa, None, None, None), P(dpa, None))
 
         def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_, *rest):
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            loc_ = rest[0] if rest else None
+            idx_r = 0
+            if has_loc:
+                loc_ = rest[idx_r]
+                idx_r += 1
+            else:
+                loc_ = None
+            fpi_ = rest[idx_r] if has_fpi else None
             if not readonly:
                 cache_, seq_lens_ = self._write_idx_4d(
                     cache_, k_, seq_lens_, pi_, cuq_, cukv_, dpa, loc_=loc_
@@ -1630,6 +1661,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     kernel_cache_shape=cache_.shape,
                     tp_size=tp_sz,
                     uniform_q_per_seq=True,
+                    precomputed_fixed_pi=fpi_,
                 )
                 topk_pages = jnp.repeat(topk_pages_last, q_group, axis=0)
             else:
@@ -1649,6 +1681,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     kernel_cache_shape=cache_.shape,
                     tp_size=tp_sz if is_spec_mode else 1,
                     uniform_q_per_seq=is_spec_mode,
+                    precomputed_fixed_pi=fpi_,
                 )
             return cache_, topk_pages
 
@@ -2491,6 +2524,185 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     "sparse prefill self-write: out_cache_loc has "
                     f"{loc.shape[0]} entries for {ql.shape[0]} tokens ({mode.name})"
                 )
+
+        if (
+            _PREFILL_QBLOCK
+            and _SHARE_SPARSE_META
+            and not self.enable_coop_prefill
+            and loc is not None
+            and forward_batch is not None
+        ):
+            tp_sz = (
+                self.mesh.shape["tensor"]
+                if (self.mesh is not None and "tensor" in self.mesh.axis_names)
+                else 1
+            )
+            dp_sz = (
+                self.mesh.shape[dpa]
+                if (self.mesh is not None and dpa in self.mesh.axis_names)
+                else 1
+            )
+            local_h = ql.shape[1] // tp_sz
+            local_t = ql.shape[0] // dp_sz
+            local_s = md.seq_lens.shape[0] // dp_sz
+            pk = cache.shape[2]
+            r_cap_mla = max(
+                default_run_capacity(local_t, page_size), local_t // page_size + local_s + 34
+            )
+
+            wr_key = (id(loc), local_t, pk, page_size, r_cap_mla, dpa)
+            cached_wr = getattr(forward_batch, "_qblock_write_runs_cache", None)
+            if cached_wr is not None and cached_wr[0] == wr_key:
+                precomputed_wr = cached_wr[1]
+            else:
+                precomputed_wr = jax.shard_map(
+                    lambda loc_: prepare_paged_write_runs(
+                        loc_,
+                        num_rows=local_t,
+                        kv_packing=pk,
+                        page_size=page_size,
+                        r_cap=r_cap_mla,
+                    ),
+                    in_specs=(P(dpa),),
+                    out_specs=(P(dpa), P(dpa), P(dpa)),
+                    check_vma=False,
+                )(loc)
+                try:
+                    forward_batch._qblock_write_runs_cache = (wr_key, precomputed_wr)
+                except Exception:
+                    pass
+
+            qb_key = (
+                id(topk_pages),
+                id(positions),
+                id(md.seq_lens),
+                id(md.cu_q_lens),
+                id(md.cu_kv_lens),
+                id(md.page_indices),
+                local_h,
+                page_size,
+                _PREFILL_QBLOCK_QB,
+                dpa,
+            )
+            cached_qb = getattr(forward_batch, "_qblock_meta_cache", None)
+            if cached_qb is not None and cached_qb[0] == qb_key:
+                precomputed_qb = cached_qb[1]
+            else:
+                precomputed_qb = jax.shard_map(
+                    lambda tp_, pos_, sl_, cuq_, cukv_, pi_: prepare_qblock_ragged_metadata(
+                        tp_,
+                        pos_,
+                        sl_,
+                        cuq_,
+                        cukv_,
+                        pi_,
+                        num_heads=local_h,
+                        page_size=page_size,
+                        query_block=_PREFILL_QBLOCK_QB,
+                    ),
+                    in_specs=(P(dpa, None), P(dpa), P(dpa), P(dpa), P(dpa), P(dpa)),
+                    out_specs=(P(dpa, None, None, None),) * 7,
+                    check_vma=False,
+                )(
+                    topk_pages,
+                    positions,
+                    md.seq_lens,
+                    md.cu_q_lens,
+                    md.cu_kv_lens,
+                    md.page_indices,
+                )
+                try:
+                    forward_batch._qblock_meta_cache = (qb_key, precomputed_qb)
+                except Exception:
+                    pass
+
+            in_specs_cached = (
+                (
+                    P(dpa, "tensor", None),  # ql
+                    P(dpa, "tensor", None),  # qpe
+                    P(dpa, None),  # kvc
+                    P(dpa, None),  # kpe
+                    P(dpa, None, None, None),  # cache
+                    P(dpa, None),  # topk_pages
+                    P(dpa),  # positions
+                    P(dpa),  # loc
+                    P(dpa),  # seq_lens
+                    P(dpa),  # cu_q_lens
+                    P(dpa),  # cu_kv_lens
+                    P(dpa),  # page_indices
+                )
+                + (P(dpa, None, None, None),) * 7
+                + (P(dpa), P(dpa), P(dpa))
+            )
+            out_specs_cached = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+            def _run_cached(
+                ql_,
+                qpe_,
+                kvc_,
+                kpe_,
+                cache_,
+                tp_,
+                pos_,
+                loc_,
+                sl_,
+                cuq_,
+                cukv_,
+                pi_,
+                u4_,
+                c4_,
+                pr_,
+                kvr_,
+                br_,
+                mt_,
+                pt_,
+                tf_,
+                ne_,
+                nr_,
+            ):
+                o, cache_new = prefill_write_and_attend_ragged_qblock(
+                    ql_,
+                    qpe_,
+                    kvc_,
+                    kpe_,
+                    cache_,
+                    tp_,
+                    pos_,
+                    loc_,
+                    sl_,
+                    cuq_,
+                    cukv_,
+                    pi_,
+                    kv_lora_rank=kv_lora_rank,
+                    page_size=page_size,
+                    sm_scale=sm,
+                    query_block=_PREFILL_QBLOCK_QB,
+                    precomputed_ragged_meta=(u4_, c4_, pr_, kvr_, br_, mt_, pt_),
+                    precomputed_write_runs=(tf_, ne_, nr_),
+                )
+                return o.astype(ql_.dtype), cache_new
+
+            return jax.shard_map(
+                _run_cached,
+                in_specs=in_specs_cached,
+                out_specs=out_specs_cached,
+                check_vma=False,
+            )(
+                ql,
+                qpe,
+                kvc,
+                kpe,
+                cache,
+                topk_pages,
+                positions,
+                loc,
+                md.seq_lens,
+                md.cu_q_lens,
+                md.cu_kv_lens,
+                md.page_indices,
+                *precomputed_qb,
+                *precomputed_wr,
+            )
 
         in_specs = (
             P(dpa, "tensor", None),  # ql   [T, H, kv_lora_rank]

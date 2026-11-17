@@ -255,6 +255,77 @@ def _qblock_kernel(
     o_ref[0, 0] = out.astype(o_ref.dtype)
 
 
+def prepare_qblock_ragged_metadata(
+    topk_pages,  # [S, K] int32 seq-local page ids (-1 padded)
+    positions,  # [S] int32
+    seq_lens,  # [num_seqs] int32
+    cu_q_lens,  # [num_seqs+1] int32
+    cu_kv_lens,  # [num_seqs+1] int32
+    page_indices,  # [total_pages] int32
+    *,
+    num_heads: int,
+    page_size: int,
+    query_block: int,
+    u_max: int | None = None,
+):
+    """Precompute ``(units4, counts4, pos_rows, kvlen_rows, base_rows, memt, pt_arg)``
+    once per full DSA layer so all 57 IndexShare layers skip union-sort & bitmap prep."""
+    S, K = topk_pages.shape
+    B = 1
+    H = num_heads
+    QB = query_block
+    ps = page_size
+    PTW = page_indices.shape[0]
+    num_units = PTW
+    num_seqs = seq_lens.shape[0]
+
+    t = jnp.arange(S, dtype=jnp.int32)
+    qsid = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, num_seqs - 1).astype(
+        jnp.int32
+    )
+    base_pages = (cu_kv_lens[qsid] // ps).astype(jnp.int32)
+    idx_g = jnp.where(
+        topk_pages.reshape(B, S, K) >= 0,
+        topk_pages.reshape(B, S, K) + base_pages.reshape(B, S, 1),
+        -1,
+    )
+    kvlen_tok = seq_lens[qsid].astype(jnp.int32)
+    base_tok = base_pages * ps
+    pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
+
+    u_safe = min(QB * K, num_units)
+    if u_max is None:
+        u_max = u_safe
+    elif u_max < u_safe:
+        _warn_umax_truncation(u_max, u_safe)
+
+    blk_u, blk_m, blk_c = jax.vmap(
+        functools.partial(build_block_unit_tables, query_block=QB, u_max=u_max)
+    )(idx_g)
+    nQB = blk_u.shape[1]
+    U_pad = ((u_max + 31) // 32) * 32
+    QBH = QB * H
+    QBHp = ((QBH + 127) // 128) * 128
+    Sp = nQB * QB
+
+    memt = jnp.repeat(blk_m.transpose(0, 1, 3, 2), H, axis=3)
+    memt = jnp.pad(memt, ((0, 0), (0, 0), (0, U_pad - u_max), (0, QBHp - QBH)))
+    units4 = jnp.pad(blk_u, ((0, 0), (0, 0), (0, U_pad - u_max)), constant_values=-1)
+    units4 = units4.reshape(B, nQB, 1, U_pad)
+    counts4 = jnp.minimum(blk_c, u_max).reshape(B, nQB, 1, 1)
+
+    def _rows(vec, fill):
+        v = jnp.pad(vec.reshape(B, S), ((0, 0), (0, Sp - S)), constant_values=fill)
+        v = jnp.repeat(v.reshape(B, nQB, QB), H, axis=2)
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, QBHp - QBH)), constant_values=fill)
+        return v.reshape(B, nQB, 1, QBHp)
+
+    pos_rows = _rows(positions.astype(jnp.int32), -1)
+    kvlen_rows = _rows(jnp.broadcast_to(kvlen_tok, (B, S)), 0)
+    base_rows = _rows(jnp.broadcast_to(base_tok, (B, S)), 0)
+    return units4, counts4, pos_rows, kvlen_rows, base_rows, memt, pt_arg
+
+
 def sparse_mla_attention_qblock(
     q,  # [B, S, H, Dk]        Dk = kv_lora_rank + qk_rope_head_dim
     kv,  # [B, T, Dk] flat latent | packed 4D paged cache (ragged mode)
@@ -267,6 +338,8 @@ def sparse_mla_attention_qblock(
     u_max: int | None = None,  # per-block union cap; default makes overflow impossible
     sm_scale: float,
     interpret: bool = False,
+    out_dtype: jnp.dtype | None = None,
+    precomputed_ragged_meta: tuple | None = None,
     # ── packed-ragged mode (multi-request extend; mirrors sparse_mla_attention) ──
     page_size: int | None = None,
     q_seq_id=None,  # [total_tokens] int32  token -> request id (enables ragged mode)
@@ -301,11 +374,13 @@ def sparse_mla_attention_qblock(
     Dv = kv_lora_rank
     RB = read_block
     QB = query_block
-    ragged = q_seq_id is not None
+    ragged = (q_seq_id is not None) or (precomputed_ragged_meta is not None)
     if ragged:
         if B != 1:
             raise ValueError(f"ragged mode packs all requests into B=1 (got B={B})")
-        if seq_lens is None or cu_kv_lens is None or page_indices is None:
+        if precomputed_ragged_meta is None and (
+            seq_lens is None or cu_kv_lens is None or page_indices is None
+        ):
             raise ValueError("ragged mode requires seq_lens, cu_kv_lens and page_indices")
         if page_size is None or page_size != RB:
             raise ValueError("qblock ragged mode requires read_block == page_size")
@@ -321,76 +396,93 @@ def sparse_mla_attention_qblock(
     Dk_pad = ((Dk + 127) // 128) * 128
     RBF = ((RB + 15) // 16) * 16
 
-    if ragged:
+    if precomputed_ragged_meta is not None:
+        units4, counts4, pos_rows, kvlen_rows, base_rows, memt, pt_arg = precomputed_ragged_meta
         ps = page_size
-        PTW = page_indices.shape[0]
-        num_units = PTW
-        # lift seq-local pages to global page-table keys; resolve per-row bounds
-        qsid = jnp.clip(q_seq_id, 0, seq_lens.shape[0] - 1).astype(jnp.int32)
-        base_pages = (cu_kv_lens[qsid] // ps).astype(jnp.int32)  # [S]
-        idx_g = jnp.where(indices >= 0, indices + base_pages.reshape(B, S, 1), -1)
-        kvlen_tok = seq_lens[qsid].astype(jnp.int32)  # [S]
-        base_tok = base_pages * ps  # [S]
+        PTW = pt_arg.shape[-1]
         if kv.shape[-1] != Dk_pad:
             raise ValueError(f"paged cache last dim {kv.shape[-1]} != Dk_pad {Dk_pad}")
-        kv2 = kv  # native 4D pool; flattened inside the kernel (HBM ref view)
-        pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
+        kv2 = kv
+        nQB = units4.shape[1]
+        U_pad = units4.shape[3]
+        QBH = QB * H
+        QBHp = ((QBH + 127) // 128) * 128
+        Sp = nQB * QB
+        q4 = jnp.pad(q, ((0, 0), (0, Sp - S), (0, 0), (0, Dk_pad - Dk)))
+        q4 = q4.reshape(B, nQB, QBH, Dk_pad)
+        q4 = jnp.pad(q4, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
     else:
-        ps = 0
-        PTW = 1
-        T = kv.shape[1]
-        num_units = -(-T // RB)
-        idx_g = indices
-        kvlen_tok = jnp.full((S,), T, jnp.int32)
-        base_tok = jnp.zeros((S,), jnp.int32)
-        # flat KV: pad features to Dk_pad and rows by RBF (tail-unit over-fetch)
-        kv2 = jnp.pad(kv, ((0, 0), (0, RBF), (0, Dk_pad - Dk)))
-        pt_arg = jnp.zeros((B, 1, 1, 1), jnp.int32)
+        if ragged:
+            ps = page_size
+            PTW = page_indices.shape[0]
+            num_units = PTW
+            # lift seq-local pages to global page-table keys; resolve per-row bounds
+            qsid = jnp.clip(q_seq_id, 0, seq_lens.shape[0] - 1).astype(jnp.int32)
+            base_pages = (cu_kv_lens[qsid] // ps).astype(jnp.int32)  # [S]
+            idx_g = jnp.where(indices >= 0, indices + base_pages.reshape(B, S, 1), -1)
+            kvlen_tok = seq_lens[qsid].astype(jnp.int32)  # [S]
+            base_tok = base_pages * ps  # [S]
+            if kv.shape[-1] != Dk_pad:
+                raise ValueError(f"paged cache last dim {kv.shape[-1]} != Dk_pad {Dk_pad}")
+            kv2 = kv  # native 4D pool; flattened inside the kernel (HBM ref view)
+            pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
+        else:
+            ps = 0
+            PTW = 1
+            T = kv.shape[1]
+            num_units = -(-T // RB)
+            idx_g = indices
+            kvlen_tok = jnp.full((S,), T, jnp.int32)
+            base_tok = jnp.zeros((S,), jnp.int32)
+            # flat KV: pad features to Dk_pad and rows by RBF (tail-unit over-fetch)
+            kv2 = jnp.pad(kv, ((0, 0), (0, RBF), (0, Dk_pad - Dk)))
+            pt_arg = jnp.zeros((B, 1, 1, 1), jnp.int32)
 
-    u_safe = min(QB * K, num_units)
-    if u_max is None:
-        u_max = u_safe
-    elif u_max < u_safe:
-        _warn_umax_truncation(u_max, u_safe)
+        u_safe = min(QB * K, num_units)
+        if u_max is None:
+            u_max = u_safe
+        elif u_max < u_safe:
+            _warn_umax_truncation(u_max, u_safe)
 
-    # ── preprocessing (jnp, outside the kernel) ────────────────────────────
-    blk_u, blk_m, blk_c = jax.vmap(
-        functools.partial(build_block_unit_tables, query_block=QB, u_max=u_max)
-    )(idx_g)
-    # blk_u [B,nQB,u_max] blk_m [B,nQB,QB,u_max] blk_c [B,nQB]
-    nQB = blk_u.shape[1]
-    U_pad = ((u_max + 31) // 32) * 32  # int8 sublane tile
-    QBH = QB * H
-    QBHp = ((QBH + 127) // 128) * 128  # lane axis of the score
+        # ── preprocessing (jnp, outside the kernel) ────────────────────────────
+        blk_u, blk_m, blk_c = jax.vmap(
+            functools.partial(build_block_unit_tables, query_block=QB, u_max=u_max)
+        )(idx_g)
+        # blk_u [B,nQB,u_max] blk_m [B,nQB,QB,u_max] blk_c [B,nQB]
+        nQB = blk_u.shape[1]
+        U_pad = ((u_max + 31) // 32) * 32  # int8 sublane tile
+        QBH = QB * H
+        QBHp = ((QBH + 127) // 128) * 128  # lane axis of the score
 
-    # membership -> slot-major [B,nQB,U_pad,QBHp] int8, lanes H-expanded so the
-    # kernel's lane r = q*H + h reads member[q] directly.
-    memt = jnp.repeat(blk_m.transpose(0, 1, 3, 2), H, axis=3)  # [B,nQB,u_max,QBH]
-    memt = jnp.pad(memt, ((0, 0), (0, 0), (0, U_pad - u_max), (0, QBHp - QBH)))
-    units4 = jnp.pad(blk_u, ((0, 0), (0, 0), (0, U_pad - u_max)), constant_values=-1)
-    units4 = units4.reshape(B, nQB, 1, U_pad)
-    # clamp: if a block overflowed u_max (impossible with the default cap), only
-    # the retained prefix of the union is walked.
-    counts4 = jnp.minimum(blk_c, u_max).reshape(B, nQB, 1, 1)
+        # membership -> slot-major [B,nQB,U_pad,QBHp] int8, lanes H-expanded so the
+        # kernel's lane r = q*H + h reads member[q] directly.
+        memt = jnp.repeat(blk_m.transpose(0, 1, 3, 2), H, axis=3)  # [B,nQB,u_max,QBH]
+        memt = jnp.pad(memt, ((0, 0), (0, 0), (0, U_pad - u_max), (0, QBHp - QBH)))
+        units4 = jnp.pad(blk_u, ((0, 0), (0, 0), (0, U_pad - u_max)), constant_values=-1)
+        units4 = units4.reshape(B, nQB, 1, U_pad)
+        # clamp: if a block overflowed u_max (impossible with the default cap), only
+        # the retained prefix of the union is walked.
+        counts4 = jnp.minimum(blk_c, u_max).reshape(B, nQB, 1, 1)
 
-    # q -> [B, nQB, QBHp, Dk_pad] (row = q*H + h), zero pad rows/features
-    Sp = nQB * QB
-    q4 = jnp.pad(q, ((0, 0), (0, Sp - S), (0, 0), (0, Dk_pad - Dk)))
-    q4 = q4.reshape(B, nQB, QBH, Dk_pad)
-    q4 = jnp.pad(q4, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
+        # q -> [B, nQB, QBHp, Dk_pad] (row = q*H + h), zero pad rows/features
+        Sp = nQB * QB
+        q4 = jnp.pad(q, ((0, 0), (0, Sp - S), (0, 0), (0, Dk_pad - Dk)))
+        q4 = q4.reshape(B, nQB, QBH, Dk_pad)
+        q4 = jnp.pad(q4, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
 
-    def _rows(vec, fill):
-        # [B, S] -> [B, nQB, 1, QBHp] with H-expansion and `fill` on pad rows
-        v = jnp.pad(vec.reshape(B, S), ((0, 0), (0, Sp - S)), constant_values=fill)
-        v = jnp.repeat(v.reshape(B, nQB, QB), H, axis=2)
-        v = jnp.pad(v, ((0, 0), (0, 0), (0, QBHp - QBH)), constant_values=fill)
-        return v.reshape(B, nQB, 1, QBHp)
+        def _rows(vec, fill):
+            # [B, S] -> [B, nQB, 1, QBHp] with H-expansion and `fill` on pad rows
+            v = jnp.pad(vec.reshape(B, S), ((0, 0), (0, Sp - S)), constant_values=fill)
+            v = jnp.repeat(v.reshape(B, nQB, QB), H, axis=2)
+            v = jnp.pad(v, ((0, 0), (0, 0), (0, QBHp - QBH)), constant_values=fill)
+            return v.reshape(B, nQB, 1, QBHp)
 
-    # pad rows: qpos=-1 => no key can satisfy kp <= qpos => zero output row
-    pos_rows = _rows(positions.astype(jnp.int32), -1)
-    kvlen_rows = _rows(jnp.broadcast_to(kvlen_tok, (B, S)), 0)
-    base_rows = _rows(jnp.broadcast_to(base_tok, (B, S)), 0)
+        # pad rows: qpos=-1 => no key can satisfy kp <= qpos => zero output row
+        pos_rows = _rows(positions.astype(jnp.int32), -1)
+        kvlen_rows = _rows(jnp.broadcast_to(kvlen_tok, (B, S)), 0)
+        base_rows = _rows(jnp.broadcast_to(base_tok, (B, S)), 0)
 
+    eff_out_dtype = jnp.float32 if out_dtype is None else out_dtype
     kernel = functools.partial(
         _qblock_kernel,
         sm_scale=sm_scale,
@@ -418,7 +510,7 @@ def sparse_mla_attention_qblock(
             pl.BlockSpec((1, 1, 1, PTW), lambda b, n: (b, 0, 0, 0), memory_space=smem),
         ],
         out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), eff_out_dtype),
         scratch_shapes=[
             pltpu.VMEM(
                 (
@@ -456,6 +548,8 @@ def prefill_write_and_attend_ragged_qblock(
     sm_scale: float,
     query_block: int = 256,
     interpret: bool = False,
+    precomputed_ragged_meta: tuple | None = None,
+    precomputed_write_runs: tuple | None = None,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
 
@@ -489,13 +583,17 @@ def prefill_write_and_attend_ragged_qblock(
         page_size=ps,
         r_cap=max(default_run_capacity(T, ps), T // ps + S + 34),
         interpret=interpret,
+        precomputed_write_runs=precomputed_write_runs,
     )
 
-    # token -> request id (same convention as the per-query ragged wrapper)
-    t = jnp.arange(T, dtype=jnp.int32)
-    q_seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1).astype(
-        jnp.int32
-    )
+    if precomputed_ragged_meta is not None:
+        q_seq_id = None
+    else:
+        # token -> request id (same convention as the per-query ragged wrapper)
+        t = jnp.arange(T, dtype=jnp.int32)
+        q_seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1).astype(
+            jnp.int32
+        )
 
     out = sparse_mla_attention_qblock(
         q_sparse.reshape(1, T, H, q_sparse.shape[2]),
@@ -506,6 +604,8 @@ def prefill_write_and_attend_ragged_qblock(
         read_block=ps,
         query_block=query_block,
         sm_scale=float(sm_scale),
+        out_dtype=ql.dtype,
+        precomputed_ragged_meta=precomputed_ragged_meta,
         page_size=ps,
         q_seq_id=q_seq_id,
         seq_lens=seq_lens,
@@ -580,6 +680,7 @@ def prefill_write_and_attend_ragged_qblock_tsa(
         read_block=ps,
         query_block=query_block,
         sm_scale=float(sm_scale),
+        out_dtype=ql.dtype,
         page_size=ps,
         q_seq_id=q_seq_id,
         seq_lens=seq_lens,
@@ -718,7 +819,7 @@ def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref,
 # 64 requests x 4 draft tokens is 256 rows; the old default
 # (2 * pages + 130 = 134) did not cover it and cost two whole-pool copies per
 # layer (~0.15 ms each on GLM-5.2 tp16).
-STATIC_DISPATCH_MAX_ROWS = 4096
+STATIC_DISPATCH_MAX_ROWS = 8192
 # Row counts up to this size take the 4D-native scatter when the caller opts in
 # (speculative verify / draft-extend pre-write); see paged_write_back.
 SCATTER_ROWS_MAX = 1024
@@ -742,6 +843,28 @@ def pallas_always_fits(num_rows: int, r_cap: int) -> bool:
     return int(num_rows) <= int(r_cap)
 
 
+def prepare_paged_write_runs(
+    loc: jax.Array,
+    *,
+    num_rows: int,
+    kv_packing: int,
+    page_size: int,
+    r_cap: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Precompute ``(table_flat, n_ent, n_raw)`` once per step for ``paged_write_back``."""
+    Tp = -(-num_rows // kv_packing) * kv_packing
+    if Tp != loc.shape[0]:
+        loc = jnp.pad(loc.astype(jnp.int32), ((0, Tp - loc.shape[0]),), constant_values=-1)
+    else:
+        loc = loc.astype(jnp.int32)
+    if r_cap is None:
+        r_cap = default_run_capacity(Tp, page_size)
+    table, n_raw = _build_write_runs(loc, kv_packing=kv_packing, r_cap=r_cap)
+    table_flat = table.reshape(-1)
+    n_ent = (3 * jnp.minimum(n_raw, r_cap)).reshape(1).astype(jnp.int32)
+    return table_flat, n_ent, n_raw.reshape(1).astype(jnp.int32)
+
+
 def paged_write_back(
     cache,  # [Pn, ps//pk, pk, D] paged pool
     row,  # [T, D] new rows (already cache dtype / padded feature dim)
@@ -751,6 +874,7 @@ def paged_write_back(
     r_cap: int | None = None,
     interpret: bool = False,
     small_rows_scatter: bool = False,
+    precomputed_write_runs: tuple | None = None,
 ):
     """In-place paged self-write: ``cache[loc[t]] = row[t]`` for ``loc >= 0``.
 
@@ -788,10 +912,14 @@ def paged_write_back(
         )
     if r_cap is None:
         r_cap = default_run_capacity(Tp, ps)
-    table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
-    table_flat = table.reshape(-1)
+    if precomputed_write_runs is not None:
+        table_flat, n_ent, n_raw_vec = precomputed_write_runs
+        n_raw = n_raw_vec[0]
+    else:
+        table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
+        table_flat = table.reshape(-1)
+        n_ent = (3 * jnp.minimum(n_raw, r_cap)).reshape(1).astype(jnp.int32)  # live table entries
     row_w = row.reshape(Tp // pk, pk, D)
-    n_ent = (3 * jnp.minimum(n_raw, r_cap)).reshape(1).astype(jnp.int32)  # live table entries
 
     def _pallas(cache, row_w, table_flat, n_ent):
         return pl.pallas_call(
