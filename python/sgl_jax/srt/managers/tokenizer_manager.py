@@ -228,8 +228,6 @@ class TokenizerManager:
         # Store states
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
-        self._prefill_coalesce_buf: list = []
-        self._prefill_coalesce_handle: asyncio.TimerHandle | None = None
         self.health_check_failed = False
         self.gracefully_exit = False
         self._shutdown = False
@@ -612,23 +610,13 @@ class TokenizerManager:
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
 
-    def _flush_coalesced_requests(self) -> None:
-        if self._prefill_coalesce_handle is not None:
-            self._prefill_coalesce_handle.cancel()
-            self._prefill_coalesce_handle = None
-        if not self._prefill_coalesce_buf:
-            return
-        pending = self._prefill_coalesce_buf
-        self._prefill_coalesce_buf = []
-        for item in pending:
-            send_mm_request(self.send_to_scheduler, item)
-
     def _send_one_request(
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
+        send_mm_request(self.send_to_scheduler, tokenized_obj)
         # Capture the caller's event loop so that _notify_state_event can use
         # call_soon_threadsafe when handle_loop runs on a different thread
         # (e.g. enable_engine_loop_run_forever_daemon mode).
@@ -642,29 +630,6 @@ class TokenizerManager:
         # Handle rid being a list (single element) or string
         rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
         self.rid_to_state[rid_key] = state
-
-        coalesce_ms = float(os.environ.get("SGL_PREFILL_INGRESS_COALESCE_MS", "0"))
-        dp_size = int(getattr(self.server_args, "dp_size", 1))
-        min_len = int(os.environ.get("SGL_PREFILL_INGRESS_MIN_LEN", "4096"))
-        if (
-            coalesce_ms > 0.0
-            and dp_size > 1
-            and caller_loop is not None
-            and isinstance(tokenized_obj, TokenizedGenerateReqInput)
-            and tokenized_obj.input_ids is not None
-            and len(tokenized_obj.input_ids) >= min_len
-        ):
-            self._prefill_coalesce_buf.append(tokenized_obj)
-            if len(self._prefill_coalesce_buf) >= dp_size:
-                self._flush_coalesced_requests()
-            elif self._prefill_coalesce_handle is None:
-                self._prefill_coalesce_handle = caller_loop.call_later(
-                    coalesce_ms / 1000.0, self._flush_coalesced_requests
-                )
-        else:
-            if self._prefill_coalesce_buf:
-                self._flush_coalesced_requests()
-            send_mm_request(self.send_to_scheduler, tokenized_obj)
         return state
 
     def _notify_state_event(self, state: ReqState) -> None:
@@ -846,14 +811,12 @@ class TokenizerManager:
                         pass
 
     async def flush_cache(self) -> FlushCacheReqOutput:
-        self._flush_coalesced_requests()
         self.auto_create_handle_loop()
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
-        self._flush_coalesced_requests()
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
