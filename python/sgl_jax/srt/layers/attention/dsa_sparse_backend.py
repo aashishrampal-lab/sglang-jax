@@ -177,6 +177,11 @@ _TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 # relayout copies across all 21 full DSA layers). Default ON.
 _PALLAS_IDX_WRITE = os.environ.get("DSA_PALLAS_IDX_WRITE", "1") == "1"
 
+# Cache QBlock union-sort/bitmap metadata across shared IndexShare layers (57/78),
+# paged_write_back run tables across all 78 MLA layers, and fixed_stride_pages
+# across all 21 full DSA layers within a forward step. Default ON.
+_SHARE_SPARSE_META = os.environ.get("DSA_SHARE_SPARSE_META", "1") == "1"
+
 # Token-level SparseCore KV gather + double-buffered TensorCore MLA attention
 # (ports vllm-torchtpu's dsa_gather + split-Q MLA pipeline onto sglang-jax's 4D
 # fused KV cache). DSA_SC_TOKEN_GATHER=1 enables both prefill and decode unless
