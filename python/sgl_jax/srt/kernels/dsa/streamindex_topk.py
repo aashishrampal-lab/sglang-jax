@@ -640,12 +640,9 @@ def _scores_kernel(
                                 return jnp.where(mask, a, -jnp.inf)
 
                             acc = lax.cond(is_interior, lambda a: a, _mask_boundary, acc)
-                            pooled = acc.reshape(bq_sz, 16, 128).max(axis=-1)
-                            sub_scores_ref[sub] = pooled.reshape(bq_sz // 8, 128)
+                            sub_scores_ref[:, pl.ds(sub * 2048, 2048)] = acc
 
-                    page_scores = jnp.concatenate(
-                        [sub_scores_ref[sub].reshape(bq_sz, 16) for sub in range(8)], axis=1
-                    )
+                    page_scores = sub_scores_ref[...].reshape(bq_sz, 128, 128).max(axis=-1)
                     scores_block_x2_ref[bo_sem_idx, :, bkv_idx, :] = page_scores
                     return None
 
@@ -1416,7 +1413,7 @@ def streamindex_page_topk(
             pltpu.VMEM((2, 1, bq_sz, num_q_heads), prepared_indexer_weights.dtype),
             pltpu.VMEM((2, bq_sz, num_page_sublanes, 128), jnp.float32),
             pltpu.SemaphoreType.DMA((4, 2, 1)),
-            pltpu.VMEM((8, bq_sz // 8, 128), jnp.float32) if use_fast_paged_scratch else None,
+            pltpu.VMEM((bq_sz, bkv_sz), jnp.float32) if use_fast_paged_scratch else None,
         ]
 
         scalar_prefetches = (
