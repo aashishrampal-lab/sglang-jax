@@ -28,6 +28,11 @@ def gmm(
     acc_dtype: jnp.dtype | None = None,
     activation_quantized_dtype: jnp.dtype | None = None,
     v2_tile_info: Any = None,
+    rhs_up: jnp.ndarray | None = None,
+    rhs_up_scale: jnp.ndarray | None = None,
+    rhs_up_bias: jnp.ndarray | None = None,
+    fuse_act: str | None = None,
+    swiglu_limit: float | None = None,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -64,13 +69,69 @@ def gmm(
     use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
         rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
     )
+    if rhs_up is not None and not is_supported_by_gmm_v2(
+        rhs_up_scale, maybe_quantize_lhs=maybe_quantize_lhs
+    ):
+        use_gmm_v2 = False
 
-    # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
+    if not use_gmm_v2 and fuse_act is not None:
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import activation_fn
+
+        if rhs_up is None:
+            half_n = rhs.shape[-1] // 2
+            w_gate, w_up = rhs[..., :half_n], rhs[..., half_n:]
+            s_gate = None if rhs_scale is None else rhs_scale[..., :half_n]
+            s_up = None if rhs_scale is None else rhs_scale[..., half_n:]
+            b_gate = None if rhs_bias is None else rhs_bias[..., :half_n]
+            b_up = None if rhs_bias is None else rhs_bias[..., half_n:]
+        else:
+            w_gate, w_up = rhs, rhs_up
+            s_gate, s_up = rhs_scale, rhs_up_scale
+            b_gate, b_up = rhs_bias, rhs_up_bias
+        gate_out = gmm(
+            lhs,
+            w_gate,
+            group_sizes,
+            preferred_element_type=jnp.float32,
+            rhs_scale=s_gate,
+            rhs_bias=b_gate,
+            tiling=tiling,
+            group_offset=group_offset,
+            existing_out=existing_out,
+            interpret=interpret,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            zero_initialize=zero_initialize,
+            acc_dtype=acc_dtype,
+            activation_quantized_dtype=activation_quantized_dtype,
+            v2_tile_info=v2_tile_info,
+        )
+        up_out = gmm(
+            lhs,
+            w_up,
+            group_sizes,
+            preferred_element_type=jnp.float32,
+            rhs_scale=s_up,
+            rhs_bias=b_up,
+            tiling=tiling,
+            group_offset=group_offset,
+            existing_out=existing_out,
+            interpret=interpret,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            zero_initialize=zero_initialize,
+            acc_dtype=acc_dtype,
+            activation_quantized_dtype=activation_quantized_dtype,
+            v2_tile_info=v2_tile_info,
+        )
+        return activation_fn(gate_out, up_out, fuse_act, swiglu_limit).astype(
+            preferred_element_type
+        )
+
+    # gmm_v2 pads lhs internally to sublane tiling without mutating group_sizes;
+    # keep 128-row alignment only for legacy gmm_v1.
     m = lhs.shape[0]
     pad_size = 0
-    alignment = 32 if use_gmm_v2 else 128
-    if not interpret and m % alignment != 0:
-        pad_size = alignment - (m % alignment)
+    if not use_gmm_v2 and not interpret and m % 128 != 0:
+        pad_size = 128 - (m % 128)
         lhs = jax.lax.pad(lhs, jnp.zeros((), dtype=lhs.dtype), ((0, pad_size, 0), (0, 0, 0)))
         group_sizes = group_sizes.at[-1].add(pad_size)
 
@@ -90,6 +151,11 @@ def gmm(
             rhs_scale=rhs_scale,
             rhs_bias=rhs_bias,
             group_offset=group_offset,
+            rhs_up=rhs_up,
+            rhs_up_scale=rhs_up_scale,
+            rhs_up_bias=rhs_up_bias,
+            fuse_act=fuse_act,
+            swiglu_limit=swiglu_limit,
             preferred_element_type=preferred_element_type,
             maybe_quantize_lhs=maybe_quantize_lhs,
             zero_initialize=zero_initialize,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import math
+import os
 import time
 from functools import partial
 from typing import TYPE_CHECKING
@@ -1593,6 +1594,42 @@ class MLATokenToKVPool(KVCache):
 
         return align_to(indexer_key_dim, 128) if indexer_key_dim else 0
 
+    @staticmethod
+    def _use_native_sc_latent_cache(
+        *,
+        page_size: int,
+        dtype: jnp.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+    ) -> bool:
+        """Whether MLA latent KV uses unified 576 B/tok SparseCore uint32 layout."""
+        return (
+            os.environ.get("DSA_NATIVE_SC_KV", "0") == "1"
+            and jnp.dtype(dtype) == jnp.dtype(jnp.float8_e4m3fn)
+            and kv_lora_rank == 512
+            and qk_rope_head_dim == 64
+            and page_size >= 64
+            and (page_size % 64 == 0)
+        )
+
+    @classmethod
+    def _latent_cache_dtype(
+        cls,
+        *,
+        page_size: int,
+        dtype: jnp.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+    ) -> jnp.dtype:
+        if cls._use_native_sc_latent_cache(
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        ):
+            return jnp.uint32
+        return dtype
+
     @classmethod
     def _latent_cache_shape(
         cls,
@@ -1603,6 +1640,18 @@ class MLATokenToKVPool(KVCache):
         kv_lora_rank: int,
         qk_rope_head_dim: int,
     ) -> tuple[int, ...]:
+        if cls._use_native_sc_latent_cache(
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        ):
+            # Unified 576 B/tok native SparseCore layout:
+            # page_size 128-word rows for NOPE (512B/tok) + (page_size // 8) 128-word
+            # rows for ROPE (8 packed 64B tokens per 128-word row). At page_size=128,
+            # 144 = 18 * 8 rows/page incurs zero XLA (8, 128) tile padding.
+            return (total_num_pages, page_size + page_size // 8, 128)
+
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
         nope_dim, rope_dim = cls._aligned_latent_dims(kv_lora_rank, qk_rope_head_dim)
@@ -1664,7 +1713,13 @@ class MLATokenToKVPool(KVCache):
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
         )
-        bytes_per_page = cls._shape_bytes(latent_shape, dtype) * num_latent_layers
+        latent_dtype = cls._latent_cache_dtype(
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        bytes_per_page = cls._shape_bytes(latent_shape, latent_dtype) * num_latent_layers
         if num_indexer_layers:
             indexer_shape = cls._indexer_cache_shape(
                 total_num_pages=1,
@@ -1778,9 +1833,6 @@ class MLATokenToKVPool(KVCache):
         DeepSeek-V3 (lora=512, rope=64) is a coincidental match — 512+128=640
         and align(576,128)=640.
         """
-        # MLA cache has no head axis to shard; page axis is sharded by DP.
-        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
-
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
         total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
@@ -1791,25 +1843,59 @@ class MLATokenToKVPool(KVCache):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        per_layer_bytes = self._shape_bytes(buffer_shape, self.dtype)
+        latent_dtype = self._latent_cache_dtype(
+            page_size=self.page_size,
+            dtype=self.dtype,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        # MLA cache has no head axis to shard; page axis is sharded by DP.
+        self.kv_sharding = NamedSharding(
+            self.mesh,
+            P("data", *([None] * (len(buffer_shape) - 1))),
+        )
+        idx_sharding = NamedSharding(self.mesh, P("data", None, None, None))
+        per_layer_bytes = self._shape_bytes(buffer_shape, latent_dtype)
         logger.info(
             "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB",
             buffer_shape,
-            self.dtype,
+            latent_dtype,
             per_layer_bytes / GB,
         )
 
-        def allocate_buffers(shape, count):
+        def allocate_buffers(shape, buf_dtype, buf_sharding, count):
             if abstract:
                 return [
-                    jax.ShapeDtypeStruct(shape, self.dtype, sharding=self.kv_sharding)
+                    jax.ShapeDtypeStruct(shape, buf_dtype, sharding=buf_sharding)
                     for _ in range(count)
                 ]
-            allocate = _get_kv_zero_allocator(shape, self.dtype, self.kv_sharding)
+            allocate = _get_kv_zero_allocator(shape, buf_dtype, buf_sharding)
             return [allocate() for _ in range(count)]
 
         with jax.set_mesh(self.mesh):
-            self.kv_buffer = allocate_buffers(buffer_shape, self.layer_num)
+            if self._use_native_sc_latent_cache(
+                page_size=self.page_size,
+                dtype=self.dtype,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            ):
+                from sgl_jax.srt.kernels.dsa.sparse_mla_sc_gather import NativeSCKVBuffer
+
+                nope_shape = (total_num_pages, self.page_size, 128)
+                rope_shape = (total_num_pages, self.page_size // 8, 128)
+                nope_bufs = allocate_buffers(
+                    nope_shape, latent_dtype, self.kv_sharding, self.layer_num
+                )
+                rope_bufs = allocate_buffers(
+                    rope_shape, latent_dtype, self.kv_sharding, self.layer_num
+                )
+                self.kv_buffer = [
+                    NativeSCKVBuffer(n, r) for n, r in zip(nope_bufs, rope_bufs)
+                ]
+            else:
+                self.kv_buffer = allocate_buffers(
+                    buffer_shape, latent_dtype, self.kv_sharding, self.layer_num
+                )
 
             self.indexer_key_buffer = []
             if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
@@ -1826,7 +1912,9 @@ class MLATokenToKVPool(KVCache):
                     idx_shape,
                     self.num_indexer_layers * indexer_bytes / GB,
                 )
-                self.indexer_key_buffer = allocate_buffers(idx_shape, self.num_indexer_layers)
+                self.indexer_key_buffer = allocate_buffers(
+                    idx_shape, self.dtype, idx_sharding, self.num_indexer_layers
+                )
 
     def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
         return self.indexer_key_buffer[slot_id]
@@ -1861,7 +1949,13 @@ class MLATokenToKVPool(KVCache):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return self._shape_bytes(shape, self.dtype)
+        latent_dtype = self._latent_cache_dtype(
+            page_size=self.page_size,
+            dtype=self.dtype,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        return self._shape_bytes(shape, latent_dtype)
 
     def _indexer_buffer_bytes(self) -> int:
         """Bytes for ONE DSA indexer key buffer; 0 when none is allocated."""
@@ -1930,7 +2024,16 @@ class MLATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
-            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+            cur = self.kv_buffer[layer_id]
+            if hasattr(cur, "nope") and hasattr(cur, "rope"):
+                from sgl_jax.srt.kernels.dsa.sparse_mla_sc_gather import NativeSCKVBuffer
+
+                self.kv_buffer[layer_id] = NativeSCKVBuffer(
+                    cur.nope.at[indices].set(kv_device.nope),
+                    cur.rope.at[indices].set(kv_device.rope),
+                )
+            else:
+                self.kv_buffer[layer_id] = cur.at[indices].set(kv_device)
 
 
 @register_pytree_node_class

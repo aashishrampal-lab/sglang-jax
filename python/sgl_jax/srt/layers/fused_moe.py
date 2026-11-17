@@ -585,6 +585,70 @@ class FusedEPMoE(nnx.Module):
         return output
 
 
+_COUNTING_SORT_BLOCK = 512
+
+
+def _counting_sort_positions(
+    sort_keys: jax.Array, num_buckets: int
+) -> tuple[jax.Array | None, jax.Array | None]:
+    """MXU-accelerated stable counting sort: row -> sorted position + bucket counts."""
+    m = sort_keys.shape[0]
+    block = min(_COUNTING_SORT_BLOCK, m)
+    if m <= 0 or num_buckets > block:
+        return None, None
+    pad = (-m) % block
+    if pad:
+        sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
+    onehot = jax.nn.one_hot(
+        sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
+    )
+    lower = jnp.concatenate(
+        [
+            jnp.ones((1, block), jnp.bfloat16),
+            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
+        ],
+        axis=0,
+    )
+    both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
+    hist = both[:, 0, :]
+    rank = both[:, 1:, :]
+    upper_buckets = jnp.triu(jnp.ones((num_buckets, num_buckets), jnp.bfloat16), 1)
+    if hist.shape[0] == 1:
+        counts = hist[0]
+        base = jnp.einsum(
+            "e,ef->f",
+            counts,
+            upper_buckets,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )[None, :]
+    else:
+        counts = hist.sum(axis=0)
+        bucket_offset = jnp.einsum(
+            "e,ef->f",
+            counts,
+            upper_buckets,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        if hist.shape[0] <= _COUNTING_SORT_BLOCK:
+            lower_blocks = jnp.tril(
+                jnp.ones((hist.shape[0], hist.shape[0]), jnp.bfloat16), -1
+            )
+            block_offset = jnp.einsum(
+                "ab,be->ae",
+                lower_blocks,
+                hist,
+                precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            block_offset = jnp.cumsum(hist, axis=0) - hist
+        base = block_offset + bucket_offset
+    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+
+
 class FusedEPMoEV2(FusedEPMoE):
     """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
 
@@ -737,23 +801,60 @@ class FusedEPMoEV2(FusedEPMoE):
                 tw_all = tw_local
                 ti_all = ti_local
 
-            # Scatter invalid/-1 padded routing slots uniformly across experts with
-            # zero weight so partial-batch padding stays load-balanced across EP ranks.
-            valid_slot = (ti_all >= 0) & (ti_all < num_experts)
-            uniform_pad_ids = (
-                jnp.arange(ti_all.size, dtype=jnp.int32).reshape(ti_all.shape) % num_experts
-            )
-            safe_ids = jnp.where(valid_slot, ti_all, uniform_pad_ids)
-            safe_weights = jnp.where(valid_slot, tw_all, 0.0)
-
-            flat_ids = jnp.ravel(safe_ids)
-            sorted_pos = jnp.argsort(flat_ids, stable=True)
-            token_indices = sorted_pos // top_k
-            group_sizes = jnp.bincount(flat_ids, length=num_experts).astype(jnp.int32)
-
+            # 3. Local-bucket routing compaction (17 buckets: 0..local_num_experts-1 + sentinel).
+            # Remaps global expert IDs to local IDs, filters non-local and zero-weight padded
+            # slots into bucket `local_num_experts`, uses MXU _counting_sort_positions for
+            # zero-scatter argsort_revert_indices + group_sizes_local, and packs (sort_key,
+            # token_id) into one 32-bit unstable sort so only the valid local prefix [0, valid_count)
+            # is gathered and processed by fused gate+up+SiLU gmm_v2 (FusedWeightsRef).
             local_num_experts = w1_loc.shape[0]
-            group_offset = jnp.asarray(my_ep * local_num_experts, dtype=jnp.int32)
-            total_routed = flat_ids.shape[0]
+            local_id = ti_all - my_ep * local_num_experts
+            valid_slot = (ti_all >= 0) & (ti_all < num_experts)
+            valid_local = (
+                valid_slot
+                & (local_id >= 0)
+                & (local_id < local_num_experts)
+                & (tw_all != 0)
+            )
+            safe_weights = jnp.where(valid_local, tw_all, 0.0)
+            safe_weights_flat = jnp.reshape(safe_weights, (-1,))
+            valid_local_flat = jnp.reshape(valid_local, (-1,))
+            sort_keys = jnp.where(
+                valid_local_flat, jnp.reshape(local_id, (-1,)), local_num_experts
+            ).astype(jnp.int32)
+
+            num_tokens_all = hs_all.shape[0]
+            total_routed = sort_keys.shape[0]
+            token_indices_flat = jnp.repeat(
+                jnp.arange(num_tokens_all, dtype=jnp.int32), top_k
+            )
+
+            inv_pos, bucket_counts = _counting_sort_positions(
+                sort_keys, local_num_experts + 1
+            )
+            token_bits = max(1, (num_tokens_all - 1).bit_length())
+            packable = (local_num_experts + 1).bit_length() + token_bits < 31
+
+            if inv_pos is not None and bucket_counts is not None:
+                group_sizes_local = bucket_counts[:local_num_experts]
+                if packable:
+                    packed = jax.lax.sort(
+                        jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
+                        is_stable=False,
+                    )
+                    token_indices_sorted = jnp.bitwise_and(
+                        packed, (1 << token_bits) - 1
+                    )
+                else:
+                    sorted_pos = jnp.argsort(sort_keys, stable=True)
+                    token_indices_sorted = token_indices_flat[sorted_pos]
+            else:
+                sorted_pos = jnp.argsort(sort_keys, stable=True)
+                inv_pos = jnp.argsort(sorted_pos).astype(jnp.int32)
+                token_indices_sorted = token_indices_flat[sorted_pos]
+                group_sizes_local = jnp.bincount(
+                    sort_keys, length=local_num_experts + 1
+                )[:local_num_experts].astype(jnp.int32)
 
             use_sc = (
                 mesh_ep_size > 1
@@ -764,6 +865,8 @@ class FusedEPMoEV2(FusedEPMoE):
                 and should_use_sparse_core(total_routed, hs_all.shape[-1], hs_all.dtype)
             )
 
+            zero_offset = jnp.array([0], dtype=jnp.int32)
+            valid_count = group_sizes_local.sum(dtype=jnp.int32)
             if use_sc:
                 from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
                     ragged_gather_reduce,
@@ -772,45 +875,34 @@ class FusedEPMoEV2(FusedEPMoE):
                     ragged_gather_v2,
                 )
 
-                group_offsets = jnp.concatenate(
-                    [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(group_sizes, dtype=jnp.int32)]
+                lhs = ragged_gather_v2(
+                    hs_all,
+                    token_indices_sorted,
+                    zero_offset,
+                    valid_count[None],
                 )
-                token_start = group_offsets[group_offset]
-                token_end = group_offsets[group_offset + local_num_experts]
-                lhs = ragged_gather_v2(hs_all, token_indices, token_start, token_end)
             else:
-                token_start = None
-                token_end = None
-                lhs = hs_all[token_indices]
+                lhs = hs_all[token_indices_sorted]
 
             gmm_kwargs = dict(
-                group_sizes=group_sizes,
+                group_sizes=group_sizes_local,
                 preferred_element_type=hs_local.dtype,
-                group_offset=group_offset,
+                group_offset=zero_offset,
                 maybe_quantize_lhs=enable_act_quant,
                 acc_dtype=jnp.float32,
                 activation_quantized_dtype=act_q_dtype,
             )
-            gate_out = gmm(
+            inter = gmm(
                 lhs=lhs,
                 rhs=w1_loc,
                 rhs_scale=w1_s_loc,
+                rhs_up=w3_loc,
+                rhs_up_scale=w3_s_loc,
+                fuse_act=act_fn_name,
+                swiglu_limit=swiglu_limit,
                 zero_initialize=False,
                 **gmm_kwargs,
             )
-            up_out = gmm(
-                lhs=lhs,
-                rhs=w3_loc,
-                rhs_scale=w3_s_loc,
-                zero_initialize=False,
-                **gmm_kwargs,
-            )
-            inter = activation_fn(
-                gate_out.astype(jnp.float32),
-                up_out.astype(jnp.float32),
-                act_fn_name,
-                swiglu_limit,
-            ).astype(hs_local.dtype)
             down_out = gmm(
                 lhs=inter,
                 rhs=w2_loc,
@@ -819,21 +911,23 @@ class FusedEPMoEV2(FusedEPMoE):
                 **gmm_kwargs,
             )
 
-            inv_pos = jnp.argsort(sorted_pos).astype(jnp.int32)
             if use_sc:
-                valid_rows = (inv_pos >= token_start) & (inv_pos < token_end)
                 routed_all = ragged_gather_reduce(
                     down_out,
                     inv_pos,
-                    jnp.reshape(safe_weights, (-1,)),
-                    valid_rows,
+                    safe_weights_flat,
+                    valid_local_flat,
                     top_k,
                 ).astype(hs_local.dtype)
             else:
-                unsorted = jnp.take(down_out, indices=inv_pos, axis=0)
+                unsorted = jnp.where(
+                    valid_local_flat[:, None],
+                    jnp.take(down_out, indices=inv_pos, axis=0),
+                    0,
+                )
                 routed_all = jnp.einsum(
                     "tkh,tk->th",
-                    unsorted.reshape(hs_all.shape[0], top_k, -1).astype(jnp.float32),
+                    unsorted.reshape(num_tokens_all, top_k, -1).astype(jnp.float32),
                     safe_weights.astype(jnp.float32),
                 ).astype(hs_local.dtype)
 

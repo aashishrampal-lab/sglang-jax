@@ -86,17 +86,7 @@ def _scores_kernel(
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     indexer_weights_hbm_ref,  # [max_num_tokens, num_q_heads]
     cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
-    scores_in_hbm_ref,  # aliased to the output
-    # Output
-    scores_hbm_ref,  # [max_num_tokens, num_sublanes_total, 128]
-    # Scratch
-    bkv_x2_ref,  # [2, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim]
-    bq_x2_ref,  # [2, bq_sz, num_q_heads, head_dim]
-    bq_weights_x2_ref,  # [2, bq_sz, num_q_heads]
-    scores_block_x2_ref,  # [2, bq_sz, num_sublanes_bkv, 128]
-    sems,  # [4, 2]
-    sub_scores_ref=None,  # Optional [8, bq_sz // 8, 128] VMEM scratch for fast paged sub-tiling
-    *,
+    *rest_refs,
     compression_ratio: int,
     static_q_len: int,
     bkv_p: int,
@@ -105,7 +95,32 @@ def _scores_kernel(
     pages_per_seq: int,
     page_pool_size: int | None = None,
     num_bkv_max: int | None = None,
+    has_scores_in: bool = True,
+    skip_causal_mask: bool = False,
+    fast_token_scores: bool = False,
 ):
+    if has_scores_in:
+        (
+            scores_in_hbm_ref,
+            scores_hbm_ref,
+            bkv_x2_ref,
+            bq_x2_ref,
+            bq_weights_x2_ref,
+            scores_block_x2_ref,
+            sems,
+        ) = rest_refs[:7]
+        sub_scores_ref = rest_refs[7] if len(rest_refs) > 7 else None
+        del scores_in_hbm_ref
+    else:
+        (
+            scores_hbm_ref,
+            bkv_x2_ref,
+            bq_x2_ref,
+            bq_weights_x2_ref,
+            scores_block_x2_ref,
+            sems,
+        ) = rest_refs[:6]
+        sub_scores_ref = rest_refs[6] if len(rest_refs) > 6 else None
     _, num_q_heads, head_dim = q_hbm_ref.shape
     lkv_dim = cache_kv_hbm_ref.shape[-1]
 
@@ -402,11 +417,14 @@ def _scores_kernel(
                 s_summed = s.sum(axis=1)
                 if scale_val is not None:
                     s_summed = s_summed * scale_val
-                k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s_summed.shape, 1)
-                valid_mask = k_span < kv_lens[batch_idx]
-                causal_mask = k_span <= bq_pos_compressed[:, None]
-                mask = jnp.logical_and(valid_mask, causal_mask)
-                s_summed = jnp.where(mask, s_summed, -jnp.inf)
+                if not skip_causal_mask:
+                    k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                        jnp.int32, s_summed.shape, 1
+                    )
+                    valid_mask = k_span < kv_lens[batch_idx]
+                    causal_mask = k_span <= bq_pos_compressed[:, None]
+                    mask = jnp.logical_and(valid_mask, causal_mask)
+                    s_summed = jnp.where(mask, s_summed, -jnp.inf)
                 if page_pool_size is not None:
                     # Page mode: max-pool token scores within each page. Columns
                     # are linear (compressed) kv positions, and bkv_sz is a whole
@@ -416,6 +434,48 @@ def _scores_kernel(
                 else:
                     ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
             return jnp.concatenate(ret, axis=0)
+
+        use_fast_token_scores = (
+            fast_token_scores
+            and page_pool_size is None
+            and seq_batch_size == 1
+            and compression_ratio == 1
+            and num_q_heads == 32
+            and bq_sz >= 32
+            and (bq_sz % 16 == 0)
+            and bkv_sz >= 512
+            and (bkv_sz % 512 == 0)
+            and bkv_x2_ref.dtype != jnp.uint8
+        )
+
+        def num_bkv_for_bq(s_idx, q_blk):
+            if not skip_causal_mask:
+                kvl = seq_lens_ref[s_idx] // compression_ratio
+                return jnp.maximum(1, cdiv(kvl, bkv_sz))
+            q_s = cu_q_lens_ref[s_idx]
+            q_e = cu_q_lens_ref[s_idx + 1]
+            ql = q_e - q_s
+            sl = seq_lens_ref[s_idx]
+            kvl = sl // compression_ratio
+            sz_q = jnp.maximum(0, jnp.minimum(bq_sz, ql - q_blk * bq_sz))
+            max_vis = jnp.where(
+                sz_q > 0,
+                jnp.minimum(kvl, (sl - ql + q_blk * bq_sz + sz_q) // compression_ratio),
+                0,
+            )
+            return jnp.maximum(1, cdiv(max_vis, bkv_sz))
+
+        def get_next_bkv_ids_fast(seq_idx, bq_idx, bkv_idx, bkv_sem_idx):
+            cur_nbkv = num_bkv_for_bq(seq_idx, bq_idx)
+            next_bkv_idx = bkv_idx + 1
+            is_last_bkv = next_bkv_idx == cur_nbkv
+            next_bkv_idx = lax.select(is_last_bkv, 0, next_bkv_idx)
+            next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
+            is_last_bq = next_bq_idx == num_bq
+            next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + seq_batch_size, seq_idx)
+            next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+            return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
 
         def compute_with_bq(bq_idx, _):
 
@@ -445,14 +505,95 @@ def _scores_kernel(
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
-            bq_vec = load_bq(bq_sem_idx)
-            bq_weights_vec = load_bq_weights(bq_sem_idx)
 
-            # If seq_batch_size > 1, static_q_len is always 1, therefore sz is always
-            # 1 for all sequences within the batch.
             token_start = cu_q_lens_ref[batch_start_seq_idx] + bq_idx * bq_sz
             curr_q_end = cu_q_lens_ref[batch_start_seq_idx + 1]
             sz = jnp.maximum(0, jnp.minimum(bq_sz, curr_q_end - token_start))
+
+            if use_fast_token_scores:
+                bq_hm = bq_x2_ref.at[bq_sem_idx, 0, :bq_sz][...].transpose(1, 0, 2)
+                q_g0 = bq_hm[:16].reshape(16 * bq_sz, head_dim)
+                q_g1 = bq_hm[16:].reshape(16 * bq_sz, head_dim)
+                w_raw = bq_weights_x2_ref.at[bq_sem_idx, 0, :bq_sz][...].astype(jnp.float32)
+                lane_chunk = 512
+                words_per_chunk = lane_chunk // kv_packing
+                w_cols_g0 = [
+                    jnp.broadcast_to(w_raw[:, i : i + 1], (bq_sz, lane_chunk))
+                    for i in range(16)
+                ]
+                w_cols_g1 = [
+                    jnp.broadcast_to(w_raw[:, 16 + i : 17 + i], (bq_sz, lane_chunk))
+                    for i in range(16)
+                ]
+                cur_nbkv = num_bkv_for_bq(batch_start_seq_idx, bq_idx)
+
+                def compute_with_bkv_fast(bkv_idx, _):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids_fast(
+                        batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
+                    )
+
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+
+                    wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                    chunk_scores = []
+                    for c in range(bkv_sz // lane_chunk):
+                        bkv_c = bkv_x2_ref.at[
+                            bkv_sem_idx, 0, pl.ds(c * words_per_chunk, words_per_chunk)
+                        ][...].reshape(lane_chunk, lkv_dim)[:, :head_dim]
+                        st0 = jnp.einsum(
+                            "nd,md->nm",
+                            q_g0,
+                            bkv_c,
+                            preferred_element_type=jnp.float32,
+                        )
+                        st1 = jnp.einsum(
+                            "nd,md->nm",
+                            q_g1,
+                            bkv_c,
+                            preferred_element_type=jnp.float32,
+                        )
+                        acc = None
+                        for i in range(16):
+                            r0 = jnp.maximum(
+                                st0[i * bq_sz : (i + 1) * bq_sz].astype(jnp.bfloat16),
+                                jnp.bfloat16(0.0),
+                            )
+                            t0 = r0.astype(jnp.float32) * w_cols_g0[i]
+                            acc = t0 if acc is None else acc + t0
+                            r1 = jnp.maximum(
+                                st1[i * bq_sz : (i + 1) * bq_sz].astype(jnp.bfloat16),
+                                jnp.bfloat16(0.0),
+                            )
+                            t1 = r1.astype(jnp.float32) * w_cols_g1[i]
+                            acc = acc + t1
+                        if not skip_causal_mask:
+                            k_span = (
+                                bkv_idx * bkv_sz
+                                + c * lane_chunk
+                                + lax.broadcasted_iota(jnp.int32, (bq_sz, lane_chunk), 1)
+                            )
+                            mask = (k_span < kv_lens[0]) & (
+                                k_span <= bq_pos_compressed_vec[0][:, None]
+                            )
+                            acc = jnp.where(mask, acc, -jnp.inf)
+                        chunk_scores.append(acc.reshape(bq_sz, lane_chunk // 128, 128))
+
+                    scores = jnp.concatenate(chunk_scores, axis=1)
+                    bo_sem_idx = sem_ids_ref[2]
+                    wait_send_scores(bo_sem_idx)
+                    scores_block_x2_ref[bo_sem_idx, ...] = scores
+                    start_send_scores(bo_sem_idx, sz, token_start, bkv_idx)
+                    sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+
+                lax.fori_loop(0, cur_nbkv, compute_with_bkv_fast, None, unroll=False)
+                return
+
+            bq_vec = load_bq(bq_sem_idx)
+            bq_weights_vec = load_bq_weights(bq_sem_idx)
 
             def compute_with_bkv(bkv_idx, _):
                 bkv_sem_idx = sem_ids_ref[1]
@@ -889,6 +1030,8 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
         "decode_req_batch_size",
         "topk_backend",
         "pages_per_seq",
+        "prefill_only",
+        "decode_only",
     ),
 )
 def streamindex_topk(
@@ -909,6 +1052,8 @@ def streamindex_topk(
     topk_backend: str = "auto",
     cu_kv_pages: jax.Array | None = None,
     pages_per_seq: int | None = None,
+    prefill_only: bool = False,
+    decode_only: bool = False,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -956,6 +1101,17 @@ def streamindex_topk(
         num_queries_per_blocks = num_queries_per_block
 
     max_num_seqs = seq_lens.shape[0]
+    if (
+        is_tpu_runtime()
+        and cache_kv.dtype in (jnp.float8_e4m3fn, jnp.uint8)
+        and q.dtype != jnp.float8_e4m3fn
+        and os.environ.get("DSA_INDEXER_FP8_Q", "1") == "1"
+    ):
+        q_f32 = q.astype(jnp.float32)
+        q_amax = jnp.max(jnp.abs(q_f32), axis=-1, keepdims=True)
+        q_scale = jnp.maximum(q_amax / jnp.float32(448.0), jnp.float32(1e-12))
+        q = (q_f32 / q_scale).astype(jnp.float8_e4m3fn)
+        indexer_weights = indexer_weights.astype(jnp.float32) * q_scale.squeeze(-1)
 
     original_dtype = q.dtype
 
@@ -979,6 +1135,20 @@ def streamindex_topk(
     num_sublanes_total = max(
         align_to(pages_per_seq, bkv_p) * page_size // 128 for bkv_p in num_kv_pages_per_blocks
     )
+    total_score_cols = num_sublanes_total * 128
+    fast_token_scores = os.environ.get("DSA_INDEXER_FAST_TOKEN", "1") == "1"
+    use_fast_sc_topk = (
+        os.environ.get("DSA_FAST_SC_TOPK", "1") == "1"
+        and topk_backend in ("auto", "sc")
+        and sc_topk_available()
+        and (k % 16 == 0)
+        and (0 < k <= 4096)
+        and (total_score_cols % 16 == 0)
+        and (
+            topk_backend == "sc"
+            or total_score_cols >= int(os.environ.get("DSA_FAST_SC_TOPK_MIN_ENTRIES", "2048"))
+        )
+    )
 
     def run_topk_kernel(
         q,
@@ -995,11 +1165,9 @@ def streamindex_topk(
         num_queries_per_block,
         seq_batch_size,
         case=MlaCase.MIXED,
+        skip_causal_mask: bool = False,
     ):
         _, num_q_heads, head_dim = q.shape
-        # Only support batching for decode sequences.
-        # TODO: support batching for decode sequences with speculative decoding
-        # enabled, e.g. static_q_len = gamma + 1.
         if seq_batch_size > 1:
             assert static_q_len == 1
 
@@ -1012,16 +1180,16 @@ def streamindex_topk(
         bkv_buf_sz_per_kv_packing = bkv_sz_per_kv_packing
         num_sublanes_bkv = bkv_sz_per_kv_packing * kv_packing // 128
 
-        # If seq_batch_size > 1, caller already guaranteed that
-        # end_seq_idx - start_seq_idx % seq_batch_size == 0.
         grid = ((end_seq_idx - start_seq_idx) // seq_batch_size,)
+        has_scores_in = scores is not None
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # prepared_indexer_weights
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
-            pl.BlockSpec(memory_space=pltpu.HBM),  # scores_init (aliased to out)
         ]
+        if has_scores_in:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # scores_init
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # scores
 
         bkv_double_buf = pltpu.VMEM(
@@ -1086,6 +1254,9 @@ def streamindex_topk(
                     bkv_p=bkv_p,
                     seq_batch_size=seq_batch_size,
                     pages_per_seq=pages_per_seq,
+                    has_scores_in=has_scores_in,
+                    skip_causal_mask=skip_causal_mask,
+                    fast_token_scores=fast_token_scores,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -1103,20 +1274,17 @@ def streamindex_topk(
                     shape=(q.shape[0], num_sublanes_total, 128),
                     dtype=jnp.float32,
                 ),
-                input_output_aliases={len(scalar_prefetches) + 3: 0},
+                input_output_aliases=(
+                    {len(scalar_prefetches) + 3: 0} if has_scores_in else {}
+                ),
                 name=scope_name,
             )
         )
-        return kernel(
-            *scalar_prefetches,
-            q,
-            prepared_indexer_weights,
-            cache_kv,
-            scores,
-        )
+        operands = (q, prepared_indexer_weights, cache_kv) + ((scores,) if has_scores_in else ())
+        return kernel(*scalar_prefetches, *operands)
 
     def _run_full_topk(_):
-        if jax.default_backend() == "cpu":
+        if not is_tpu_runtime():
             # Pure-JAX CPU fallback so unit tests can trace both lax.cond branches on CPU.
             cache_flat = cache_kv.reshape(-1, lkv_dim).astype(jnp.float32)
             q_f32 = q.astype(jnp.float32)
@@ -1152,6 +1320,158 @@ def streamindex_topk(
             if res.shape[1] < k:
                 res = jnp.pad(res, ((0, 0), (0, k - res.shape[1])), constant_values=-1)
             return res
+
+        if use_fast_sc_topk:
+            from sgl_jax.srt.kernels.dsa.sparsecore_topk import sparsecore_topk
+
+            t_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
+            num_valid_s = jnp.clip(distribution[2].astype(jnp.int32), 0, max_num_seqs)
+            total_valid_q = cu_q_lens[num_valid_s]
+            seg = jnp.clip(
+                jnp.searchsorted(cu_q_lens, t_idx, side="right").astype(jnp.int32) - 1,
+                0,
+                max(0, max_num_seqs - 1),
+            )
+            q_start = cu_q_lens[seg]
+            q_end = cu_q_lens[seg + 1]
+            q_len = q_end - q_start
+            seq_len_row = seq_lens[seg]
+            kv_len_comp = seq_len_row // compression_ratio
+            valid_q = (
+                (t_idx < total_valid_q)
+                & (t_idx >= q_start)
+                & (t_idx < q_end)
+                & (kv_len_comp > 0)
+            )
+            q_pos = seq_len_row - q_len + (t_idx - q_start)
+            vis_len = (q_pos + 1) // compression_ratio
+            causal_row_lengths = jnp.where(
+                valid_q, jnp.clip(vis_len, 0, kv_len_comp), 0
+            ).astype(jnp.int32)
+
+            if prefill_only:
+                scores = run_topk_kernel(
+                    q,
+                    prepared_indexer_weights,
+                    cache_kv,
+                    None,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+                    num_queries_per_block=num_queries_per_blocks[2],
+                    start_seq_idx=jnp.array(0, dtype=jnp.int32),
+                    end_seq_idx=distribution[2],
+                    static_q_len=None,
+                    seq_batch_size=1,
+                    case=MlaCase.MIXED,
+                    skip_causal_mask=True,
+                )
+            elif decode_only:
+                if q.shape[0] >= decode_req_batch_size:
+                    decode_batch_end = (
+                        distribution[0] // decode_req_batch_size * decode_req_batch_size
+                    )
+                    scores = run_topk_kernel(
+                        q,
+                        prepared_indexer_weights,
+                        cache_kv,
+                        None,
+                        seq_lens,
+                        page_indices,
+                        cu_q_lens,
+                        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+                        num_queries_per_block=num_queries_per_blocks[0],
+                        start_seq_idx=jnp.array(0, dtype=jnp.int32),
+                        end_seq_idx=decode_batch_end,
+                        static_q_len=1,
+                        seq_batch_size=decode_req_batch_size,
+                        case=MlaCase.DECODE,
+                        skip_causal_mask=True,
+                    )
+                else:
+                    decode_batch_end = jnp.array(0, dtype=jnp.int32)
+                    scores = None
+                scores = run_topk_kernel(
+                    q,
+                    prepared_indexer_weights,
+                    cache_kv,
+                    scores,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+                    num_queries_per_block=num_queries_per_blocks[0],
+                    start_seq_idx=decode_batch_end,
+                    end_seq_idx=distribution[1],
+                    static_q_len=1,
+                    seq_batch_size=1,
+                    case=MlaCase.DECODE,
+                    skip_causal_mask=True,
+                )
+            else:
+                if q.shape[0] >= decode_req_batch_size:
+                    decode_batch_end = (
+                        distribution[0] // decode_req_batch_size * decode_req_batch_size
+                    )
+                    scores = run_topk_kernel(
+                        q,
+                        prepared_indexer_weights,
+                        cache_kv,
+                        None,
+                        seq_lens,
+                        page_indices,
+                        cu_q_lens,
+                        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+                        num_queries_per_block=num_queries_per_blocks[0],
+                        start_seq_idx=jnp.array(0, dtype=jnp.int32),
+                        end_seq_idx=decode_batch_end,
+                        static_q_len=1,
+                        seq_batch_size=decode_req_batch_size,
+                        case=MlaCase.DECODE,
+                        skip_causal_mask=True,
+                    )
+                else:
+                    decode_batch_end = jnp.array(0, dtype=jnp.int32)
+                    scores = None
+                scores = run_topk_kernel(
+                    q,
+                    prepared_indexer_weights,
+                    cache_kv,
+                    scores,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+                    num_queries_per_block=num_queries_per_blocks[0],
+                    start_seq_idx=decode_batch_end,
+                    end_seq_idx=distribution[1],
+                    static_q_len=1,
+                    seq_batch_size=1,
+                    case=MlaCase.DECODE,
+                    skip_causal_mask=True,
+                )
+                scores = run_topk_kernel(
+                    q,
+                    prepared_indexer_weights,
+                    cache_kv,
+                    scores,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+                    num_queries_per_block=num_queries_per_blocks[2],
+                    start_seq_idx=distribution[1],
+                    end_seq_idx=distribution[2],
+                    static_q_len=None,
+                    seq_batch_size=1,
+                    case=MlaCase.MIXED,
+                    skip_causal_mask=True,
+                )
+
+            scores = scores.reshape(q.shape[0], -1)
+            topk_idxs = sparsecore_topk(scores, k, row_lengths=causal_row_lengths)
+            return topk_idxs[: q.shape[0], :k].astype(jnp.int32)
 
         # Pre-fill the output with -inf and alias it, so masked / unwritten
         # columns are already -inf.
@@ -1299,7 +1619,7 @@ def streamindex_page_topk(
     """
     max_num_seqs = seq_lens.shape[0]
     if (
-        jax.default_backend() == "tpu"
+        is_tpu_runtime()
         and cache_kv.dtype in (jnp.float8_e4m3fn, jnp.uint8)
         and q.dtype != jnp.float8_e4m3fn
         and os.environ.get("DSA_INDEXER_FP8_Q", "1") == "1"
@@ -1345,7 +1665,7 @@ def streamindex_page_topk(
     T = q.shape[0]
 
     def _run_full_page_topk(_):
-        if jax.default_backend() == "cpu":
+        if not is_tpu_runtime():
             cache_pages = cache_kv.reshape(-1, page_size, lkv_dim).astype(jnp.float32)
             q_f32 = q.astype(jnp.float32)
             w_f32 = indexer_weights[:T].astype(jnp.float32)
